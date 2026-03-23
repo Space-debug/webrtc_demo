@@ -1,8 +1,14 @@
 #include "p2p_player.h"
 #include "sdl_display.h"
+#include "config_loader.h"
 
+#include <atomic>
+#include <chrono>
 #include <csignal>
+#include <cstring>
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <thread>
 
 static p2p::P2pPlayer* g_player = nullptr;
@@ -11,27 +17,106 @@ void SignalHandler(int) {
     if (g_player) g_player->Stop();
 }
 
+static std::string FindConfigPath(const char* prog, const std::string& config_arg) {
+    if (!config_arg.empty()) return config_arg;
+    std::string prog_path(prog);
+    size_t slash = prog_path.find_last_of("/\\");
+    std::string dir = (slash != std::string::npos) ? prog_path.substr(0, slash) : ".";
+    for (const char* sub : {"/config/streams.conf", "/../../config/streams.conf"}) {
+        std::string path = dir + sub;
+        std::ifstream f(path);
+        if (f) return path;
+    }
+    return "";
+}
+
+static void PrintPlayerUsage(const char* prog) {
+    std::cout << "用法: " << prog << " [选项] [信令地址] [stream_id]\n"
+              << "选项:\n"
+              << "  --config FILE      配置文件路径\n"
+              << "  --headless         无窗口：仅通过控制台统计解码帧，适合 SSH/远程\n"
+              << "  --frames N         headless 模式下收到至少 N 帧即成功退出（默认 30）\n"
+              << "  --timeout-sec S    headless 超时秒数（默认 120）\n"
+              << "  -h, --help         显示本帮助\n"
+              << std::endl;
+}
+
 int main(int argc, char* argv[]) {
     std::string url = "127.0.0.1:8765";
-    if (argc >= 2) url = argv[1];
+    std::string stream_id = "livestream";
+    std::string config_path;
+    bool headless = false;
+    unsigned need_frames = 30;
+    int timeout_sec = 120;
 
-    std::cout << "=== WebRTC P2P 拉流 (SDL2 播放) ===" << std::endl;
-    std::cout << "信令: " << url << std::endl;
-    std::cout << "按 Esc 或关闭窗口退出" << std::endl;
+    int i = 1;
+    while (i < argc && argv[i][0] == '-') {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            PrintPlayerUsage(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            config_path = argv[i + 1];
+            i += 2;
+        } else if (strcmp(argv[i], "--headless") == 0) {
+            headless = true;
+            ++i;
+        } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+            need_frames = static_cast<unsigned>(std::atoi(argv[i + 1]));
+            if (need_frames < 1) need_frames = 1;
+            i += 2;
+        } else if (strcmp(argv[i], "--timeout-sec") == 0 && i + 1 < argc) {
+            timeout_sec = std::atoi(argv[i + 1]);
+            if (timeout_sec < 5) timeout_sec = 5;
+            i += 2;
+        } else {
+            ++i;
+        }
+    }
+    if (config_path.empty()) config_path = FindConfigPath(argv[0], "");
+    webrtc_demo::ConfigLoader cfg;
+    if (!config_path.empty() && cfg.Load(config_path)) {
+        url = cfg.Get("SIGNALING_ADDR", "127.0.0.1:8765");
+        stream_id = cfg.Get("DEFAULT_STREAM", "livestream");
+    }
+    if (i < argc) url = argv[i++];
+    if (i < argc) stream_id = argv[i++];
 
-    p2p::SdlDisplay display("WebRTC P2P 拉流");
-    if (!display.IsOpen()) {
-        std::cerr << "SDL 窗口创建失败，请安装: sudo apt install libsdl2-dev" << std::endl;
-        return 1;
+    std::cout << "=== WebRTC P2P 拉流" << (headless ? " (无头/仅日志)" : " (SDL2)") << " ===" << std::endl;
+    std::cout << "信令: " << url << " 流: " << stream_id << std::endl;
+    if (!headless) {
+        std::cout << "按 Esc 或关闭窗口退出" << std::endl;
     }
 
-    p2p::P2pPlayer player(url);
+    std::unique_ptr<p2p::SdlDisplay> display;
+    if (!headless) {
+        display = std::make_unique<p2p::SdlDisplay>("WebRTC P2P 拉流");
+        if (!display->IsOpen()) {
+            std::cerr << "SDL 窗口创建失败，请安装: sudo apt install libsdl2-dev\n"
+                      << "或远程/无显示时使用: " << argv[0] << " --headless ..." << std::endl;
+            return 1;
+        }
+    }
+
+    p2p::P2pPlayer player(url, stream_id);
     g_player = &player;
 
     std::signal(SIGINT, SignalHandler);
 
-    player.SetOnVideoFrame([&display](const uint8_t* argb, int width, int height, int stride) {
-        display.UpdateFrame(argb, width, height, stride);
+    std::atomic<unsigned> decoded_frames{0};
+    player.SetOnVideoFrame([&decoded_frames, &display, headless](const uint8_t* argb, int width,
+                                                                 int height, int stride) {
+        (void)argb;
+        (void)stride;
+        unsigned n = ++decoded_frames;
+        if (headless) {
+            if (n == 1 || n <= 5 || n % 10 == 0) {
+                std::cout << "[Headless] 已收到解码帧 #" << n << " 分辨率 " << width << "x" << height
+                          << std::endl;
+            }
+        } else if (display) {
+            display->UpdateFrame(argb, width, height, stride);
+        }
     });
 
     player.SetOnConnectionState([](p2p::ConnectionState state) {
@@ -45,12 +130,35 @@ int main(int argc, char* argv[]) {
 
     player.Play();
 
-    while (player.IsPlaying() && display.PollAndRender()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps UI 刷新
-    }
+    if (headless) {
+        std::cout << "[Headless] 等待推流端 offer，目标至少 " << need_frames << " 帧，超时 " << timeout_sec
+                  << " 秒..." << std::endl;
+        using clock = std::chrono::steady_clock;
+        auto deadline = clock::now() + std::chrono::seconds(timeout_sec);
+        while (player.IsPlaying() && clock::now() < deadline) {
+            if (decoded_frames >= need_frames) {
+                std::cout << "[Headless] 拉流验证成功：共收到 " << decoded_frames.load() << " 帧" << std::endl;
+                player.Stop();
+                g_player = nullptr;
+                return 0;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (player.IsPlaying()) {
+            std::cerr << "[Headless] 超时：仅收到 " << decoded_frames.load() << " 帧（需要 " << need_frames
+                      << "）" << std::endl;
+            player.Stop();
+            g_player = nullptr;
+            return 2;
+        }
+    } else {
+        while (player.IsPlaying() && display->PollAndRender()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps UI 刷新
+        }
 
-    if (player.IsPlaying()) {
-        player.Stop();
+        if (player.IsPlaying()) {
+            player.Stop();
+        }
     }
 
     g_player = nullptr;

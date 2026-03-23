@@ -33,6 +33,7 @@ add_executable(p2p_player
     main.cpp
     p2p_player.cpp
     sdl_display.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/config_loader/config_loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/signaling_client/signaling_client.cpp
 )
 

@@ -11,6 +11,8 @@
 webrtc_demo/
 ├── CMakeLists.txt
 ├── README.md
+├── config/
+│   └── streams.conf            # 流配置（信令、分辨率、多流等）
 ├── docs/
 ├── include/
 ├── src/
@@ -38,11 +40,14 @@ webrtc_demo/
 - CMake >= 3.14
 - C++17 编译器（GCC/Clang）
 - SDL2（拉流端显示）
+- libjpeg-turbo8-dev（可选，MJPEG 采集格式需要）
 
-Linux 安装 SDL2 开发包：
+Linux 安装：
 
 ```bash
 sudo apt install libsdl2-dev
+# MJPEG 采集格式（可选）
+sudo apt install libjpeg-turbo8-dev
 ```
 
 ## 编译
@@ -56,6 +61,103 @@ sudo apt install libsdl2-dev
 - `build/bin/p2p_player`
 - `build/bin/signaling_server`
 
+## 配置文件
+
+直接运行可执行文件时，可用 `--config path` 指定 `config/streams.conf`。  
+配置文件已按“功能分区”组织，格式为 `KEY=value`，并支持 `STREAM_<id>_<KEY>` 覆盖：
+
+```ini
+# [A] 连接与会话
+SIGNALING_ADDR=127.0.0.1:8765
+ENABLE_AUDIO=0
+
+# [B] 采集源
+DEFAULT_STREAM=livestream
+DEFAULT_CAMERA=/dev/video0
+
+# [C] 采集格式与桥接
+CAPTURE_FORMAT=auto
+LOOPBACK_DEVICE=/dev/video12
+
+# [D] 分辨率与帧率
+WIDTH=640
+HEIGHT=480
+FPS=30
+
+# [E] 带宽控制
+TARGET_BITRATE=1000
+MIN_BITRATE=100
+MAX_BITRATE=2000
+
+# [F] 自适应降级策略
+DEGRADATION_PREFERENCE=maintain_framerate
+
+# [G] 编码器
+VIDEO_CODEC=h264
+H264_PROFILE=main
+H264_LEVEL=3.0
+
+# [H] 按流覆盖：STREAM_<id>_<KEY>=value
+STREAM_livestream_CAMERA=/dev/video0
+STREAM_livestream_WIDTH=640
+STREAM_livestream_HEIGHT=480
+STREAM_livestream_FPS=30
+STREAM_livestream_720p_CAMERA=/dev/video0
+STREAM_livestream_720p_WIDTH=1280
+STREAM_livestream_720p_HEIGHT=720
+STREAM_livestream_720p_DEGRADATION_PREFERENCE=maintain_resolution
+```
+
+说明：
+- 同一个 `stream_id` 一次只使用一组 `WIDTH/HEIGHT/FPS`。
+- 要覆盖“相机支持的所有分辨率”，建议为同一摄像头建立多个 stream profile（如 `livestream`、`livestream_720p`、`livestream_1080p`）。
+- 先用 `v4l2-ctl -d /dev/video0 --list-formats-ext` 查询设备真实支持档位，再写入对应 profile。
+
+### 采集格式（YUYV / MJPEG）
+
+支持 UVC 相机的 YUYV 和 MJPEG 出流。  
+`MJPEG` 路径会先解码为 YUV（YUYV）后再进入 H264 编码；`YUYV` 可直接进入编码链路。
+
+| 格式 | 说明 | 依赖 |
+|------|------|------|
+| `auto` | 由 libwebrtc 自动选择（默认） | 无 |
+| `yuyv` | 强制 YUYV 采集，直通编码 | v4l2loopback |
+| `mjpeg` | 强制 MJPEG 采集，先解码为 YUYV 再编码 | v4l2loopback + libjpeg-turbo |
+
+**yuyv / mjpeg 需配合 v4l2loopback**：采集桥接从真实摄像头读取指定格式，输出到虚拟设备，libwebrtc 从虚拟设备读取。
+
+1. 加载 v4l2loopback 并创建虚拟设备（如 /dev/video12）：
+
+```bash
+sudo modprobe v4l2loopback video_nr=12
+```
+
+2. 配置 `config/streams.conf`：
+
+```ini
+CAPTURE_FORMAT=mjpeg
+LOOPBACK_DEVICE=/dev/video12
+DEFAULT_CAMERA=/dev/video11
+```
+
+3. 或命令行指定：
+
+```bash
+./build/bin/webrtc_push_demo livestream /dev/video11 --capture-format mjpeg --loopback /dev/video12
+```
+
+### WebRTC 自动降级（分辨率/帧率）
+
+通过 `DEGRADATION_PREFERENCE` 控制：
+
+| 配置值 | 网络变差时的优先策略 |
+|---|---|
+| `maintain_framerate` | 优先降分辨率（更保帧率） |
+| `maintain_resolution` | 优先降帧率（更保分辨率） |
+| `balanced` | 分辨率和帧率折中调整 |
+
+这意味着“自动降低分辨率”和“自动降低帧率”都支持，按策略选择优先级即可。
+
 ## 运行方式
 
 ### 1) 启动推流端（服务器）
@@ -66,8 +168,8 @@ sudo apt install libsdl2-dev
 
 默认行为：
 - 自动启动 `signaling_server`（`START_SIGNALING=1`）
-- 信令地址默认 `127.0.0.1:8765`（可用 `SIGNALING_ADDR` 覆盖）
-- 分辨率/帧率默认 `640x480@30`（可用 `WIDTH/HEIGHT/FPS` 覆盖）
+- 信令地址默认 `127.0.0.1:8765`（可用环境变量 `SIGNALING_ADDR` 覆盖）
+- 分辨率/帧率默认 `640x480@30`（可用环境变量 `WIDTH/HEIGHT/FPS` 覆盖）
 
 示例（指定信令地址）：
 
@@ -92,9 +194,53 @@ SIGNALING_ADDR=192.168.3.222:8765 ./scripts/push.sh livestream /dev/video11
 
 > 远端拉流时，参数应填写“推流机上的信令地址（IP:端口）”，不能用 `127.0.0.1`。
 
+#### SSH / 无显示器：仅验证是否拉到流
+
+```bash
+# 直接运行（收到 30 帧后成功退出，退出码 0）
+./build/bin/p2p_player --headless --frames 30 --timeout-sec 120 192.168.3.222:8765 livestream
+
+# 或用脚本
+HEADLESS=1 HEADLESS_FRAMES=20 ./scripts/pull.sh 192.168.3.222:8765 livestream
+```
+
+本机一键验证（需摄像头）：`./scripts/test_p2p_headless.sh /dev/video0`
+
+### 3) 多摄像头推流 + 多客户端拉流
+
+支持同一信令服务器上多个流（stream_id），每个流可有多个拉流端。
+
+**多摄像头推流**（每个摄像头一个进程，共用一个信令）：
+
+```bash
+# 终端 1：启动信令 + 摄像头 1
+./scripts/push.sh livestream /dev/video0
+
+# 终端 2：摄像头 2（不重复启动信令）
+START_SIGNALING=0 ./scripts/push.sh cam2 /dev/video11
+
+# 终端 3：摄像头 3
+START_SIGNALING=0 ./scripts/push.sh cam3 /dev/video12
+```
+
+**多客户端拉流**（同一流可被多个客户端拉取）：
+
+```bash
+# 拉取 livestream
+./scripts/pull.sh 127.0.0.1:8765 livestream
+
+# 拉取 cam2
+./scripts/pull.sh 127.0.0.1:8765 cam2
+
+# 远端拉取
+./scripts/pull.sh 192.168.1.10:8765 livestream
+```
+
 ## 常见问题
 
-- 推流卡在连接：确认 8765 端口可达，且双方网络互通。
+- **推流卡在连接**：确认 8765 端口可达，且双方网络互通。
+- **MJPEG 报错**：安装 `libjpeg-turbo8-dev` 并重新编译。
+- **yuyv/mjpeg 无法启动**：先执行 `sudo modprobe v4l2loopback video_nr=12`，确保 `LOOPBACK_DEVICE` 与 `video_nr` 对应。
 - 拉流无画面：先确认推流端已开始发送，再启动拉流端。
 - 跨机失败：检查防火墙/路由/DNS/代理策略。
 

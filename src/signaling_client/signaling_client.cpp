@@ -12,6 +12,51 @@
 
 namespace webrtc_demo {
 
+namespace {
+
+static std::string EscapeJsonString(const std::string& input) {
+    std::ostringstream oss;
+    for (char c : input) {
+        if (c == '"') oss << "\\\"";
+        else if (c == '\\') oss << "\\\\";
+        else if (c == '\n') oss << "\\n";
+        else if (c == '\r') oss << "\\r";
+        else oss << c;
+    }
+    return oss.str();
+}
+
+static std::string ExtractJsonString(const std::string& line, const std::string& key) {
+    std::string token = "\"" + key + "\":\"";
+    size_t p = line.find(token);
+    if (p == std::string::npos) return "";
+    p += token.size();
+    std::string out;
+    for (size_t i = p; i < line.size(); ++i) {
+        if (line[i] == '\\' && i + 1 < line.size()) {
+            char n = line[i + 1];
+            if (n == 'n') out += '\n';
+            else if (n == 'r') out += '\r';
+            else out += n;
+            ++i;
+            continue;
+        }
+        if (line[i] == '"') break;
+        out += line[i];
+    }
+    return out;
+}
+
+static int ExtractJsonInt(const std::string& line, const std::string& key, int fallback = 0) {
+    std::string token = "\"" + key + "\":";
+    size_t p = line.find(token);
+    if (p == std::string::npos) return fallback;
+    p += token.size();
+    return std::atoi(line.c_str() + p);
+}
+
+}  // namespace
+
 static void ParseHostPort(const std::string& addr, std::string& host, uint16_t& port) {
     std::string s = addr;
     if (s.find("ws://") == 0) s = s.substr(5);
@@ -26,9 +71,11 @@ static void ParseHostPort(const std::string& addr, std::string& host, uint16_t& 
     }
 }
 
-SignalingClient::SignalingClient(const std::string& server_addr, const std::string& role)
+SignalingClient::SignalingClient(const std::string& server_addr, const std::string& role,
+                                const std::string& stream_id)
     : server_addr_(server_addr), role_(role) {
     ParseHostPort(server_addr, host_, port_);
+    stream_id_ = stream_id.empty() ? "livestream" : stream_id;
 }
 
 SignalingClient::~SignalingClient() {
@@ -62,7 +109,8 @@ bool SignalingClient::Connect() {
     std::cout << "[Signaling] TCP 连接成功" << std::endl;
 
     std::ostringstream reg;
-    reg << "{\"type\":\"register\",\"role\":\"" << role_ << "\"}\n";
+    reg << "{\"type\":\"register\",\"role\":\"" << role_ << "\",\"stream_id\":\""
+        << EscapeJsonString(stream_id_) << "\"}\n";
     std::string msg = reg.str();
     if (send(sock_fd_, msg.data(), msg.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(msg.size())) {
         if (on_error_) on_error_("send register failed");
@@ -102,44 +150,51 @@ void SignalingClient::SendLine(const std::string& line) {
     (void)sent;
 }
 
-void SignalingClient::SendOffer(const std::string& sdp) {
-    std::ostringstream oss;
-    oss << "{\"type\":\"offer\",\"sdp\":\"";
-    for (char c : sdp) {
-        if (c == '"') oss << "\\\"";
-        else if (c == '\\') oss << "\\\\";
-        else if (c == '\n') oss << "\\n";
-        else if (c == '\r') oss << "\\r";
-        else oss << c;
+std::string SignalingClient::ResolveTargetPeer(const std::string& to_peer_id) const {
+    if (!to_peer_id.empty()) return to_peer_id;
+    std::lock_guard<std::mutex> lock(peer_mutex_);
+    return last_remote_peer_id_;
+}
+
+void SignalingClient::SendOffer(const std::string& sdp, const std::string& to_peer_id) {
+    std::string target = ResolveTargetPeer(to_peer_id);
+    if (role_ == "publisher" && target.empty()) {
+        std::cerr << "[Signaling] 忽略未指定目标订阅者的 offer" << std::endl;
+        return;
     }
-    oss << "\"}";
+    std::ostringstream oss;
+    oss << "{\"type\":\"offer\"";
+    if (!target.empty()) {
+        oss << ",\"to\":\"" << EscapeJsonString(target) << "\"";
+    }
+    oss << ",\"sdp\":\"" << EscapeJsonString(sdp) << "\"";
+    oss << "}";
     SendLine(oss.str());
 }
 
-void SignalingClient::SendAnswer(const std::string& sdp) {
+void SignalingClient::SendAnswer(const std::string& sdp, const std::string& to_peer_id) {
+    std::string target = ResolveTargetPeer(to_peer_id);
     std::ostringstream oss;
-    oss << "{\"type\":\"answer\",\"sdp\":\"";
-    for (char c : sdp) {
-        if (c == '"') oss << "\\\"";
-        else if (c == '\\') oss << "\\\\";
-        else if (c == '\n') oss << "\\n";
-        else if (c == '\r') oss << "\\r";
-        else oss << c;
+    oss << "{\"type\":\"answer\"";
+    if (!target.empty()) {
+        oss << ",\"to\":\"" << EscapeJsonString(target) << "\"";
     }
-    oss << "\"}";
+    oss << ",\"sdp\":\"" << EscapeJsonString(sdp) << "\"";
+    oss << "}";
     SendLine(oss.str());
 }
 
 void SignalingClient::SendIceCandidate(const std::string& mid, int mline_index,
-                                       const std::string& candidate) {
+                                       const std::string& candidate,
+                                       const std::string& to_peer_id) {
+    std::string target = ResolveTargetPeer(to_peer_id);
     std::ostringstream oss;
-    oss << "{\"type\":\"ice\",\"mid\":\"" << mid << "\",\"mlineIndex\":" << mline_index
-       << ",\"candidate\":\"";
-    for (char c : candidate) {
-        if (c == '"') oss << "\\\"";
-        else if (c == '\\') oss << "\\\\";
-        else oss << c;
+    oss << "{\"type\":\"ice\"";
+    if (!target.empty()) {
+        oss << ",\"to\":\"" << EscapeJsonString(target) << "\"";
     }
+    oss << ",\"mid\":\"" << EscapeJsonString(mid) << "\",\"mlineIndex\":" << mline_index
+        << ",\"candidate\":\"" << EscapeJsonString(candidate);
     oss << "\"}";
     SendLine(oss.str());
 }
@@ -170,70 +225,44 @@ void SignalingClient::ParseAndDispatch(const std::string& line) {
     if (line.empty()) return;
     if (line.find("\"type\":\"register\"") != std::string::npos) return;
 
-    if (line.find("\"type\":\"answer\"") != std::string::npos ||
-        line.find("\"type\": \"answer\"") != std::string::npos) {
-        size_t sdp_start = line.find("\"sdp\":\"");
-        if (sdp_start != std::string::npos) {
-            sdp_start += 7;
-            std::string sdp;
-            for (size_t i = sdp_start; i < line.size(); ++i) {
-                if (line[i] == '\\' && i + 1 < line.size()) {
-                    if (line[i + 1] == 'n') sdp += '\n';
-                    else if (line[i + 1] == 'r') sdp += '\r';
-                    else if (line[i + 1] == '"') sdp += '"';
-                    else sdp += line[i + 1];
-                    ++i;
-                } else if (line[i] == '"') break;
-                else sdp += line[i];
-            }
-            if (on_answer_) on_answer_("answer", sdp);
-        }
+    std::string type = ExtractJsonString(line, "type");
+    std::string from = ExtractJsonString(line, "from");
+    if (!from.empty()) {
+        std::lock_guard<std::mutex> lock(peer_mutex_);
+        last_remote_peer_id_ = from;
+    }
+
+    if (type == "welcome") {
+        std::string id = ExtractJsonString(line, "id");
+        std::lock_guard<std::mutex> lock(peer_mutex_);
+        self_peer_id_ = id;
         return;
     }
-    if (line.find("\"type\":\"offer\"") != std::string::npos ||
-        line.find("\"type\": \"offer\"") != std::string::npos) {
-        size_t sdp_start = line.find("\"sdp\":\"");
-        if (sdp_start != std::string::npos) {
-            sdp_start += 7;
-            std::string sdp;
-            for (size_t i = sdp_start; i < line.size(); ++i) {
-                if (line[i] == '\\' && i + 1 < line.size()) {
-                    if (line[i + 1] == 'n') sdp += '\n';
-                    else if (line[i + 1] == 'r') sdp += '\r';
-                    else if (line[i + 1] == '"') sdp += '"';
-                    else sdp += line[i + 1];
-                    ++i;
-                } else if (line[i] == '"') break;
-                else sdp += line[i];
-            }
-            if (on_offer_) on_offer_("offer", sdp);
-        }
+
+    if (type == "subscriber_join") {
+        if (on_subscriber_join_) on_subscriber_join_(from);
         return;
     }
-    if (line.find("\"type\":\"ice\"") != std::string::npos ||
-        line.find("\"type\": \"ice\"") != std::string::npos) {
-        std::string mid, candidate;
-        int mline = 0;
-        size_t p = line.find("\"mid\":\"");
-        if (p != std::string::npos) {
-            p += 6;
-            size_t end = line.find('"', p);
-            if (end != std::string::npos) mid = line.substr(p, end - p);
-        }
-        p = line.find("\"mlineIndex\":");
-        if (p != std::string::npos) mline = std::atoi(line.c_str() + p + 12);
-        p = line.find("\"candidate\":\"");
-        if (p != std::string::npos) {
-            p += 13;
-            for (size_t i = p; i < line.size(); ++i) {
-                if (line[i] == '\\' && i + 1 < line.size()) {
-                    candidate += line[i + 1];
-                    ++i;
-                } else if (line[i] == '"') break;
-                else candidate += line[i];
-            }
-        }
-        if (on_ice_ && !candidate.empty()) on_ice_(mid, mline, candidate);
+    if (type == "subscriber_leave") {
+        if (on_subscriber_leave_) on_subscriber_leave_(from);
+        return;
+    }
+
+    if (type == "answer") {
+        std::string sdp = ExtractJsonString(line, "sdp");
+        if (on_answer_) on_answer_(from, "answer", sdp);
+        return;
+    }
+    if (type == "offer") {
+        std::string sdp = ExtractJsonString(line, "sdp");
+        if (on_offer_) on_offer_(from, "offer", sdp);
+        return;
+    }
+    if (type == "ice") {
+        std::string mid = ExtractJsonString(line, "mid");
+        std::string candidate = ExtractJsonString(line, "candidate");
+        int mline = ExtractJsonInt(line, "mlineIndex", 0);
+        if (on_ice_ && !candidate.empty()) on_ice_(from, mid, mline, candidate);
     }
 }
 

@@ -16,20 +16,42 @@ struct PushStreamerConfig {
     int video_fps{30};
     int video_device_index{0};      /// 设备索引，与 --list-cameras 输出对应
     std::string video_device_path;  /// 设备路径，如 /dev/video11，优先于 index
-    bool enable_audio{true};
+    std::string capture_format{"auto"};  /// 采集格式: auto|yuyv|mjpeg。yuyv/mjpeg 需 v4l2loopback
+    std::string loopback_device;    /// v4l2loopback 设备路径，capture_format 非 auto 时使用
+    bool enable_audio{false};  /// 默认纯视频；true 时仍不创建麦克风流，仅放宽 SDP 音频意向
     bool test_capture_only{false};  /// 仅测试采集，不创建 offer/连接
     bool test_encode_mode{false};   /// 本地回环验证 H264 编码（采集→编码→接收）
+    /// 信令多订阅者模式：仅对加入的拉流端 CreateOfferForPeer，不在 Start 末尾发 default offer
+    bool signaling_subscriber_offer_only{false};
     std::string stun_server{"stun:stun.l.google.com:19302"};
     std::string turn_server;
     std::string turn_username;
     std::string turn_password;
+
+    // 码率控制
+    std::string bitrate_mode{"vbr"};  /// cbr=固定码率, vbr=可变码率
+    int target_bitrate_kbps{1000};
+    int min_bitrate_kbps{100};
+    int max_bitrate_kbps{2000};
+
+    // 可变分辨率策略
+    std::string degradation_preference{"maintain_framerate"};
+
+    // 编解码
+    std::string video_codec{"h264"};  /// h264|h265|vp8|vp9|av1
+    std::string h264_profile{"main"}; /// baseline|main|high
+    std::string h264_level{"3.0"};
+    int keyframe_interval{0};        /// GOP 帧数，0=自动
+    int capture_warmup_sec{0};       /// 摄像头预热秒数，默认 0（极速启动）
 };
 
 /// SDP 回调：用于将 SDP 发送到信令服务器
-using OnSdpCallback = std::function<void(const std::string& type, const std::string& sdp)>;
+using OnSdpCallback = std::function<void(const std::string& peer_id, const std::string& type,
+                                         const std::string& sdp)>;
 
 /// ICE 候选回调：用于将 ICE 候选发送到信令服务器
-using OnIceCandidateCallback = std::function<void(const std::string& mid, int mline_index, const std::string& candidate)>;
+using OnIceCandidateCallback = std::function<void(const std::string& peer_id, const std::string& mid,
+                                                  int mline_index, const std::string& candidate)>;
 
 /// 帧回调：每收到一帧调用，参数为 (帧数, 宽, 高)，用于验证采集是否正常
 using OnFrameCallback = std::function<void(unsigned int frame_count, int width, int height)>;
@@ -62,9 +84,14 @@ public:
 
     /// 设置远端 SDP（Answer），用于 P2P 模式
     bool SetRemoteDescription(const std::string& type, const std::string& sdp);
+    bool SetRemoteDescriptionForPeer(const std::string& peer_id, const std::string& type,
+                                     const std::string& sdp);
 
     /// 添加远端 ICE 候选
     void AddRemoteIceCandidate(const std::string& mid, int mline_index, const std::string& candidate);
+    void AddRemoteIceCandidateForPeer(const std::string& peer_id, const std::string& mid,
+                                      int mline_index, const std::string& candidate);
+    void CreateOfferForPeer(const std::string& peer_id);
 
     /// 回调设置
     void SetOnSdpCallback(OnSdpCallback cb);

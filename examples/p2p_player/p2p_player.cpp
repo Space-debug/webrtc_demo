@@ -12,10 +12,30 @@
 #include <rtc_video_track.h>
 
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 
 namespace p2p {
+
+namespace {
+
+void EnableAlsaNullDeviceFallback() {
+    const char* path = "/tmp/webrtc_demo_alsa_null.conf";
+    std::ofstream out(path, std::ios::trunc);
+    if (out) {
+        out << "pcm.!default {\n"
+               "  type asym\n"
+               "  playback.pcm \"null\"\n"
+               "  capture.pcm \"null\"\n"
+               "}\n";
+        out.close();
+        setenv("ALSA_CONFIG_PATH", path, 1);
+    }
+}
+
+}  // namespace
 
 class VideoRenderer
     : public libwebrtc::RTCVideoRenderer<libwebrtc::scoped_refptr<libwebrtc::RTCVideoFrame>> {
@@ -43,15 +63,28 @@ private:
 
 class P2pPlayer::Impl : public libwebrtc::RTCPeerConnectionObserver {
 public:
-    explicit Impl(const std::string& url) : signaling_(std::make_unique<webrtc_demo::SignalingClient>(url, "subscriber")) {}
+    explicit Impl(const std::string& url, const std::string& stream_id)
+        : signaling_(std::make_unique<webrtc_demo::SignalingClient>(url, "subscriber", stream_id)) {}
 
     bool Initialize() {
         std::cout << "[P2pPlayer] 初始化 LibWebRTC..." << std::endl;
         if (!libwebrtc::LibWebRTC::Initialize()) return false;
         factory_ = libwebrtc::LibWebRTC::CreateRTCPeerConnectionFactory();
-        if (!factory_ || !factory_->Initialize()) {
+        if (!factory_) {
             libwebrtc::LibWebRTC::Terminate();
             return false;
+        }
+        // 先做 ALSA null 注入，避免无声卡环境在 Initialize 内部直接 abort。
+        EnableAlsaNullDeviceFallback();
+        if (!factory_->Initialize()) {
+            std::cerr << "[P2pPlayer] factory init failed, try video-only fallback (ALSA null)"
+                      << std::endl;
+            EnableAlsaNullDeviceFallback();
+            factory_ = libwebrtc::LibWebRTC::CreateRTCPeerConnectionFactory();
+            if (!factory_ || !factory_->Initialize()) {
+                libwebrtc::LibWebRTC::Terminate();
+                return false;
+            }
         }
         std::cout << "[P2pPlayer] 创建 PeerConnection (recvonly)..." << std::endl;
         return CreatePeerConnection();
@@ -81,6 +114,8 @@ public:
         rtc_config.tcp_candidate_policy = libwebrtc::TcpCandidatePolicy::kTcpCandidatePolicyDisabled;
         // 抗花屏：DSCP QoS 标记
         rtc_config.enable_dscp = true;
+        // 纯视频拉流，不协商音频
+        rtc_config.offer_to_receive_audio = false;
 
         auto constraints = libwebrtc::RTCMediaConstraints::Create();
         peer_connection_ = factory_->Create(rtc_config, constraints);
@@ -109,6 +144,10 @@ public:
     }
 
     void CreateAnswer() {
+        auto constraints = libwebrtc::RTCMediaConstraints::Create();
+        constraints->AddOptionalConstraint(
+            libwebrtc::RTCMediaConstraints::kOfferToReceiveAudio,
+            libwebrtc::RTCMediaConstraints::kValueFalse);
         peer_connection_->CreateAnswer(
             [this](const libwebrtc::string& sdp, const libwebrtc::string& type) {
                 peer_connection_->SetLocalDescription(
@@ -124,7 +163,7 @@ public:
             [this](const char* err) {
                 if (on_error_) on_error_(std::string("CreateAnswer: ") + err);
             },
-            libwebrtc::RTCMediaConstraints::Create());
+            constraints);
     }
 
     void AddRemoteIceCandidate(const std::string& mid, int mline_index, const std::string& candidate) {
@@ -201,8 +240,8 @@ public:
     OnErrorCallback on_error_;
 };
 
-P2pPlayer::P2pPlayer(const std::string& signaling_url)
-    : impl_(std::make_unique<Impl>(signaling_url)) {}
+P2pPlayer::P2pPlayer(const std::string& signaling_url, const std::string& stream_id)
+    : impl_(std::make_unique<Impl>(signaling_url, stream_id)) {}
 
 P2pPlayer::~P2pPlayer() { Stop(); }
 
@@ -213,13 +252,16 @@ void P2pPlayer::Play() {
     impl_->on_error_ = on_error_;
     impl_->video_renderer_ = std::make_shared<VideoRenderer>(on_video_frame_);
 
-    impl_->signaling_->SetOnOffer([this](const std::string& type, const std::string& sdp) {
-        std::cout << "[P2pPlayer] 收到 offer (type=" << type << ", len=" << sdp.size() << ")" << std::endl;
+    impl_->signaling_->SetOnOffer([this](const std::string& peer_id, const std::string& type,
+                                         const std::string& sdp) {
+        std::cout << "[P2pPlayer] 收到 offer from=" << peer_id
+                  << " (type=" << type << ", len=" << sdp.size() << ")" << std::endl;
         impl_->SetRemoteDescription(type, sdp);
     });
-    impl_->signaling_->SetOnIce([this](const std::string& mid, int mline_index,
+    impl_->signaling_->SetOnIce([this](const std::string& peer_id, const std::string& mid, int mline_index,
                                        const std::string& candidate) {
-        std::cout << "[P2pPlayer] 收到 ICE 候选 mid=" << mid << " idx=" << mline_index << std::endl;
+        std::cout << "[P2pPlayer] 收到 ICE 候选 from=" << peer_id << " mid=" << mid
+                  << " idx=" << mline_index << std::endl;
         impl_->AddRemoteIceCandidate(mid, mline_index, candidate);
     });
     impl_->signaling_->SetOnError([this](const std::string& msg) {

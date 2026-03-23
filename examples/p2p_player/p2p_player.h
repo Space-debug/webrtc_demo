@@ -11,7 +11,9 @@ enum class ConnectionState { New, Connecting, Connected, Disconnected, Failed, C
 
 class P2pPlayer {
 public:
-    explicit P2pPlayer(const std::string& signaling_url);
+    /// stream_id: 要拉取的流 ID，多流时需指定，默认 livestream
+    explicit P2pPlayer(const std::string& signaling_url,
+                       const std::string& stream_id = "livestream");
     ~P2pPlayer();
 
     void Play();
