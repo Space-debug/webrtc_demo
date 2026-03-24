@@ -1,6 +1,7 @@
 #include "push_streamer.h"
 #include "camera_utils.h"
 #include "capture_bridge.h"
+#include "webrtc_field_trials.h"
 #include <libwebrtc.h>
 
 using libwebrtc::scoped_refptr;
@@ -24,10 +25,13 @@ using libwebrtc::scoped_refptr;
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -49,6 +53,172 @@ void EnableAlsaNullDeviceFallback() {
         out.close();
         setenv("ALSA_CONFIG_PATH", path, 1);
     }
+}
+
+static bool FecStatsNameContainsFec(const std::string& n) {
+    std::string lower;
+    lower.reserve(n.size());
+    for (unsigned char c : n) {
+        lower.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return lower.find("fec") != std::string::npos;
+}
+
+static uint64_t FecStatsMemberToUint(const libwebrtc::RTCStatsMember& m) {
+    using T = libwebrtc::RTCStatsMember::Type;
+    switch (m.GetType()) {
+        case T::kUint64:
+            return m.ValueUint64();
+        case T::kUint32:
+            return m.ValueUint32();
+        case T::kInt64: {
+            int64_t v = m.ValueInt64();
+            return v > 0 ? static_cast<uint64_t>(v) : 0;
+        }
+        case T::kInt32: {
+            int32_t v = m.ValueInt32();
+            return v > 0 ? static_cast<uint64_t>(v) : 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+static void FecAccumulateFromMembers(const libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>& rep,
+                                     bool* any_fec_named,
+                                     uint64_t* max_val) {
+    if (!rep || !any_fec_named || !max_val) {
+        return;
+    }
+    const auto members = rep->Members();
+    for (size_t i = 0; i < members.size(); ++i) {
+        const auto& mem = members[i];
+        if (!mem || !mem->IsDefined()) {
+            continue;
+        }
+        if (!FecStatsNameContainsFec(mem->GetName().std_string())) {
+            continue;
+        }
+        using T = libwebrtc::RTCStatsMember::Type;
+        switch (mem->GetType()) {
+            case T::kUint64:
+            case T::kUint32:
+            case T::kInt64:
+            case T::kInt32:
+                break;
+            default:
+                continue;
+        }
+        uint64_t v = FecStatsMemberToUint(*mem);
+        *any_fec_named = true;
+        if (v > *max_val) {
+            *max_val = v;
+        }
+    }
+}
+
+static uint64_t FecJsonUintAfterKey(const std::string& j, const char* key) {
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t p = j.find(needle);
+    if (p == std::string::npos) {
+        return UINT64_MAX;
+    }
+    p = j.find(':', p + needle.size());
+    if (p == std::string::npos) {
+        return UINT64_MAX;
+    }
+    ++p;
+    while (p < j.size() && std::isspace(static_cast<unsigned char>(j[p]))) {
+        ++p;
+    }
+    if (p >= j.size() || !std::isdigit(static_cast<unsigned char>(j[p]))) {
+        return UINT64_MAX;
+    }
+    uint64_t v = 0;
+    while (p < j.size() && std::isdigit(static_cast<unsigned char>(j[p]))) {
+        v = v * 10 + static_cast<uint64_t>(j[p] - '0');
+        ++p;
+    }
+    return v;
+}
+
+/// 从 outbound-rtp 报告中汇总 FEC 发送计数（WebRTC 标准字段 fecPacketsSent / fecBytesSent）。
+static void DumpOutboundFecLinkLine(std::ostream& out,
+                                    libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
+                                    const std::string& peer_tag,
+                                    int timeout_ms) {
+    using clock = std::chrono::system_clock;
+    const int64_t t_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
+
+    if (!pc) {
+        out << "[fec-link] t_ms=" << t_ms << " peer=" << peer_tag << " err=no_pc\n" << std::flush;
+        return;
+    }
+
+    struct Agg {
+        uint64_t fec_packets_sent{UINT64_MAX};
+        uint64_t fec_bytes_sent{UINT64_MAX};
+        bool any_fec_member{false};
+        uint64_t fec_member_max{0};
+    };
+    auto agg = std::make_shared<Agg>();
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> fut = done->get_future();
+
+    pc->GetStats(
+        [agg, done](const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
+            // 不限于 outbound-rtp：部分 libwebrtc 绑定把 fec* 放在其它报告或未区分类型
+            for (size_t i = 0; i < reports.size(); ++i) {
+                const auto& rep = reports[i];
+                if (!rep) {
+                    continue;
+                }
+                FecAccumulateFromMembers(rep, &agg->any_fec_member, &agg->fec_member_max);
+                std::string j = rep->ToJson().std_string();
+                uint64_t v = FecJsonUintAfterKey(j, "fecPacketsSent");
+                if (v != UINT64_MAX) {
+                    if (agg->fec_packets_sent == UINT64_MAX || v > agg->fec_packets_sent) {
+                        agg->fec_packets_sent = v;
+                    }
+                }
+                v = FecJsonUintAfterKey(j, "fecBytesSent");
+                if (v != UINT64_MAX) {
+                    if (agg->fec_bytes_sent == UINT64_MAX || v > agg->fec_bytes_sent) {
+                        agg->fec_bytes_sent = v;
+                    }
+                }
+            }
+            done->set_value();
+        },
+        [done, &out, t_ms, peer_tag](const char* err) {
+            out << "[fec-link] t_ms=" << t_ms << " peer=" << peer_tag << " GetStats_error=" << (err ? err : "")
+                << "\n" << std::flush;
+            done->set_value();
+        });
+
+    if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
+        out << "[fec-link] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
+        return;
+    }
+
+    std::ostringstream pkt_s;
+    if (agg->fec_packets_sent == UINT64_MAX) {
+        pkt_s << "KEY_MISSING";
+    } else {
+        pkt_s << agg->fec_packets_sent;
+    }
+    std::ostringstream by_s;
+    if (agg->fec_bytes_sent == UINT64_MAX) {
+        by_s << "KEY_MISSING";
+    } else {
+        by_s << agg->fec_bytes_sent;
+    }
+
+    out << "[fec-link] t_ms=" << t_ms << " peer=" << peer_tag << " fecPacketsSent=" << pkt_s.str()
+        << " fecBytesSent=" << by_s.str() << " fec_named_member_max=" << agg->fec_member_max
+        << " has_fec_named_member=" << (agg->any_fec_member ? "1" : "0") << "\n"
+        << std::flush;
 }
 
 }  // namespace
@@ -172,6 +342,7 @@ public:
     };
 
     bool Initialize() {
+        webrtc_demo::EnsureFlexfecFieldTrials(config_.enable_flexfec, config_.flexfec_field_trials);
         std::cout << "[PushStreamer] 初始化 LibWebRTC..." << std::endl;
         if (!libwebrtc::LibWebRTC::Initialize()) {
             std::cerr << "[PushStreamer] LibWebRTC init failed" << std::endl;
@@ -506,8 +677,14 @@ public:
                                           << *sdp_str << "\n--- End ---\n" << std::flush;
                             }
                             DoLoopbackExchange(*type_str, *sdp_str);
-                        } else if (on_sdp_) {
-                            on_sdp_(*peer_id_ptr, *type_str, *sdp_str);
+                        } else {
+                            if (std::getenv("WEBRTC_DUMP_OFFER") && on_sdp_) {
+                                std::cout << "\n--- Local offer SDP (signaling peer=" << *peer_id_ptr
+                                          << ") ---\n" << *sdp_str << "\n--- End ---\n" << std::flush;
+                            }
+                            if (on_sdp_) {
+                                on_sdp_(*peer_id_ptr, *type_str, *sdp_str);
+                            }
                         }
                     },
                     [](const char* err) {
@@ -936,6 +1113,27 @@ public:
     }
     bool TestCaptureOnly() const { return config_.test_capture_only; }
     bool SignalingSubscriberOfferOnly() const { return config_.signaling_subscriber_offer_only; }
+
+    void LogFecLinkStatsForAllPeers(std::ostream& out) {
+        std::vector<std::pair<std::string, scoped_refptr<libwebrtc::RTCPeerConnection>>> copy;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& kv : peer_connections_) {
+                copy.emplace_back(kv.first, kv.second);
+            }
+        }
+        if (copy.empty()) {
+            using clock = std::chrono::system_clock;
+            const int64_t t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     clock::now().time_since_epoch())
+                                     .count();
+            out << "[fec-link] t_ms=" << t_ms << " peer=(none) note=no_subscriber_connections\n" << std::flush;
+            return;
+        }
+        for (const auto& pr : copy) {
+            DumpOutboundFecLinkLine(out, pr.second, pr.first, 5000);
+        }
+    }
 };
 
 PushStreamer::PushStreamer(const PushStreamerConfig& config)
@@ -1014,6 +1212,10 @@ unsigned int PushStreamer::GetFrameCount() const {
 
 unsigned int PushStreamer::GetDecodedFrameCount() const {
     return impl_->GetDecodedFrameCount();
+}
+
+void PushStreamer::LogFecLinkStatsForAllPeers(std::ostream& out) {
+    impl_->LogFecLinkStatsForAllPeers(out);
 }
 
 }  // namespace webrtc_demo

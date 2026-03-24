@@ -2,6 +2,7 @@
 #define P2P_PLAYER_H
 
 #include <functional>
+#include <iosfwd>
 #include <memory>
 #include <string>
 
@@ -16,6 +17,9 @@ public:
                        const std::string& stream_id = "livestream");
     ~P2pPlayer();
 
+    /// 与推流端一致：在 Play() 前调用；在 LibWebRTC::Initialize 前注入 FlexFEC Field Trials
+    void SetFlexfecOptions(bool enable, const std::string& field_trials_override = {});
+
     void Play();
     void Stop();
     bool IsPlaying() const { return is_playing_; }
@@ -28,6 +32,9 @@ public:
 
     using OnErrorCallback = std::function<void(const std::string& msg)>;
     void SetOnError(OnErrorCallback cb) { on_error_ = std::move(cb); }
+
+    /// 对 PeerConnection 调用 GetStats，输出 [fec-verify] fecPacketsReceived=…（供可选自动化；多数绑定无独立 FEC 计数）。
+    void DumpInboundFecReceiverStats(std::ostream& out, int timeout_ms = 5000);
 
 private:
     class Impl;

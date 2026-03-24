@@ -3,7 +3,9 @@
 #include "config_loader.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <csignal>
 #include <cstring>
 #include <fstream>
@@ -37,6 +39,7 @@ static void PrintPlayerUsage(const char* prog) {
               << "  --headless         无窗口：仅通过控制台统计解码帧，适合 SSH/远程\n"
               << "  --frames N         headless 模式下收到至少 N 帧即成功退出（默认 30）\n"
               << "  --timeout-sec S    headless 超时秒数（默认 120）\n"
+              << "  --enable-flexfec   启用 FlexFEC-03（与 ENABLE_FLEXFEC=1 一致，推流端也需开）\n"
               << "  -h, --help         显示本帮助\n"
               << std::endl;
 }
@@ -45,6 +48,7 @@ int main(int argc, char* argv[]) {
     std::string url = "127.0.0.1:8765";
     std::string stream_id = "livestream";
     std::string config_path;
+    bool cmdline_enable_flexfec = false;
     bool headless = false;
     unsigned need_frames = 30;
     int timeout_sec = 120;
@@ -58,6 +62,9 @@ int main(int argc, char* argv[]) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             config_path = argv[i + 1];
             i += 2;
+        } else if (strcmp(argv[i], "--enable-flexfec") == 0) {
+            cmdline_enable_flexfec = true;
+            ++i;
         } else if (strcmp(argv[i], "--headless") == 0) {
             headless = true;
             ++i;
@@ -82,6 +89,28 @@ int main(int argc, char* argv[]) {
     if (i < argc) url = argv[i++];
     if (i < argc) stream_id = argv[i++];
 
+    bool player_flexfec = false;
+    std::string player_flexfec_override;
+    if (!config_path.empty() && !cfg.empty()) {
+        std::string ef = cfg.GetStream(stream_id, "ENABLE_FLEXFEC", cfg.Get("ENABLE_FLEXFEC", "0"));
+        for (auto& c : ef) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        player_flexfec = (ef == "1" || ef == "true" || ef == "yes" || ef == "on");
+        player_flexfec_override =
+            cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", cfg.Get("FLEXFEC_FIELD_TRIALS", ""));
+    }
+    if (const char* ef_env = std::getenv("ENABLE_FLEXFEC")) {
+        std::string s(ef_env);
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s == "1" || s == "true" || s == "yes" || s == "on") {
+            player_flexfec = true;
+        } else if (s == "0" || s == "false" || s == "no" || s == "off") {
+            player_flexfec = false;
+        }
+    }
+    if (cmdline_enable_flexfec) {
+        player_flexfec = true;
+    }
+
     std::cout << "=== WebRTC P2P 拉流" << (headless ? " (无头/仅日志)" : " (SDL2)") << " ===" << std::endl;
     std::cout << "信令: " << url << " 流: " << stream_id << std::endl;
     if (!headless) {
@@ -99,6 +128,7 @@ int main(int argc, char* argv[]) {
     }
 
     p2p::P2pPlayer player(url, stream_id);
+    player.SetFlexfecOptions(player_flexfec, player_flexfec_override);
     g_player = &player;
 
     std::signal(SIGINT, SignalHandler);
@@ -138,6 +168,9 @@ int main(int argc, char* argv[]) {
         while (player.IsPlaying() && clock::now() < deadline) {
             if (decoded_frames >= need_frames) {
                 std::cout << "[Headless] 拉流验证成功：共收到 " << decoded_frames.load() << " 帧" << std::endl;
+                if (std::getenv("P2P_FEC_STATS_VERIFY")) {
+                    player.DumpInboundFecReceiverStats(std::cout, 5000);
+                }
                 player.Stop();
                 g_player = nullptr;
                 return 0;

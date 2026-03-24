@@ -1,11 +1,35 @@
 #!/bin/bash
 # 本机无头验证：信令 + 推流 + p2p_player --headless（通过帧计数判定成功）
 # 默认尽量按 config/streams.conf 运行，参数仅在显式传入时覆盖
-# 用法: ./scripts/test_p2p_headless.sh [摄像头设备]
+#
+# 用法:
+#   ./scripts/test_p2p_headless.sh [摄像头设备]
+#   ./scripts/test_p2p_headless.sh --fec [摄像头设备]       # SDP：发送端 Offer 与客户端收到的 Offer 均含 flexfec/ulpfec
+#   ./scripts/test_p2p_headless.sh --fec-link [摄像头设备] # 在 --fec 基础上，用推流端周期性 GetStats 看 fecPacketsSent/fecBytesSent 是否持续增长
+# 环境变量:
+#   FEC_VERIFY=1        与 --fec 等效
+#   FEC_LINK_VERIFY=1   与 --fec-link 等效（也可 FEC_VERIFY=1 FEC_LINK_VERIFY=1）
+#   ENABLE_FLEXFEC=1    由脚本在 FEC 模式下自动 export
+#   WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC  推流采样间隔秒，默认 2
+#   FEC_PCAP_VERIFY=1   可选：test-encode 解析 PT + tcpdump+tshark（SRTP 下常仍无 rtp 层）
+#   P2P_TEST_PORT       信令端口，默认 18765
+#
+# --fec-link 在 SRTP 无法解密时依赖 libwebrtc 是否在 outbound-rtp 统计里暴露 fecPacketsSent；若无则 exit 4。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+FEC_VERIFY="${FEC_VERIFY:-0}"
+FEC_LINK_VERIFY="${FEC_LINK_VERIFY:-0}"
+if [ "${1:-}" = "--fec-link" ]; then
+    FEC_VERIFY=1
+    FEC_LINK_VERIFY=1
+    shift
+elif [ "${1:-}" = "--fec" ]; then
+    FEC_VERIFY=1
+    shift
+fi
 
 CONFIG_FILE="${CONFIG_FILE:-${PROJECT_ROOT}/config/streams.conf}"
 cfg_get() {
@@ -39,7 +63,6 @@ cfg_get() {
 
 STREAM_ID="${STREAM_ID:-$(cfg_get DEFAULT_STREAM livestream)}"
 CAMERA="${1:-$(cfg_get DEFAULT_CAMERA /dev/video11)}"
-# 避免与已占用 8765 的信令冲突
 PORT="${P2P_TEST_PORT:-18765}"
 
 case "$(uname -m)" in
@@ -61,9 +84,74 @@ for f in "$SIG" "$PUSH" "$PULL"; do
     fi
 done
 
+# FEC_PCAP 用 PT（仅 FEC_PCAP_VERIFY=1 时由 test-encode 解析）
+FEC_RTP_PT=""
+FEC_SDP_KIND=""
+PCAP_FILE=""
+TCPDUMP_PID=""
 PUSH_LOG=""
+PULL_OUT=""
+
+# FEC 模式：Field Trials + 信令 SDP 落盘（推流本地 Offer / 拉流远端 Offer）
+if [ "$FEC_VERIFY" = "1" ]; then
+    export ENABLE_FLEXFEC=1
+    export WEBRTC_DUMP_REMOTE_OFFER=1
+    echo "[test][fec] ENABLE_FLEXFEC=1、WEBRTC_DUMP_REMOTE_OFFER=1；推流进程将带 WEBRTC_DUMP_OFFER=1 打印本地 Offer"
+    if [ "$FEC_LINK_VERIFY" = "1" ]; then
+        export WEBRTC_FEC_LINK_PROBE=1
+        export WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC="${WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC:-2}"
+        echo "[test][fec-link] WEBRTC_FEC_LINK_PROBE=1 INTERVAL=${WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC}s（观察 outbound-rtp 的 fec* 计数）"
+    fi
+    if [ "${FEC_PCAP_VERIFY:-0}" = "1" ]; then
+        SDP_F=$(mktemp)
+        echo "[test][fec] FEC_PCAP_VERIFY=1：短时 test-encode 解析 FEC PT…"
+        if ! ENABLE_FLEXFEC=1 WEBRTC_DUMP_OFFER=1 timeout 30 "$PUSH" --test-encode --config "$CONFIG_FILE" \
+            "$STREAM_ID" "$CAMERA" >"$SDP_F" 2>&1; then
+            echo "[test][fec] 警告: test-encode 未正常结束，仍尝试解析 SDP" >&2
+        fi
+        FEC_RTP_PT=$(grep -i 'a=rtpmap:' "$SDP_F" | grep -i flexfec | head -1 | sed -E 's/.*a=rtpmap:([0-9]+).*/\1/') || true
+        FEC_SDP_KIND="flexfec"
+        if [ -z "$FEC_RTP_PT" ]; then
+            FEC_RTP_PT=$(grep -i 'a=rtpmap:' "$SDP_F" | grep -i ulpfec | head -1 | sed -E 's/.*a=rtpmap:([0-9]+).*/\1/') || true
+            FEC_SDP_KIND="ulpfec"
+        fi
+        rm -f "$SDP_F"
+        sleep 2
+        if [ -z "$FEC_RTP_PT" ]; then
+            echo "[test][fec] 错误: FEC_PCAP_VERIFY=1 但 test-encode SDP 未解析到 flexfec/ulpfec PT" >&2
+            exit 2
+        fi
+        echo "[test][fec] pcap 过滤用 PT=$FEC_RTP_PT ($FEC_SDP_KIND)"
+        if ! command -v tcpdump >/dev/null 2>&1; then
+            echo "[test][fec] 错误: 未找到 tcpdump" >&2
+            exit 2
+        fi
+        if ! command -v tshark >/dev/null 2>&1; then
+            echo "[test][fec] 错误: 未找到 tshark" >&2
+            exit 2
+        fi
+        PCAP_FILE=$(mktemp /tmp/p2p_fec_test.XXXXXX.pcap)
+        tcpdump -i any -U -w "$PCAP_FILE" udp >/dev/null 2>&1 &
+        TCPDUMP_PID=$!
+        sleep 0.4
+        if ! kill -0 "$TCPDUMP_PID" 2>/dev/null; then
+            echo "[test][fec] tcpdump 未存活（需 root/cap_net_raw）" >&2
+            rm -f "$PCAP_FILE"
+            PCAP_FILE=""
+            exit 2
+        fi
+    fi
+    PULL_OUT=$(mktemp)
+fi
+
 cleanup() {
+    if [ -n "${TCPDUMP_PID:-}" ] && kill -0 "$TCPDUMP_PID" 2>/dev/null; then
+        kill "$TCPDUMP_PID" 2>/dev/null || true
+        wait "$TCPDUMP_PID" 2>/dev/null || true
+    fi
     rm -f "${PUSH_LOG:-}"
+    rm -f "${PULL_OUT:-}"
+    rm -f "${PCAP_FILE:-}"
     if [ -n "${PUSH_PID:-}" ] && kill -0 "$PUSH_PID" 2>/dev/null; then
         kill "$PUSH_PID" 2>/dev/null || true
         wait "$PUSH_PID" 2>/dev/null || true
@@ -82,11 +170,15 @@ sleep 0.5
 PUSH_LOG=$(mktemp)
 
 echo "[test] 启动推流 camera=$CAMERA stream=$STREAM_ID（日志: $PUSH_LOG）"
-"$PUSH" --config "$CONFIG_FILE" --signaling "127.0.0.1:$PORT" \
-    "$STREAM_ID" "$CAMERA" >"$PUSH_LOG" 2>&1 &
+if [ "$FEC_VERIFY" = "1" ]; then
+    WEBRTC_DUMP_OFFER=1 "$PUSH" --config "$CONFIG_FILE" --signaling "127.0.0.1:$PORT" \
+        "$STREAM_ID" "$CAMERA" >"$PUSH_LOG" 2>&1 &
+else
+    "$PUSH" --config "$CONFIG_FILE" --signaling "127.0.0.1:$PORT" \
+        "$STREAM_ID" "$CAMERA" >"$PUSH_LOG" 2>&1 &
+fi
 PUSH_PID=$!
 
-# 等推流完成初始化（含摄像头预热），避免拉流端过早协商导致 0 帧
 echo "[test] 等待推流端打印「推流器已启动」..."
 READY=0
 for _ in $(seq 1 90); do
@@ -108,8 +200,106 @@ if [ "$READY" != 1 ]; then
 fi
 sleep 1
 
-echo "[test] 无头拉流（需收到至少 20 帧）"
-"$PULL" --config "$CONFIG_FILE" --headless --frames 20 --timeout-sec 90 "127.0.0.1:$PORT" "$STREAM_ID"
-RC=$?
+H_FRAMES=20
+H_TO=90
+if [ "$FEC_VERIFY" = "1" ] && [ "$FEC_LINK_VERIFY" = "1" ]; then
+    H_FRAMES=50
+    H_TO=120
+fi
+
+echo "[test] 无头拉流（需收到至少 ${H_FRAMES} 帧）"
+if [ -n "${PULL_OUT:-}" ]; then
+    "$PULL" --config "$CONFIG_FILE" --headless --frames "$H_FRAMES" --timeout-sec "$H_TO" "127.0.0.1:$PORT" "$STREAM_ID" 2>&1 | tee "$PULL_OUT"
+    RC=${PIPESTATUS[0]}
+else
+    "$PULL" --config "$CONFIG_FILE" --headless --frames "$H_FRAMES" --timeout-sec "$H_TO" "127.0.0.1:$PORT" "$STREAM_ID"
+    RC=$?
+fi
 echo "[test] p2p_player 退出码: $RC"
+
+if [ "$FEC_VERIFY" = "1" ] && [ "$RC" -eq 0 ] && [ -n "${PULL_OUT:-}" ] && [ -f "$PULL_OUT" ]; then
+    # SDP：flexfec-03 / ulpfec 等
+    fec_rtpmap_re='a=rtpmap:[0-9]+[[:space:]]+[^[:cntrl:]]*(flexfec|ulpfec)'
+    PUSH_LINE=$(grep -iE "$fec_rtpmap_re" "$PUSH_LOG" 2>/dev/null | head -1 || true)
+    PULL_LINE=$(grep -iE "$fec_rtpmap_re" "$PULL_OUT" 2>/dev/null | head -1 || true)
+    PUSH_LINE="${PUSH_LINE//$'\r'/}"
+    PULL_LINE="${PULL_LINE//$'\r'/}"
+    if [ -z "$PUSH_LINE" ]; then
+        echo "[test][fec] 失败: 推流日志未见 a=rtpmap … flexfec/ulpfec（发送端本地 Offer 未带 FEC 媒体行）" >&2
+        exit 3
+    fi
+    if [ -z "$PULL_LINE" ]; then
+        echo "[test][fec] 失败: 拉流日志未见 a=rtpmap … flexfec/ulpfec（客户端未收到含 FEC 的远端 Offer）" >&2
+        exit 3
+    fi
+    echo "[test][fec] 通过(SDP): 发送端本地 Offer 含 FEC 行: $PUSH_LINE"
+    echo "[test][fec] 通过(SDP): 客户端收到的远端 Offer 含 FEC 行: $PULL_LINE"
+
+    if [ "$FEC_LINK_VERIFY" = "1" ]; then
+        link_ok=0
+        n_pkt=$(grep '\[fec-link\]' "$PUSH_LOG" | grep -c 'fecPacketsSent=[0-9]' || true)
+        n_pkt="${n_pkt//[[:space:]]/}"
+        if [ "${n_pkt:-0}" -ge 2 ]; then
+            v_first=$(grep '\[fec-link\]' "$PUSH_LOG" | grep 'fecPacketsSent=[0-9]' | head -1 | sed -E 's/.*fecPacketsSent=([0-9]+).*/\1/')
+            v_last=$(grep '\[fec-link\]' "$PUSH_LOG" | grep 'fecPacketsSent=[0-9]' | tail -1 | sed -E 's/.*fecPacketsSent=([0-9]+).*/\1/')
+            if [ -n "$v_first" ] && [ -n "$v_last" ] && [ "$v_last" -gt "$v_first" ]; then
+                link_ok=1
+            fi
+        fi
+        if [ "$link_ok" = "0" ]; then
+            n_by=$(grep '\[fec-link\]' "$PUSH_LOG" | grep -c 'fecBytesSent=[0-9]' || true)
+            n_by="${n_by//[[:space:]]/}"
+            if [ "${n_by:-0}" -ge 2 ]; then
+                b_first=$(grep '\[fec-link\]' "$PUSH_LOG" | grep 'fecBytesSent=[0-9]' | head -1 | sed -E 's/.*fecBytesSent=([0-9]+).*/\1/')
+                b_last=$(grep '\[fec-link\]' "$PUSH_LOG" | grep 'fecBytesSent=[0-9]' | tail -1 | sed -E 's/.*fecBytesSent=([0-9]+).*/\1/')
+                if [ -n "$b_first" ] && [ -n "$b_last" ] && [ "$b_last" -gt "$b_first" ]; then
+                    link_ok=1
+                fi
+            fi
+        fi
+        if [ "$link_ok" = "0" ]; then
+            n_nm=$(grep '\[fec-link\]' "$PUSH_LOG" | grep -c 'fec_named_member_max=[1-9]' || true)
+            n_nm="${n_nm//[[:space:]]/}"
+            if [ "${n_nm:-0}" -ge 2 ]; then
+                m_first=$(grep '\[fec-link\]' "$PUSH_LOG" | sed -n 's/.*fec_named_member_max=\([0-9]*\).*/\1/p' | head -1)
+                m_last=$(grep '\[fec-link\]' "$PUSH_LOG" | sed -n 's/.*fec_named_member_max=\([0-9]*\).*/\1/p' | tail -1)
+                if [ -n "$m_first" ] && [ -n "$m_last" ] && [ "$m_last" -gt "$m_first" ]; then
+                    link_ok=1
+                fi
+            fi
+        fi
+        if [ "$link_ok" != "1" ]; then
+            echo "[test][fec-link] 失败: 推流日志中 fecPacketsSent/fecBytesSent 未在多次采样间增长（或字段恒为 KEY_MISSING）。" >&2
+            echo "[test][fec-link] 说明: SRTP 下无法直接数 RTP 包；若库不暴露 outbound fec* 统计则无法用本脚本验证「链路上持续发 FEC」。" >&2
+            grep '\[fec-link\]' "$PUSH_LOG" | tail -20 >&2 || true
+            exit 4
+        fi
+        echo "[test][fec-link] 通过: 发送侧 outbound-rtp 的 FEC 计数随时间上升（反映持续产生 FEC 发送路径）。"
+    fi
+
+    if [ -n "${TCPDUMP_PID:-}" ] && kill -0 "$TCPDUMP_PID" 2>/dev/null; then
+        kill "$TCPDUMP_PID" 2>/dev/null || true
+        wait "$TCPDUMP_PID" 2>/dev/null || true
+    fi
+    TCPDUMP_PID=""
+    if [ "${FEC_PCAP_VERIFY:-0}" = "1" ] && [ -n "${PCAP_FILE:-}" ] && [ -f "$PCAP_FILE" ]; then
+        FEC_COUNT=$(tshark -r "$PCAP_FILE" -Y "rtp && rtp.p_type == ${FEC_RTP_PT}" 2>/dev/null | wc -l)
+        FEC_COUNT="${FEC_COUNT//[[:space:]]/}"
+        RTP_TOTAL=$(tshark -r "$PCAP_FILE" -Y "rtp" 2>/dev/null | wc -l)
+        RTP_TOTAL="${RTP_TOTAL//[[:space:]]/}"
+        echo "[test][fec] pcap 参考: RTP 解析行=$RTP_TOTAL, FEC PT=${FEC_RTP_PT} 行数=$FEC_COUNT（SRTP 时常为 0）"
+        rm -f "$PCAP_FILE"
+        PCAP_FILE=""
+    else
+        rm -f "${PCAP_FILE:-}"
+        PCAP_FILE=""
+    fi
+elif [ -n "${TCPDUMP_PID:-}" ] && kill -0 "$TCPDUMP_PID" 2>/dev/null; then
+    kill "$TCPDUMP_PID" 2>/dev/null || true
+    wait "$TCPDUMP_PID" 2>/dev/null || true
+    TCPDUMP_PID=""
+    rm -f "${PCAP_FILE:-}"
+    PCAP_FILE=""
+fi
+
 exit "$RC"

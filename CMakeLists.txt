@@ -62,6 +62,7 @@ add_executable(webrtc_push_demo
     src/config_loader/config_loader.cpp
     src/signaling_client/signaling_client.cpp
     src/push_streamer/push_streamer.cpp
+    src/webrtc_field_trials/webrtc_field_trials.cpp
 )
 
 target_include_directories(webrtc_push_demo PRIVATE

@@ -7,6 +7,7 @@
 #include <csignal>
 #include <cstring>
 #include <fstream>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <thread>
@@ -57,6 +58,7 @@ void PrintUsage(const char* prog) {
               << "  --loopback DEV    v4l2loopback 设备路径，如 /dev/video12\n"
               << "  --no-audio        纯视频推流（默认，与 ENABLE_AUDIO=0 一致）\n"
               << "  --enable-audio    允许 SDP 协商音频意向（未实现麦克风采集）\n"
+              << "  --enable-flexfec  启用 FlexFEC-03（与配置 ENABLE_FLEXFEC=1 等效，收发端都需开）\n"
               << "参数:\n"
               << "  stream_id         流 ID，默认 livestream\n"
               << "  camera            摄像头路径或索引，如 /dev/video11 或 11\n"
@@ -89,6 +91,7 @@ int main(int argc, char* argv[]) {
     std::optional<int> cmdline_fps;
     std::string cmdline_capture_format, cmdline_loopback;
     std::optional<bool> cmdline_enable_audio;
+    bool cmdline_enable_flexfec = false;
     bool use_signaling = true;
     bool test_capture = false;
     bool test_encode = false;
@@ -127,6 +130,8 @@ int main(int argc, char* argv[]) {
             cmdline_enable_audio = false;
         } else if (strcmp(argv[arg_idx], "--enable-audio") == 0) {
             cmdline_enable_audio = true;
+        } else if (strcmp(argv[arg_idx], "--enable-flexfec") == 0) {
+            cmdline_enable_flexfec = true;
         } else if (argv[arg_idx][0] != '-') {
             break;
         }
@@ -166,6 +171,14 @@ int main(int argc, char* argv[]) {
             for (auto& c : ea) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             config.enable_audio = (ea == "1" || ea == "true" || ea == "yes" || ea == "on");
         }
+        {
+            std::string ef = cfg.GetStream(stream_id, "ENABLE_FLEXFEC", cfg.Get("ENABLE_FLEXFEC", "0"));
+            for (auto& c : ef) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            config.enable_flexfec =
+                (ef == "1" || ef == "true" || ef == "yes" || ef == "on");
+            config.flexfec_field_trials =
+                cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", cfg.Get("FLEXFEC_FIELD_TRIALS", ""));
+        }
     }
     if (!cmdline_capture_format.empty()) config.capture_format = cmdline_capture_format;
     if (!cmdline_loopback.empty()) config.loopback_device = cmdline_loopback;
@@ -174,6 +187,18 @@ int main(int argc, char* argv[]) {
     if (cmdline_width.has_value()) config.video_width = *cmdline_width;
     if (cmdline_height.has_value()) config.video_height = *cmdline_height;
     if (cmdline_fps.has_value()) config.video_fps = *cmdline_fps;
+    if (const char* ef_env = std::getenv("ENABLE_FLEXFEC")) {
+        std::string s(ef_env);
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s == "1" || s == "true" || s == "yes" || s == "on") {
+            config.enable_flexfec = true;
+        } else if (s == "0" || s == "false" || s == "no" || s == "off") {
+            config.enable_flexfec = false;
+        }
+    }
+    if (cmdline_enable_flexfec) {
+        config.enable_flexfec = true;
+    }
     if (stream_id.empty()) stream_id = "livestream";
 
     config.stream_id = stream_id;
@@ -225,6 +250,7 @@ int main(int argc, char* argv[]) {
               << " 预热=" << config.capture_warmup_sec << "s"
               << " 采集格式=" << config.capture_format
               << " 设备=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
+              << " flexfec=" << (config.enable_flexfec ? "on" : "off")
               << std::endl;
     if (config.keyframe_interval > 0) {
         std::cout << "[Main] 提示: 当前 libwebrtc 封装未暴露强制关键帧间隔接口，"
@@ -359,8 +385,24 @@ int main(int argc, char* argv[]) {
     std::cout << "推流已启动。拉流端: ./build/bin/p2p_player" << std::endl;
     std::cout << "Press Ctrl+C to stop." << std::endl;
 
+    const char* fec_link_probe = std::getenv("WEBRTC_FEC_LINK_PROBE");
+    int fec_link_interval_sec = 2;
+    if (const char* iv = std::getenv("WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC")) {
+        int v = std::atoi(iv);
+        if (v > 0) {
+            fec_link_interval_sec = v;
+        }
+    }
+
     while (streamer.IsStreaming()) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (fec_link_probe && fec_link_probe[0] != '\0' && std::strcmp(fec_link_probe, "0") != 0) {
+            std::this_thread::sleep_for(std::chrono::seconds(fec_link_interval_sec));
+            if (streamer.IsStreaming()) {
+                streamer.LogFecLinkStatsForAllPeers(std::cout);
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
 
     g_streamer = nullptr;

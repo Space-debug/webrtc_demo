@@ -1,8 +1,10 @@
 #include "p2p_player.h"
 #include "signaling_client.h"
+#include "webrtc_field_trials.h"
 #include <libwebrtc.h>
 #include <rtc_mediaconstraints.h>
 #include <rtc_peerconnection.h>
+#include <cctype>
 #include <rtc_peerconnection_factory.h>
 #include <rtc_rtp_receiver.h>
 #include <rtc_rtp_transceiver.h>
@@ -13,13 +15,105 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
+#include <cstdint>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <mutex>
 
 namespace p2p {
 
 namespace {
+
+static bool NameContainsFec(const std::string& n) {
+    std::string lower;
+    lower.reserve(n.size());
+    for (unsigned char c : n) {
+        lower.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return lower.find("fec") != std::string::npos;
+}
+
+static uint64_t StatsMemberToUint(const libwebrtc::RTCStatsMember& m) {
+    using T = libwebrtc::RTCStatsMember::Type;
+    switch (m.GetType()) {
+        case T::kUint64:
+            return m.ValueUint64();
+        case T::kUint32:
+            return m.ValueUint32();
+        case T::kInt64: {
+            int64_t v = m.ValueInt64();
+            return v > 0 ? static_cast<uint64_t>(v) : 0;
+        }
+        case T::kInt32: {
+            int32_t v = m.ValueInt32();
+            return v > 0 ? static_cast<uint64_t>(v) : 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+/// 从 RTCStats 成员中累加名称含 "fec" 的整型计数（比依赖 ToJson 字段名更稳）。
+static void AccumulateFecFromMembers(const libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>& rep,
+                                     bool* any_fec_named_counter,
+                                     uint64_t* max_value) {
+    if (!rep || !any_fec_named_counter || !max_value) {
+        return;
+    }
+    const auto members = rep->Members();
+    for (size_t i = 0; i < members.size(); ++i) {
+        const auto& mem = members[i];
+        if (!mem || !mem->IsDefined()) {
+            continue;
+        }
+        std::string name = mem->GetName().std_string();
+        if (!NameContainsFec(name)) {
+            continue;
+        }
+        using T = libwebrtc::RTCStatsMember::Type;
+        switch (mem->GetType()) {
+            case T::kUint64:
+            case T::kUint32:
+            case T::kInt64:
+            case T::kInt32:
+                break;
+            default:
+                continue;
+        }
+        uint64_t v = StatsMemberToUint(*mem);
+        *any_fec_named_counter = true;
+        if (v > *max_value) {
+            *max_value = v;
+        }
+    }
+}
+
+uint64_t JsonUintAfterKey(const std::string& j, const char* key) {
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t p = j.find(needle);
+    if (p == std::string::npos) {
+        return UINT64_MAX;
+    }
+    p = j.find(':', p + needle.size());
+    if (p == std::string::npos) {
+        return UINT64_MAX;
+    }
+    ++p;
+    while (p < j.size() && std::isspace(static_cast<unsigned char>(j[p]))) {
+        ++p;
+    }
+    if (p >= j.size() || !std::isdigit(static_cast<unsigned char>(j[p]))) {
+        return UINT64_MAX;
+    }
+    uint64_t v = 0;
+    while (p < j.size() && std::isdigit(static_cast<unsigned char>(j[p]))) {
+        v = v * 10 + static_cast<uint64_t>(j[p] - '0');
+        ++p;
+    }
+    return v;
+}
 
 void EnableAlsaNullDeviceFallback() {
     const char* path = "/tmp/webrtc_demo_alsa_null.conf";
@@ -66,7 +160,13 @@ public:
     explicit Impl(const std::string& url, const std::string& stream_id)
         : signaling_(std::make_unique<webrtc_demo::SignalingClient>(url, "subscriber", stream_id)) {}
 
+    void SetFlexfecOptions(bool enable, std::string override_trials) {
+        flexfec_enable_ = enable;
+        flexfec_override_ = std::move(override_trials);
+    }
+
     bool Initialize() {
+        webrtc_demo::EnsureFlexfecFieldTrials(flexfec_enable_, flexfec_override_);
         std::cout << "[P2pPlayer] 初始化 LibWebRTC..." << std::endl;
         if (!libwebrtc::LibWebRTC::Initialize()) return false;
         factory_ = libwebrtc::LibWebRTC::CreateRTCPeerConnectionFactory();
@@ -238,12 +338,102 @@ public:
     std::mutex mutex_;
     OnConnectionStateCallback on_connection_state_;
     OnErrorCallback on_error_;
+    bool flexfec_enable_{false};
+    std::string flexfec_override_;
+
+    void DumpInboundFecReceiverStats(std::ostream& out, int timeout_ms) {
+        libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pc = peer_connection_;
+        }
+        if (!pc) {
+            out << "[fec-verify] fecPacketsReceived=NO_PEER_CONNECTION\n";
+            return;
+        }
+
+        struct Agg {
+            bool had_key{false};
+            uint64_t max_val{0};
+        };
+        auto agg = std::make_shared<Agg>();
+        auto done = std::make_shared<std::promise<void>>();
+        std::future<void> fut = done->get_future();
+
+        // 使用无 receiver 的 GetStats：部分 libwebrtc 绑定在 GetStats(receiver) 上会崩溃
+        pc->GetStats(
+            [agg, done](const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
+                const bool debug = std::getenv("P2P_FEC_STATS_DEBUG") != nullptr;
+                std::ofstream dbg;
+                if (debug) {
+                    dbg.open("/tmp/webrtc_fec_stats_debug.txt", std::ios::out | std::ios::trunc);
+                }
+                for (size_t i = 0; i < reports.size(); ++i) {
+                    const auto& rep = reports[i];
+                    if (!rep) {
+                        continue;
+                    }
+                    if (debug && dbg) {
+                        dbg << "type=" << rep->type().std_string() << "\n";
+                        const auto members = rep->Members();
+                        for (size_t mi = 0; mi < members.size(); ++mi) {
+                            const auto& mem = members[mi];
+                            if (!mem) {
+                                continue;
+                            }
+                            dbg << "  m[" << mi << "] name=" << mem->GetName().std_string()
+                                << " defined=" << (mem->IsDefined() ? 1 : 0)
+                                << " ty=" << static_cast<int>(mem->GetType()) << "\n";
+                        }
+                        dbg << "  json_prefix=" << rep->ToJson().std_string().substr(0, 400) << "\n---\n";
+                    }
+                    AccumulateFecFromMembers(rep, &agg->had_key, &agg->max_val);
+                    std::string j = rep->ToJson().std_string();
+                    static const char* kJsonKeys[] = {"fecPacketsReceived", "fecBytesReceived", "fecPacketsSent",
+                                                    "fecBytesSent"};
+                    for (const char* key : kJsonKeys) {
+                        uint64_t v = JsonUintAfterKey(j, key);
+                        if (v != UINT64_MAX) {
+                            agg->had_key = true;
+                            if (v > agg->max_val) {
+                                agg->max_val = v;
+                            }
+                        }
+                    }
+                }
+                done->set_value();
+            },
+            [done, &out](const char* err) {
+                out << "[fec-verify] GetStats_error=" << (err ? err : "") << "\n";
+                done->set_value();
+            });
+
+        if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
+            out << "[fec-verify] fecPacketsReceived=STATS_TIMEOUT\n";
+            return;
+        }
+
+        if (agg->had_key) {
+            // 脚本只解析本行；max_val 为名称含 fec 的成员或 JSON 中 fec* 计数器的最大值
+            out << "[fec-verify] fecPacketsReceived=" << agg->max_val << "\n";
+        } else {
+            out << "[fec-verify] fecPacketsReceived=KEY_MISSING\n";
+        }
+    }
 };
 
 P2pPlayer::P2pPlayer(const std::string& signaling_url, const std::string& stream_id)
     : impl_(std::make_unique<Impl>(signaling_url, stream_id)) {}
 
 P2pPlayer::~P2pPlayer() { Stop(); }
+
+void P2pPlayer::SetFlexfecOptions(bool enable, const std::string& field_trials_override) {
+    impl_->SetFlexfecOptions(enable, field_trials_override);
+}
+
+void P2pPlayer::DumpInboundFecReceiverStats(std::ostream& out, int timeout_ms) {
+    impl_->DumpInboundFecReceiverStats(out, timeout_ms);
+}
 
 void P2pPlayer::Play() {
     if (is_playing_) return;
@@ -256,6 +446,10 @@ void P2pPlayer::Play() {
                                          const std::string& sdp) {
         std::cout << "[P2pPlayer] 收到 offer from=" << peer_id
                   << " (type=" << type << ", len=" << sdp.size() << ")" << std::endl;
+        if (std::getenv("WEBRTC_DUMP_REMOTE_OFFER")) {
+            std::cout << "\n--- Remote offer SDP (from publisher via signaling) ---\n"
+                      << sdp << "\n--- End remote offer ---\n" << std::flush;
+        }
         impl_->SetRemoteDescription(type, sdp);
     });
     impl_->signaling_->SetOnIce([this](const std::string& peer_id, const std::string& mid, int mline_index,

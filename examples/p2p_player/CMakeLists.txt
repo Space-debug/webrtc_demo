@@ -35,6 +35,7 @@ add_executable(p2p_player
     sdl_display.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/config_loader/config_loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/signaling_client/signaling_client.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/webrtc_field_trials/webrtc_field_trials.cpp
 )
 
 target_include_directories(p2p_player PRIVATE

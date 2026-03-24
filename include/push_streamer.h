@@ -2,6 +2,7 @@
 #define PUSH_STREAMER_H
 
 #include <functional>
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,6 +44,11 @@ struct PushStreamerConfig {
     std::string h264_level{"3.0"};
     int keyframe_interval{0};        /// GOP 帧数，0=自动
     int capture_warmup_sec{0};       /// 摄像头预热秒数，默认 0（极速启动）
+
+    /// FlexFEC-03：在 LibWebRTC::Initialize 前注入 WEBRTC_FIELD_TRIALS；拉流端也需开启
+    bool enable_flexfec{false};
+    /// 非空则作为完整 trials 串覆盖默认；通常留空即可
+    std::string flexfec_field_trials;
 };
 
 /// SDP 回调：用于将 SDP 发送到信令服务器
@@ -107,6 +113,10 @@ public:
 
     /// 是否正在推流
     bool IsStreaming() const { return is_streaming_; }
+
+    /// 对每个订阅者 PeerConnection 调用 GetStats，从 outbound-rtp 抽取 FEC 发送相关计数（若库有暴露）。
+    /// 与 WEBRTC_FEC_LINK_PROBE 配合：用于观察链路上是否持续产生 FEC 发送侧统计。
+    void LogFecLinkStatsForAllPeers(std::ostream& out);
 
 private:
     class Impl;
