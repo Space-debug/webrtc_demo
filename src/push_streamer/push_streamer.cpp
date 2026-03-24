@@ -9,6 +9,7 @@ using libwebrtc::scoped_refptr;
 #include <rtc_media_stream.h>
 #include <rtc_peerconnection.h>
 #include <rtc_peerconnection_factory.h>
+#include <rtc_rtp_capabilities.h>
 #include <rtc_rtp_parameters.h>
 #include <rtc_rtp_receiver.h>
 #include <rtc_rtp_sender.h>
@@ -21,6 +22,7 @@ using libwebrtc::scoped_refptr;
 #include <helper.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -304,10 +306,86 @@ public:
         tmp.push_back(libwebrtc::string(config_.stream_id.c_str()));
         libwebrtc::vector<libwebrtc::string> stream_ids(tmp);
         peer_connection_->AddTrack(video_track_, stream_ids);
+        ApplyVideoCodecPreferences(peer_connection_);
         ApplyEncodingParameters(peer_connection_);
         std::cout << "[PushStreamer] 已添加视频轨道 (stream_id=" << config_.stream_id << ")" << std::endl;
 
         return true;
+    }
+
+    /// 在 CreateOffer 之前调用：按 VIDEO_CODEC 将首选编码（如 H264）排到能力列表最前，影响 SDP m=video 中 PT 顺序。
+    void ApplyVideoCodecPreferences(libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc) {
+        if (!factory_ || !pc) return;
+
+        std::string want = config_.video_codec;
+        for (auto& ch : want) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        if (want.empty()) want = "h264";
+
+        auto caps = factory_->GetRtpSenderCapabilities(libwebrtc::RTCMediaType::VIDEO);
+        if (!caps) {
+            std::cerr << "[PushStreamer] GetRtpSenderCapabilities(VIDEO) 为空，跳过编解码器排序" << std::endl;
+            return;
+        }
+
+        libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::RTCRtpCodecCapability>> in = caps->codecs();
+        if (in.size() == 0) return;
+
+        auto mime_lower = [](libwebrtc::scoped_refptr<libwebrtc::RTCRtpCodecCapability> c) -> std::string {
+            std::string m = c->mime_type().std_string();
+            for (auto& ch : m) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            return m;
+        };
+
+        auto match_want = [&](const std::string& m) -> bool {
+            if (want == "h264") return m.find("h264") != std::string::npos;
+            if (want == "h265" || want == "hevc") {
+                return m.find("h265") != std::string::npos || m.find("hevc") != std::string::npos ||
+                       m.find("hev1") != std::string::npos;
+            }
+            if (want == "vp8") return m.find("vp8") != std::string::npos;
+            if (want == "vp9") return m.find("vp9") != std::string::npos;
+            if (want == "av1") return m.find("av1") != std::string::npos;
+            return m.find(want) != std::string::npos;
+        };
+
+        std::vector<libwebrtc::scoped_refptr<libwebrtc::RTCRtpCodecCapability>> preferred, other;
+        for (size_t i = 0; i < in.size(); ++i) {
+            auto c = in[i];
+            if (!c) continue;
+            if (match_want(mime_lower(c))) {
+                preferred.push_back(c);
+            } else {
+                other.push_back(c);
+            }
+        }
+
+        if (preferred.empty()) {
+            std::cout << "[PushStreamer] SetCodecPreferences 跳过: 无与 VIDEO_CODEC=" << config_.video_codec
+                      << " 匹配的 sender 能力项" << std::endl;
+            return;
+        }
+
+        std::vector<libwebrtc::scoped_refptr<libwebrtc::RTCRtpCodecCapability>> ordered;
+        ordered.reserve(preferred.size() + other.size());
+        ordered.insert(ordered.end(), preferred.begin(), preferred.end());
+        ordered.insert(ordered.end(), other.begin(), other.end());
+
+        libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::RTCRtpCodecCapability>> lw(ordered);
+
+        auto transceivers = pc->transceivers();
+        for (size_t i = 0; i < transceivers.size(); ++i) {
+            auto tr = transceivers[i];
+            if (!tr || tr->media_type() != libwebrtc::RTCMediaType::VIDEO) continue;
+            tr->SetCodecPreferences(lw);
+            std::cout << "[PushStreamer] SetCodecPreferences: 优先 " << want << "（" << preferred.size()
+                      << " 项置前 / 共 " << ordered.size() << " 项），Offer 中对应 PT 将排在 VP8 等之前"
+                      << std::endl;
+            return;
+        }
     }
 
     void ApplyEncodingParameters(
@@ -396,6 +474,7 @@ public:
         tmp.push_back(libwebrtc::string(config_.stream_id.c_str()));
         libwebrtc::vector<libwebrtc::string> stream_ids(tmp);
         pc->AddTrack(video_track_, stream_ids);
+        ApplyVideoCodecPreferences(pc);
         ApplyEncodingParameters(pc);
         peer_connections_[peer_id] = pc;
         extra_peer_observers_[peer_id] = std::move(observer);
@@ -422,6 +501,10 @@ public:
                     sdp, type,
                     [this, peer_id_ptr, type_str, sdp_str]() {
                         if (config_.test_encode_mode && peer_id_ptr->empty()) {
+                            if (std::getenv("WEBRTC_DUMP_OFFER")) {
+                                std::cout << "\n--- Local offer SDP ---\n"
+                                          << *sdp_str << "\n--- End ---\n" << std::flush;
+                            }
                             DoLoopbackExchange(*type_str, *sdp_str);
                         } else if (on_sdp_) {
                             on_sdp_(*peer_id_ptr, *type_str, *sdp_str);
