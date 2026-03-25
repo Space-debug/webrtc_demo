@@ -60,6 +60,8 @@ void PrintUsage(const char* prog) {
               << "环境变量:\n"
               << "  WEBRTC_LATENCY_STATS_PROBE=1  周期单行打印延时摘要(毫秒，如采集累计/编码累计/ICE往返等)\n"
               << "  WEBRTC_LATENCY_STATS_PROBE_INTERVAL_SEC=N  延迟统计间隔秒，默认 2\n"
+              << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N  创建 Offer 前至少 N 帧(0=关)，覆盖配置 CAPTURE_GATE_MIN_FRAMES\n"
+              << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N  等待门限最久 N 秒，覆盖 CAPTURE_GATE_MAX_WAIT_SEC\n"
               << "参数:\n"
               << "  stream_id         流 ID，默认 livestream\n"
               << "  camera            摄像头路径或索引，如 /dev/video11 或 11\n"
@@ -160,6 +162,10 @@ int main(int argc, char* argv[]) {
         config.keyframe_interval = cfg.GetStreamInt(stream_id, "KEYFRAME_INTERVAL", cfg.GetInt("KEYFRAME_INTERVAL", 0));
         config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC",
                                                      cfg.GetInt("CAPTURE_WARMUP_SEC", 0));
+        config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES",
+                                                          cfg.GetInt("CAPTURE_GATE_MIN_FRAMES", 0));
+        config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC",
+                                                            cfg.GetInt("CAPTURE_GATE_MAX_WAIT_SEC", 20));
         {
             std::string ea = cfg.GetStream(stream_id, "ENABLE_AUDIO", cfg.Get("ENABLE_AUDIO", "0"));
             for (auto& c : ea) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -190,6 +196,12 @@ int main(int argc, char* argv[]) {
     }
     if (cmdline_enable_flexfec) {
         config.enable_flexfec = true;
+    }
+    if (const char* g = std::getenv("WEBRTC_CAPTURE_GATE_MIN_FRAMES")) {
+        config.capture_gate_min_frames = std::atoi(g);
+    }
+    if (const char* gw = std::getenv("WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC")) {
+        config.capture_gate_max_wait_sec = std::atoi(gw);
     }
     if (stream_id.empty()) stream_id = "livestream";
 
@@ -228,6 +240,12 @@ int main(int argc, char* argv[]) {
         if (config.capture_warmup_sec < 0) {
             config.capture_warmup_sec = 0;
         }
+        if (config.capture_gate_min_frames < 0) {
+            config.capture_gate_min_frames = 0;
+        }
+        if (config.capture_gate_max_wait_sec < 1) {
+            config.capture_gate_max_wait_sec = 1;
+        }
         if (config.bitrate_mode == "cbr") {
             config.min_bitrate_kbps = config.target_bitrate_kbps;
             config.max_bitrate_kbps = config.target_bitrate_kbps;
@@ -240,6 +258,10 @@ int main(int argc, char* argv[]) {
               << " 码率=" << config.target_bitrate_kbps << "kbps(" << config.bitrate_mode << ")"
               << " 编码=" << config.video_codec
               << " 预热=" << config.capture_warmup_sec << "s"
+              << " 采集门限=" << (config.capture_gate_min_frames > 0
+                                    ? std::to_string(config.capture_gate_min_frames) + "帧≤" +
+                                          std::to_string(config.capture_gate_max_wait_sec) + "s"
+                                    : std::string("off"))
               << " 设备=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
               << " flexfec=" << (config.enable_flexfec ? "on" : "off")
               << std::endl;

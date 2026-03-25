@@ -42,6 +42,10 @@ struct PushStreamerConfig {
     std::string h264_level{"3.0"};
     int keyframe_interval{0};        /// GOP 帧数，0=自动
     int capture_warmup_sec{0};       /// 摄像头预热秒数，默认 0（极速启动）
+    /// 创建 Offer 前至少收到多少帧（与 FrameCountingRenderer 同源）；0=关闭。减轻 OpenH264「input fps 0」类告警。
+    int capture_gate_min_frames{0};
+    /// 等待采集门限的最长时间（秒），超时则放弃本次 Offer 并打日志
+    int capture_gate_max_wait_sec{20};
 
     /// FlexFEC-03：在 LibWebRTC::Initialize 前注入 WEBRTC_FIELD_TRIALS；拉流端也需开启
     bool enable_flexfec{false};

@@ -803,7 +803,42 @@ public:
         return true;
     }
 
+    /// 在 CreateOffer 前等待采集帧计数，避免编码器在刚连通时尚未收到帧而报 input framerate 0。
+    bool WaitForCaptureGate(const std::string& context) {
+        const int need = config_.capture_gate_min_frames;
+        if (need <= 0) {
+            return true;
+        }
+        if (!frame_counter_) {
+            return true;
+        }
+        int max_wait = config_.capture_gate_max_wait_sec;
+        if (max_wait < 1) {
+            max_wait = 1;
+        }
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::seconds(max_wait);
+        std::cout << "[PushStreamer] 采集门限: 等待至少 " << need << " 帧再创建 Offer（" << context
+                  << "），最长 " << max_wait << "s" << std::endl;
+        while (clock::now() < deadline) {
+            if (frame_counter_->GetFrameCount() >= static_cast<unsigned int>(need)) {
+                std::cout << "[PushStreamer] 采集门限已满足: " << frame_counter_->GetFrameCount() << " 帧（"
+                          << context << "）" << std::endl;
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+        const unsigned got = frame_counter_->GetFrameCount();
+        std::cerr << "[PushStreamer] 采集门限未满足: " << got << "/" << need << " 帧（" << max_wait
+                  << "s 内），跳过本次 Offer（" << context
+                  << "）。请检查摄像头占用、节点是否正确、或增大 CAPTURE_GATE_MAX_WAIT_SEC" << std::endl;
+        return false;
+    }
+
     void CreateOffer() {
+        if (!WaitForCaptureGate("default")) {
+            return;
+        }
         std::cout << "[PushStreamer] 创建默认 Offer..." << std::endl;
         CreateOfferOnConnection("", peer_connection_);
     }
@@ -824,6 +859,9 @@ public:
         }
         if (!pc) {
             std::cerr << "[PushStreamer] peer not found: " << peer_id << std::endl;
+            return;
+        }
+        if (!WaitForCaptureGate(std::string("peer=") + peer_id)) {
             return;
         }
         std::cout << "[PushStreamer] 为订阅者创建 Offer: " << peer_id << std::endl;
