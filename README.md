@@ -64,50 +64,29 @@ sudo apt install libjpeg-turbo8-dev
 ## 配置文件
 
 直接运行可执行文件时，可用 `--config path` 指定 `config/streams.conf`。  
-配置文件已按“功能分区”组织，格式为 `KEY=value`，并支持 `STREAM_<id>_<KEY>` 覆盖：
+格式为 `KEY=value`：**全局 KEY** 作为公共默认值，`STREAM_<stream_id>_<KEY>` **同名则覆盖**（多路时公共写一块，每路只写摄像头等差异）。
 
 ```ini
-# [A] 连接与会话
 SIGNALING_ADDR=127.0.0.1:8765
-ENABLE_AUDIO=0
+STREAM_ID=livestream
 
-# [B] 采集源
-DEFAULT_STREAM=livestream
-DEFAULT_CAMERA=/dev/video0
-
-# [C] 分辨率与帧率
-WIDTH=640
-HEIGHT=480
+# 公共（分辨率、码率、编码等）
+WIDTH=1280
+HEIGHT=720
 FPS=30
-
-# [E] 带宽控制
-TARGET_BITRATE=1000
-MIN_BITRATE=100
-MAX_BITRATE=2000
-
-# [F] 自适应降级策略
-DEGRADATION_PREFERENCE=maintain_framerate
-
-# [G] 编码器
+TARGET_BITRATE=2200
 VIDEO_CODEC=h264
-H264_PROFILE=main
-H264_LEVEL=3.0
 
-# [H] 按流覆盖：STREAM_<id>_<KEY>=value
+# 各路至少写 CAMERA；与公共相同的不必再写 STREAM_*_WIDTH 等
 STREAM_livestream_CAMERA=/dev/video0
-STREAM_livestream_WIDTH=640
-STREAM_livestream_HEIGHT=480
-STREAM_livestream_FPS=30
-STREAM_livestream_720p_CAMERA=/dev/video0
-STREAM_livestream_720p_WIDTH=1280
-STREAM_livestream_720p_HEIGHT=720
-STREAM_livestream_720p_DEGRADATION_PREFERENCE=maintain_resolution
+# STREAM_cam2_CAMERA=/dev/video13
+# STREAM_cam2_TARGET_BITRATE=1500
 ```
 
 说明：
-- 同一个 `stream_id` 一次只使用一组 `WIDTH/HEIGHT/FPS`。
-- 要覆盖“相机支持的所有分辨率”，建议为同一摄像头建立多个 stream profile（如 `livestream`、`livestream_720p`、`livestream_1080p`）。
-- 先用 `v4l2-ctl -d /dev/video0 --list-formats-ext` 查询设备真实支持档位，再写入对应 profile。
+- 省略命令行 `stream_id` 时用 `STREAM_ID`；摄像头来自 `STREAM_<id>_CAMERA`（无则空，需命令行或设备索引）。
+- 同一物理头多档分辨率可建多个 `stream_id`，公共参数共用，各路用 `STREAM_*` 只改 `WIDTH/HEIGHT/FPS` 等差异项。
+- 先用 `v4l2-ctl -d /dev/video0 --list-formats-ext` 查设备能力再填分辨率/帧率。
 
 ### 采集与像素格式（V4L2）
 

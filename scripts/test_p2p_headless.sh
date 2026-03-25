@@ -61,8 +61,8 @@ cfg_get() {
     fi
 }
 
-STREAM_ID="${STREAM_ID:-$(cfg_get DEFAULT_STREAM livestream)}"
-CAMERA="${1:-$(cfg_get DEFAULT_CAMERA /dev/video11)}"
+STREAM_ID="${STREAM_ID:-$(cfg_get STREAM_ID livestream)}"
+CAMERA="${1:-$(cfg_get "STREAM_${STREAM_ID}_CAMERA" /dev/video11)}"
 PORT="${P2P_TEST_PORT:-18765}"
 
 case "$(uname -m)" in

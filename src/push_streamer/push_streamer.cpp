@@ -64,9 +64,39 @@ static std::optional<double> LatencyMemberDoubleSeconds(const libwebrtc::RTCStat
     return m.ValueDouble();
 }
 
+static std::optional<uint64_t> LatencyMemberUint64(const libwebrtc::RTCStatsMember& m) {
+    using T = libwebrtc::RTCStatsMember::Type;
+    if (!m.IsDefined()) {
+        return std::nullopt;
+    }
+    if (m.GetType() == T::kUint64) {
+        return m.ValueUint64();
+    }
+    if (m.GetType() == T::kUint32) {
+        return static_cast<uint64_t>(m.ValueUint32());
+    }
+    return std::nullopt;
+}
+
 static void MergeMaxOptional(std::optional<double>* slot, double candidate_ms) {
     if (!slot->has_value() || candidate_ms > **slot) {
         *slot = candidate_ms;
+    }
+}
+
+static void AddOptionalDouble(std::optional<double>* slot, double add_ms) {
+    if (slot->has_value()) {
+        **slot += add_ms;
+    } else {
+        *slot = add_ms;
+    }
+}
+
+static void AddOptionalU64(std::optional<uint64_t>* slot, uint64_t add) {
+    if (slot->has_value()) {
+        **slot += add;
+    } else {
+        *slot = add;
     }
 }
 
@@ -77,14 +107,23 @@ struct LatencyOneLineSummary {
     std::optional<double> packet_send_delay_total_ms; // outbound-rtp totalPacketSendDelay
     std::optional<double> ice_current_rtt_ms;         // candidate-pair currentRoundTripTime（多对取最大）
     std::optional<double> remote_rtt_ms;              // remote-inbound-rtp roundTripTime
-    std::optional<double> remote_jitter_ms;         // remote-inbound-rtp jitter
+    std::optional<double> remote_jitter_ms;           // remote-inbound-rtp jitter
     std::optional<double> avg_rtcp_interval_ms;       // averageRtcpInterval（多处可能出现，取最大）
+    /// remote-inbound-rtp totalRoundTripTime（秒→毫秒）在单次报表内对多报告求和，便于与 roundTripTimeMeasurements 求和一致
+    std::optional<double> remote_total_rtt_sum_ms;
+    std::optional<uint64_t> remote_rtt_measurements;
 };
 
 static void AccumulateLatencySummary(const std::string& rtype,
                                      const std::string& name,
                                      const libwebrtc::RTCStatsMember& m,
                                      LatencyOneLineSummary* s) {
+    if (rtype == "remote-inbound-rtp" && name == "roundTripTimeMeasurements") {
+        if (auto u = LatencyMemberUint64(m)) {
+            AddOptionalU64(&s->remote_rtt_measurements, *u);
+        }
+        return;
+    }
     auto sec = LatencyMemberDoubleSeconds(m);
     if (!sec) {
         return;
@@ -104,6 +143,8 @@ static void AccumulateLatencySummary(const std::string& rtype,
         MergeMaxOptional(&s->remote_rtt_ms, ms);
     } else if (rtype == "remote-inbound-rtp" && name == "jitter") {
         MergeMaxOptional(&s->remote_jitter_ms, ms);
+    } else if (rtype == "remote-inbound-rtp" && name == "totalRoundTripTime") {
+        AddOptionalDouble(&s->remote_total_rtt_sum_ms, ms);
     } else if (name == "averageRtcpInterval") {
         MergeMaxOptional(&s->avg_rtcp_interval_ms, ms);
     }
@@ -118,34 +159,38 @@ static std::string FormatMsOptional(const std::optional<double>& v, int prec) {
     return o.str();
 }
 
-/// 对单个 PeerConnection 调用 GetStats，单行输出中文标签（单位 ms）。
-static void DumpLatencyStatsForPc(std::ostream& out,
-                                  libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
-                                  const std::string& peer_tag,
-                                  int timeout_ms) {
-    using clock = std::chrono::system_clock;
-    const int64_t t_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
+enum class LatencyPollStatus { Ok, Empty, Error, Timeout };
 
+struct LatencyPollResult {
+    LatencyPollStatus status{LatencyPollStatus::Ok};
+    const char* error_message{nullptr};
+    LatencyOneLineSummary sum;
+    int64_t latest_ts_us{0};
+};
+
+/// 阻塞等待 GetStats 回调，汇总 LatencyOneLineSummary（供瞬时打印与滚动差分共用）。
+static LatencyPollResult PollLatencySummaryForPc(libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
+                                                 int timeout_ms) {
+    LatencyPollResult timeout_r;
+    timeout_r.status = LatencyPollStatus::Timeout;
     if (!pc) {
-        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " err=no_pc\n" << std::flush;
-        return;
+        LatencyPollResult r;
+        r.status = LatencyPollStatus::Error;
+        r.error_message = "no_pc";
+        return r;
     }
 
-    auto done = std::make_shared<std::promise<void>>();
-    std::future<void> fut = done->get_future();
+    auto done = std::make_shared<std::promise<LatencyPollResult>>();
+    std::future<LatencyPollResult> fut = done->get_future();
 
     pc->GetStats(
-        [done, &out, t_ms, peer_tag](
-            const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
+        [done](const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
+            LatencyPollResult out;
             if (reports.size() == 0) {
-                out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats\n";
-                out << std::flush;
-                done->set_value();
+                out.status = LatencyPollStatus::Empty;
+                done->set_value(out);
                 return;
             }
-
-            LatencyOneLineSummary sum;
             int64_t latest_ts_us = 0;
             for (size_t i = 0; i < reports.size(); ++i) {
                 const auto& rep = reports[i];
@@ -162,46 +207,188 @@ static void DumpLatencyStatsForPc(std::ostream& out,
                     if (!mem) {
                         continue;
                     }
-                    AccumulateLatencySummary(rtype, mem->GetName().std_string(), *mem, &sum);
+                    AccumulateLatencySummary(rtype, mem->GetName().std_string(), *mem, &out.sum);
                 }
             }
-
-            const bool any = sum.capture_total_ms.has_value() || sum.encode_total_ms.has_value() ||
-                             sum.packet_send_delay_total_ms.has_value() || sum.ice_current_rtt_ms.has_value() ||
-                             sum.remote_rtt_ms.has_value() || sum.remote_jitter_ms.has_value() ||
-                             sum.avg_rtcp_interval_ms.has_value();
-
-            std::ostringstream ts_ms;
-            ts_ms << std::fixed << std::setprecision(3) << (static_cast<double>(latest_ts_us) / 1000.0);
-
-            if (!any) {
-                out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
-                    << " note=no_known_latency_fields stats_timestamp_ms=" << ts_ms.str() << "\n";
-            } else {
-                out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
-                    << " stats_timestamp_ms=" << ts_ms.str()
-                    << " 采集累计：" << FormatMsOptional(sum.capture_total_ms, 2) << "ms"
-                    << " 编码累计：" << FormatMsOptional(sum.encode_total_ms, 2) << "ms"
-                    << " RTP发送排队累计：" << FormatMsOptional(sum.packet_send_delay_total_ms, 2) << "ms"
-                    << " ICE当前往返：" << FormatMsOptional(sum.ice_current_rtt_ms, 3) << "ms"
-                    << " 对端反馈RTT：" << FormatMsOptional(sum.remote_rtt_ms, 3) << "ms"
-                    << " 对端抖动：" << FormatMsOptional(sum.remote_jitter_ms, 3) << "ms"
-                    << " 平均RTCP间隔：" << FormatMsOptional(sum.avg_rtcp_interval_ms, 2) << "ms"
-                    << " (累计项为连接期累计; 无字段显示为-)\n";
-            }
-            out << std::flush;
-            done->set_value();
+            out.latest_ts_us = latest_ts_us;
+            out.status = LatencyPollStatus::Ok;
+            done->set_value(out);
         },
-        [done, &out, t_ms, peer_tag](const char* err) {
-            out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
-                << " GetStats_error=" << (err ? err : "") << "\n"
-                << std::flush;
-            done->set_value();
+        [done](const char* err) {
+            LatencyPollResult out;
+            out.status = LatencyPollStatus::Error;
+            out.error_message = err;
+            done->set_value(out);
         });
 
     if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
-        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
+        return timeout_r;
     }
+    return fut.get();
+}
+
+/// 对单个 PeerConnection 调用 GetStats，单行输出中文标签（单位 ms）。
+static void DumpLatencyStatsForPc(std::ostream& out,
+                                  libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
+                                  const std::string& peer_tag,
+                                  int timeout_ms) {
+    using clock = std::chrono::system_clock;
+    const int64_t t_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
+
+    LatencyPollResult r = PollLatencySummaryForPc(pc, timeout_ms);
+    if (r.status == LatencyPollStatus::Timeout) {
+        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
+        return;
+    }
+    if (r.status == LatencyPollStatus::Error) {
+        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
+            << " GetStats_error=" << (r.error_message ? r.error_message : "") << "\n" << std::flush;
+        return;
+    }
+    if (r.status == LatencyPollStatus::Empty) {
+        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats\n" << std::flush;
+        return;
+    }
+
+    const LatencyOneLineSummary& sum = r.sum;
+    const bool any = sum.capture_total_ms.has_value() || sum.encode_total_ms.has_value() ||
+                     sum.packet_send_delay_total_ms.has_value() || sum.ice_current_rtt_ms.has_value() ||
+                     sum.remote_rtt_ms.has_value() || sum.remote_jitter_ms.has_value() ||
+                     sum.avg_rtcp_interval_ms.has_value() || sum.remote_total_rtt_sum_ms.has_value() ||
+                     sum.remote_rtt_measurements.has_value();
+
+    std::ostringstream ts_ms;
+    ts_ms << std::fixed << std::setprecision(3) << (static_cast<double>(r.latest_ts_us) / 1000.0);
+
+    if (!any) {
+        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
+            << " note=no_known_latency_fields stats_timestamp_ms=" << ts_ms.str()
+            << " (stats_timestamp_ms=RTC报表时间戳; 与配置 LATENCY_STATS_WINDOW_FRAMES 的窗长无关)\n";
+    } else {
+        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " stats_timestamp_ms=" << ts_ms.str()
+            << " 采集累计：" << FormatMsOptional(sum.capture_total_ms, 2) << "ms"
+            << " 编码累计：" << FormatMsOptional(sum.encode_total_ms, 2) << "ms"
+            << " RTP发送排队累计：" << FormatMsOptional(sum.packet_send_delay_total_ms, 2) << "ms"
+            << " ICE当前往返：" << FormatMsOptional(sum.ice_current_rtt_ms, 3) << "ms"
+            << " 对端反馈RTT：" << FormatMsOptional(sum.remote_rtt_ms, 3) << "ms"
+            << " 对端抖动：" << FormatMsOptional(sum.remote_jitter_ms, 3) << "ms"
+            << " 平均RTCP间隔：" << FormatMsOptional(sum.avg_rtcp_interval_ms, 2) << "ms"
+            << " 对端RTT累计和：" << FormatMsOptional(sum.remote_total_rtt_sum_ms, 2) << "ms"
+            << " 对端RTT样本数：" << (sum.remote_rtt_measurements.has_value()
+                                         ? std::to_string(*sum.remote_rtt_measurements)
+                                         : std::string("-"))
+            << " (stats_timestamp_ms=RTC报表时间戳; 带「累计」的项为连接期累计量；"
+               "窗内 ms/帧见 [stats-latency-avg]；无字段=-)\n";
+    }
+    out << std::flush;
+}
+
+static std::optional<double> DeltaPerFrameMs(const std::optional<double>& prev,
+                                             const std::optional<double>& curr,
+                                             unsigned int df) {
+    if (df == 0 || !prev.has_value() || !curr.has_value()) {
+        return std::nullopt;
+    }
+    return (*curr - *prev) / static_cast<double>(df);
+}
+
+static std::optional<double> RttSampleMeanMsInWindow(const std::optional<double>& prev_sum_ms,
+                                                     const std::optional<double>& curr_sum_ms,
+                                                     const std::optional<uint64_t>& prev_n,
+                                                     const std::optional<uint64_t>& curr_n) {
+    if (!prev_sum_ms || !curr_sum_ms || !prev_n || !curr_n) {
+        return std::nullopt;
+    }
+    const int64_t dn = static_cast<int64_t>(*curr_n) - static_cast<int64_t>(*prev_n);
+    if (dn <= 0) {
+        return std::nullopt;
+    }
+    return (*curr_sum_ms - *prev_sum_ms) / static_cast<double>(dn);
+}
+
+static std::optional<double> EndpointMeanMs(const std::optional<double>& a, const std::optional<double>& b) {
+    if (a && b) {
+        return (*a + *b) / 2.0;
+    }
+    if (a) {
+        return *a;
+    }
+    if (b) {
+        return *b;
+    }
+    return std::nullopt;
+}
+
+struct LatencyPeerRollState {
+    bool have_baseline{false};
+    unsigned baseline_fc{0};
+    LatencyOneLineSummary baseline;
+};
+
+static void ApplyLatencyRollStep(std::ostream& out,
+                                 const std::string& peer_tag,
+                                 const LatencyPollResult& poll,
+                                 unsigned int fc,
+                                 unsigned int window_frames,
+                                 LatencyPeerRollState* st) {
+    using clock = std::chrono::system_clock;
+    const int64_t t_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
+
+    if (poll.status == LatencyPollStatus::Timeout) {
+        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
+        return;
+    }
+    if (poll.status == LatencyPollStatus::Error) {
+        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag
+            << " GetStats_error=" << (poll.error_message ? poll.error_message : "") << "\n" << std::flush;
+        return;
+    }
+    if (poll.status == LatencyPollStatus::Empty) {
+        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats\n" << std::flush;
+        return;
+    }
+
+    const LatencyOneLineSummary& cur = poll.sum;
+
+    if (!st->have_baseline) {
+        st->baseline = cur;
+        st->baseline_fc = fc;
+        st->have_baseline = true;
+        return;
+    }
+
+    const unsigned int df = fc - st->baseline_fc;
+    if (df < window_frames) {
+        return;
+    }
+
+    const LatencyOneLineSummary& a = st->baseline;
+
+    std::ostringstream ts_ms;
+    ts_ms << std::fixed << std::setprecision(3) << (static_cast<double>(poll.latest_ts_us) / 1000.0);
+
+    out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " stats_timestamp_ms=" << ts_ms.str()
+        << " fc=" << fc << " df=" << df
+        << " 采集_ms/帧=" << FormatMsOptional(DeltaPerFrameMs(a.capture_total_ms, cur.capture_total_ms, df), 4)
+        << " 编码_ms/帧=" << FormatMsOptional(DeltaPerFrameMs(a.encode_total_ms, cur.encode_total_ms, df), 4)
+        << " RTP排队_ms/帧="
+        << FormatMsOptional(DeltaPerFrameMs(a.packet_send_delay_total_ms, cur.packet_send_delay_total_ms, df), 4)
+        << " RTCP间隔窗端均_ms="
+        << FormatMsOptional(EndpointMeanMs(a.avg_rtcp_interval_ms, cur.avg_rtcp_interval_ms), 2)
+        << " ICE_RTT窗端均_ms=" << FormatMsOptional(EndpointMeanMs(a.ice_current_rtt_ms, cur.ice_current_rtt_ms), 3)
+        << " 对端反馈RTT窗端均_ms=" << FormatMsOptional(EndpointMeanMs(a.remote_rtt_ms, cur.remote_rtt_ms), 3)
+        << " 对端抖动窗端均_ms=" << FormatMsOptional(EndpointMeanMs(a.remote_jitter_ms, cur.remote_jitter_ms), 3)
+        << " 对端RTT样本均_ms="
+        << FormatMsOptional(RttSampleMeanMsInWindow(a.remote_total_rtt_sum_ms, cur.remote_total_rtt_sum_ms,
+                                                    a.remote_rtt_measurements, cur.remote_rtt_measurements),
+                            3)
+        << " (累计类为Δ/Δ帧≈窗内每采集帧平均; ICE/抖动/RTCP间隔为两次采样端点均值; 无字段=-)\n"
+        << std::flush;
+
+    st->baseline = cur;
+    st->baseline_fc = fc;
 }
 
 }  // namespace
@@ -1082,6 +1269,8 @@ public:
     std::unordered_map<std::string, scoped_refptr<libwebrtc::RTCPeerConnection>> peer_connections_;
     std::unordered_map<std::string, std::unique_ptr<ExtraPeerObserver>> extra_peer_observers_;
     std::mutex mutex_;
+    std::mutex latency_roll_mu_;
+    std::unordered_map<std::string, LatencyPeerRollState> latency_roll_;
 public:
     void SetOnSdp(OnSdpCallback cb) { on_sdp_ = std::move(cb); }
     void SetOnIceCandidate(OnIceCandidateCallback cb) { on_ice_candidate_ = std::move(cb); }
@@ -1123,6 +1312,44 @@ public:
         }
         for (const auto& pr : copy) {
             DumpLatencyStatsForPc(out, pr.second, pr.first, 5000);
+        }
+    }
+
+    void LogLatencyStatsRollingAvg(std::ostream& out, unsigned int fc) {
+        const unsigned int w = static_cast<unsigned int>(config_.latency_stats_window_frames < 1
+                                                             ? 1
+                                                             : config_.latency_stats_window_frames);
+        std::vector<std::pair<std::string, scoped_refptr<libwebrtc::RTCPeerConnection>>> copy;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& kv : peer_connections_) {
+                copy.emplace_back(kv.first, kv.second);
+            }
+        }
+        if (copy.empty()) {
+            scoped_refptr<libwebrtc::RTCPeerConnection> pc;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pc = peer_connection_;
+            }
+            if (pc) {
+                LatencyPollResult r = PollLatencySummaryForPc(pc, 5000);
+                std::lock_guard<std::mutex> lock(latency_roll_mu_);
+                ApplyLatencyRollStep(out, "default", r, fc, w, &latency_roll_["default"]);
+            } else {
+                using clock = std::chrono::system_clock;
+                const int64_t t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         clock::now().time_since_epoch())
+                                         .count();
+                out << "[stats-latency-avg] t_ms=" << t_ms << " peer=(none) note=no_peerconnection\n"
+                    << std::flush;
+            }
+            return;
+        }
+        for (const auto& pr : copy) {
+            LatencyPollResult r = PollLatencySummaryForPc(pr.second, 5000);
+            std::lock_guard<std::mutex> lock(latency_roll_mu_);
+            ApplyLatencyRollStep(out, pr.first, r, fc, w, &latency_roll_[pr.first]);
         }
     }
 };
@@ -1207,6 +1434,10 @@ unsigned int PushStreamer::GetDecodedFrameCount() const {
 
 void PushStreamer::LogLatencyStatsForAllPeers(std::ostream& out) {
     impl_->LogLatencyStatsForAllPeers(out);
+}
+
+void PushStreamer::LogLatencyStatsRollingAvg(std::ostream& out) {
+    impl_->LogLatencyStatsRollingAvg(out, GetFrameCount());
 }
 
 }  // namespace webrtc_demo

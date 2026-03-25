@@ -18,7 +18,7 @@ public:
     /// 获取整数
     int GetInt(const std::string& key, int default_val = 0) const;
 
-    /// 获取指定 stream 的配置（STREAM_<id>_KEY），不存在时回退到全局 KEY
+    /// 获取指定 stream：优先 STREAM_<id>_KEY，否则回退全局同名 KEY（适合「公共参数 + 各路只写差异」）
     std::string GetStream(const std::string& stream_id, const std::string& key,
                          const std::string& default_val = "") const;
     int GetStreamInt(const std::string& stream_id, const std::string& key,

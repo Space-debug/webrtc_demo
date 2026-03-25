@@ -16,8 +16,8 @@ print_usage() {
   ./scripts/push.sh [stream_id] [camera]
 
 参数:
-  stream_id   流 ID（默认取 config 的 DEFAULT_STREAM）
-  camera      摄像头路径或索引（默认取 config 的 DEFAULT_CAMERA）
+  stream_id   流 ID（省略时用 config 的 STREAM_ID）
+  camera      摄像头路径或索引（省略时用 STREAM_<stream_id>_CAMERA）
 
 环境变量（按功能分区）:
   [配置文件]

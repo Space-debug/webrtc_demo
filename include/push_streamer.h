@@ -51,6 +51,11 @@ struct PushStreamerConfig {
     bool enable_flexfec{false};
     /// 非空则作为完整 trials 串覆盖默认；通常留空即可
     std::string flexfec_field_trials;
+
+    /// 周期性 GetStats：与采集帧计数对齐，对累计类指标做相邻两次采样的差分，再除以间隔帧数得到 ms/帧（近似窗内平均）
+    bool latency_stats_enable{false};
+    /// 至少间隔多少采集帧才输出一行「窗内平均」（默认 60）
+    int latency_stats_window_frames{60};
 };
 
 /// SDP 回调：用于将 SDP 发送到信令服务器
@@ -120,6 +125,9 @@ public:
     /// 无多订阅者连接时，若存在默认 peer_connection_ 则对其采样（如非信令单连接）。
     /// 与 WEBRTC_LATENCY_STATS_PROBE 环境变量配合周期打印。
     void LogLatencyStatsForAllPeers(std::ostream& out);
+
+    /// 按 latency_stats_window_frames 间隔对 GetStats 累计量做差分，输出 ms/帧及对端 RTT 样本均值等（推荐与配置 LATENCY_STATS_* 使用）。
+    void LogLatencyStatsRollingAvg(std::ostream& out);
 
 private:
     class Impl;

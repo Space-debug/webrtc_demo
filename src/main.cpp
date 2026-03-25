@@ -58,13 +58,13 @@ void PrintUsage(const char* prog) {
               << "  --enable-audio    允许 SDP 协商音频意向（未实现麦克风采集）\n"
               << "  --enable-flexfec  启用 FlexFEC-03（与配置 ENABLE_FLEXFEC=1 等效，收发端都需开）\n"
               << "环境变量:\n"
-              << "  WEBRTC_LATENCY_STATS_PROBE=1  每采集 N 帧打印一行延时摘要(毫秒)；N 见下一项，默认 50\n"
-              << "  WEBRTC_LATENCY_STATS_EVERY_FRAMES=N  与上一项配合，默认 50\n"
+              << "  WEBRTC_LATENCY_STATS_PROBE=0|1  若设置则覆盖配置 LATENCY_STATS_ENABLE（非 0 为开）\n"
+              << "  WEBRTC_LATENCY_STATS_WINDOW_FRAMES=N  覆盖配置窗长；对累计量做 Δ/Δ帧 得到 ms/帧（默认 60）\n"
               << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N  创建 Offer 前至少 N 帧(0=关)，覆盖配置 CAPTURE_GATE_MIN_FRAMES\n"
               << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N  等待门限最久 N 秒，覆盖 CAPTURE_GATE_MAX_WAIT_SEC\n"
               << "参数:\n"
-              << "  stream_id         流 ID，默认 livestream\n"
-              << "  camera            摄像头路径或索引，如 /dev/video11 或 11\n"
+              << "  stream_id         流 ID；省略时用配置 STREAM_ID\n"
+              << "  camera            摄像头；省略时用 STREAM_<stream_id>_CAMERA\n"
               << std::endl;
 }
 
@@ -141,43 +141,72 @@ int main(int argc, char* argv[]) {
     if (config_path.empty()) config_path = FindConfigPath(argv[0], "");
     webrtc_demo::ConfigLoader cfg;
     if (!config_path.empty() && cfg.Load(config_path)) {
-        if (stream_id.empty()) stream_id = cfg.Get("DEFAULT_STREAM", "livestream");
+        if (stream_id.empty()) {
+            stream_id = cfg.Get("STREAM_ID", "livestream");
+        }
         signaling_url = cfg.GetStream(stream_id, "SIGNALING_ADDR",
                                       cfg.Get("SIGNALING_ADDR", "127.0.0.1:8765"));
-        config.video_width = cfg.GetStreamInt(stream_id, "WIDTH", cfg.GetInt("WIDTH", 640));
-        config.video_height = cfg.GetStreamInt(stream_id, "HEIGHT", cfg.GetInt("HEIGHT", 480));
-        config.video_fps = cfg.GetStreamInt(stream_id, "FPS", cfg.GetInt("FPS", 30));
+        config.video_width = cfg.GetStreamInt(stream_id, "WIDTH", 1280);
+        config.video_height = cfg.GetStreamInt(stream_id, "HEIGHT", 720);
+        config.video_fps = cfg.GetStreamInt(stream_id, "FPS", 30);
         if (camera_arg.empty()) {
-            camera_arg = cfg.GetStream(stream_id, "CAMERA",
-                                      cfg.Get("DEFAULT_CAMERA", "/dev/video11"));
+            camera_arg = cfg.GetStream(stream_id, "CAMERA", "");
         }
-        config.bitrate_mode = cfg.GetStream(stream_id, "BITRATE_MODE", cfg.Get("BITRATE_MODE", "vbr"));
-        config.target_bitrate_kbps = cfg.GetStreamInt(stream_id, "TARGET_BITRATE", cfg.GetInt("TARGET_BITRATE", 1000));
-        config.min_bitrate_kbps = cfg.GetStreamInt(stream_id, "MIN_BITRATE", cfg.GetInt("MIN_BITRATE", 100));
-        config.max_bitrate_kbps = cfg.GetStreamInt(stream_id, "MAX_BITRATE", cfg.GetInt("MAX_BITRATE", 2000));
-        config.degradation_preference = cfg.GetStream(stream_id, "DEGRADATION_PREFERENCE", cfg.Get("DEGRADATION_PREFERENCE", "maintain_framerate"));
-        config.video_codec = cfg.GetStream(stream_id, "VIDEO_CODEC", cfg.Get("VIDEO_CODEC", "h264"));
-        config.h264_profile = cfg.GetStream(stream_id, "H264_PROFILE", cfg.Get("H264_PROFILE", "main"));
-        config.h264_level = cfg.GetStream(stream_id, "H264_LEVEL", cfg.Get("H264_LEVEL", "3.0"));
-        config.keyframe_interval = cfg.GetStreamInt(stream_id, "KEYFRAME_INTERVAL", cfg.GetInt("KEYFRAME_INTERVAL", 0));
-        config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC",
-                                                     cfg.GetInt("CAPTURE_WARMUP_SEC", 0));
-        config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES",
-                                                          cfg.GetInt("CAPTURE_GATE_MIN_FRAMES", 0));
-        config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC",
-                                                            cfg.GetInt("CAPTURE_GATE_MAX_WAIT_SEC", 20));
+        config.bitrate_mode = cfg.GetStream(stream_id, "BITRATE_MODE", "");
+        if (config.bitrate_mode.empty()) {
+            config.bitrate_mode = "vbr";
+        }
+        config.target_bitrate_kbps = cfg.GetStreamInt(stream_id, "TARGET_BITRATE", 2200);
+        config.min_bitrate_kbps = cfg.GetStreamInt(stream_id, "MIN_BITRATE", 1200);
+        config.max_bitrate_kbps = cfg.GetStreamInt(stream_id, "MAX_BITRATE", 3500);
+        config.degradation_preference = cfg.GetStream(stream_id, "DEGRADATION_PREFERENCE", "");
+        if (config.degradation_preference.empty()) {
+            config.degradation_preference = "maintain_framerate";
+        }
+        config.video_codec = cfg.GetStream(stream_id, "VIDEO_CODEC", "");
+        if (config.video_codec.empty()) {
+            config.video_codec = "h264";
+        }
+        config.h264_profile = cfg.GetStream(stream_id, "H264_PROFILE", "");
+        if (config.h264_profile.empty()) {
+            config.h264_profile = "main";
+        }
+        config.h264_level = cfg.GetStream(stream_id, "H264_LEVEL", "");
+        if (config.h264_level.empty()) {
+            config.h264_level = "3.0";
+        }
+        config.keyframe_interval = cfg.GetStreamInt(stream_id, "KEYFRAME_INTERVAL", 0);
+        config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
+        config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
+        config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);
         {
-            std::string ea = cfg.GetStream(stream_id, "ENABLE_AUDIO", cfg.Get("ENABLE_AUDIO", "0"));
+            std::string ea = cfg.GetStream(stream_id, "ENABLE_AUDIO", "");
+            if (ea.empty()) {
+                ea = "0";
+            }
             for (auto& c : ea) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             config.enable_audio = (ea == "1" || ea == "true" || ea == "yes" || ea == "on");
         }
         {
-            std::string ef = cfg.GetStream(stream_id, "ENABLE_FLEXFEC", cfg.Get("ENABLE_FLEXFEC", "0"));
+            std::string ef = cfg.GetStream(stream_id, "ENABLE_FLEXFEC", "");
+            if (ef.empty()) {
+                ef = "0";
+            }
             for (auto& c : ef) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             config.enable_flexfec =
                 (ef == "1" || ef == "true" || ef == "yes" || ef == "on");
-            config.flexfec_field_trials =
-                cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", cfg.Get("FLEXFEC_FIELD_TRIALS", ""));
+            config.flexfec_field_trials = cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", "");
+        }
+        {
+            std::string ls = cfg.GetStream(stream_id, "LATENCY_STATS_ENABLE", "");
+            if (ls.empty()) {
+                ls = "0";
+            }
+            for (auto& c : ls) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            config.latency_stats_enable =
+                (ls == "1" || ls == "true" || ls == "yes" || ls == "on");
+            config.latency_stats_window_frames =
+                cfg.GetStreamInt(stream_id, "LATENCY_STATS_WINDOW_FRAMES", 60);
         }
     }
     if (cmdline_enable_audio.has_value()) config.enable_audio = *cmdline_enable_audio;
@@ -202,6 +231,12 @@ int main(int argc, char* argv[]) {
     }
     if (const char* gw = std::getenv("WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC")) {
         config.capture_gate_max_wait_sec = std::atoi(gw);
+    }
+    if (const char* lw = std::getenv("WEBRTC_LATENCY_STATS_WINDOW_FRAMES")) {
+        int v = std::atoi(lw);
+        if (v > 0) {
+            config.latency_stats_window_frames = v;
+        }
     }
     if (stream_id.empty()) stream_id = "livestream";
 
@@ -398,27 +433,15 @@ int main(int argc, char* argv[]) {
     std::cout << "推流已启动。拉流端: ./build/bin/p2p_player" << std::endl;
     std::cout << "Press Ctrl+C to stop." << std::endl;
 
-    const char* latency_stats_probe = std::getenv("WEBRTC_LATENCY_STATS_PROBE");
-    int latency_stats_every_frames = 50;
-    if (const char* nf = std::getenv("WEBRTC_LATENCY_STATS_EVERY_FRAMES")) {
-        int v = std::atoi(nf);
-        if (v > 0) {
-            latency_stats_every_frames = v;
-        }
+    bool latency_probe_on = config.latency_stats_enable;
+    if (const char* latency_stats_probe = std::getenv("WEBRTC_LATENCY_STATS_PROBE")) {
+        latency_probe_on =
+            (latency_stats_probe[0] != '\0' && std::strcmp(latency_stats_probe, "0") != 0);
     }
-
-    const bool latency_probe_on = latency_stats_probe && latency_stats_probe[0] != '\0' &&
-                                  std::strcmp(latency_stats_probe, "0") != 0;
-    unsigned int latency_next_frame_milestone =
-        static_cast<unsigned int>(latency_stats_every_frames);
 
     while (streamer.IsStreaming()) {
         if (latency_probe_on) {
-            const unsigned int n = streamer.GetFrameCount();
-            while (n >= latency_next_frame_milestone) {
-                streamer.LogLatencyStatsForAllPeers(std::cout);
-                latency_next_frame_milestone += static_cast<unsigned int>(latency_stats_every_frames);
-            }
+            streamer.LogLatencyStatsRollingAvg(std::cout);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         } else {
             std::this_thread::sleep_for(std::chrono::seconds(1));

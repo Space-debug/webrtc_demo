@@ -134,7 +134,7 @@ int main(int argc, char* argv[]) {
     webrtc_demo::ConfigLoader cfg;
     if (!config_path.empty() && cfg.Load(config_path)) {
         url = cfg.Get("SIGNALING_ADDR", "127.0.0.1:8765");
-        stream_id = cfg.Get("DEFAULT_STREAM", "livestream");
+        stream_id = cfg.Get("STREAM_ID", "livestream");
     }
     if (i < argc) url = argv[i++];
     if (i < argc) stream_id = argv[i++];
@@ -142,11 +142,13 @@ int main(int argc, char* argv[]) {
     bool player_flexfec = false;
     std::string player_flexfec_override;
     if (!config_path.empty() && !cfg.empty()) {
-        std::string ef = cfg.GetStream(stream_id, "ENABLE_FLEXFEC", cfg.Get("ENABLE_FLEXFEC", "0"));
+        std::string ef = cfg.GetStream(stream_id, "ENABLE_FLEXFEC", "");
+        if (ef.empty()) {
+            ef = "0";
+        }
         for (auto& c : ef) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         player_flexfec = (ef == "1" || ef == "true" || ef == "yes" || ef == "on");
-        player_flexfec_override =
-            cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", cfg.Get("FLEXFEC_FIELD_TRIALS", ""));
+        player_flexfec_override = cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", "");
     }
     if (const char* ef_env = std::getenv("ENABLE_FLEXFEC")) {
         std::string s(ef_env);
