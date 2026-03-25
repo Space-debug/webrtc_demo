@@ -40,25 +40,10 @@ if(NOT EXISTS ${LIBWEBRTC_LIB_DIR})
         "Please ensure 3rdparty/libwebrtc/lib/${LIBWEBRTC_PLATFORM}/${LIBWEBRTC_ARCH} exists.")
 endif()
 
-# libjpeg-turbo（MJPEG 解码，可选）
-find_package(PkgConfig QUIET)
-set(HAVE_TURBOJPEG OFF)
-if(PkgConfig_FOUND)
-    pkg_check_modules(TURBOJPEG QUIET libjpeg-turbo8)
-    if(TURBOJPEG_FOUND)
-        set(HAVE_TURBOJPEG ON)
-        message(STATUS "Found libjpeg-turbo: ${TURBOJPEG_LIBRARIES}")
-    else()
-        message(STATUS "libjpeg-turbo not found - MJPEG capture format will not be available")
-        message(STATUS "  Install: Ubuntu/Debian: libjpeg-turbo8-dev, Fedora: libjpeg-turbo-devel")
-    endif()
-endif()
-
 # 主推流可执行文件
 add_executable(webrtc_push_demo
     src/main.cpp
     src/camera_utils/camera_utils.cpp
-    src/capture_bridge/capture_bridge.cpp
     src/config_loader/config_loader.cpp
     src/signaling_client/signaling_client.cpp
     src/push_streamer/push_streamer.cpp
@@ -72,11 +57,6 @@ target_include_directories(webrtc_push_demo PRIVATE
 )
 # 与 libwebrtc 构建时的 RTC_DESKTOP_DEVICE 保持一致，否则 vtable 错位导致 CreateVideoTrack 崩溃
 target_compile_definitions(webrtc_push_demo PRIVATE RTC_DESKTOP_DEVICE)
-if(HAVE_TURBOJPEG)
-    target_compile_definitions(webrtc_push_demo PRIVATE HAVE_TURBOJPEG)
-    target_include_directories(webrtc_push_demo PRIVATE ${TURBOJPEG_INCLUDE_DIRS})
-    target_link_libraries(webrtc_push_demo PRIVATE ${TURBOJPEG_LIBRARIES})
-endif()
 
 target_link_directories(webrtc_push_demo PRIVATE ${LIBWEBRTC_LIB_DIR})
 if(WIN32)

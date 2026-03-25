@@ -54,8 +54,6 @@ void PrintUsage(const char* prog) {
               << "  --width W         分辨率宽，默认 640\n"
               << "  --height H        分辨率高，默认 360\n"
               << "  --fps F           帧率，默认 15\n"
-              << "  --capture-format FMT  采集格式: auto|yuyv|mjpeg（yuyv/mjpeg 需 v4l2loopback）\n"
-              << "  --loopback DEV    v4l2loopback 设备路径，如 /dev/video12\n"
               << "  --no-audio        纯视频推流（默认，与 ENABLE_AUDIO=0 一致）\n"
               << "  --enable-audio    允许 SDP 协商音频意向（未实现麦克风采集）\n"
               << "  --enable-flexfec  启用 FlexFEC-03（与配置 ENABLE_FLEXFEC=1 等效，收发端都需开）\n"
@@ -92,7 +90,6 @@ int main(int argc, char* argv[]) {
     std::optional<int> cmdline_width;
     std::optional<int> cmdline_height;
     std::optional<int> cmdline_fps;
-    std::string cmdline_capture_format, cmdline_loopback;
     std::optional<bool> cmdline_enable_audio;
     bool cmdline_enable_flexfec = false;
     bool use_signaling = true;
@@ -125,10 +122,6 @@ int main(int argc, char* argv[]) {
             cmdline_height = std::atoi(argv[++arg_idx]);
         } else if (strcmp(argv[arg_idx], "--fps") == 0 && arg_idx + 1 < argc) {
             cmdline_fps = std::atoi(argv[++arg_idx]);
-        } else if (strcmp(argv[arg_idx], "--capture-format") == 0 && arg_idx + 1 < argc) {
-            cmdline_capture_format = argv[++arg_idx];
-        } else if (strcmp(argv[arg_idx], "--loopback") == 0 && arg_idx + 1 < argc) {
-            cmdline_loopback = argv[++arg_idx];
         } else if (strcmp(argv[arg_idx], "--no-audio") == 0) {
             cmdline_enable_audio = false;
         } else if (strcmp(argv[arg_idx], "--enable-audio") == 0) {
@@ -167,8 +160,6 @@ int main(int argc, char* argv[]) {
         config.keyframe_interval = cfg.GetStreamInt(stream_id, "KEYFRAME_INTERVAL", cfg.GetInt("KEYFRAME_INTERVAL", 0));
         config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC",
                                                      cfg.GetInt("CAPTURE_WARMUP_SEC", 0));
-        config.capture_format = cfg.GetStream(stream_id, "CAPTURE_FORMAT", cfg.Get("CAPTURE_FORMAT", "auto"));
-        config.loopback_device = cfg.GetStream(stream_id, "LOOPBACK_DEVICE", cfg.Get("LOOPBACK_DEVICE", ""));
         {
             std::string ea = cfg.GetStream(stream_id, "ENABLE_AUDIO", cfg.Get("ENABLE_AUDIO", "0"));
             for (auto& c : ea) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -183,8 +174,6 @@ int main(int argc, char* argv[]) {
                 cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", cfg.Get("FLEXFEC_FIELD_TRIALS", ""));
         }
     }
-    if (!cmdline_capture_format.empty()) config.capture_format = cmdline_capture_format;
-    if (!cmdline_loopback.empty()) config.loopback_device = cmdline_loopback;
     if (cmdline_enable_audio.has_value()) config.enable_audio = *cmdline_enable_audio;
     if (cmdline_signaling.has_value()) signaling_url = *cmdline_signaling;
     if (cmdline_width.has_value()) config.video_width = *cmdline_width;
@@ -251,7 +240,6 @@ int main(int argc, char* argv[]) {
               << " 码率=" << config.target_bitrate_kbps << "kbps(" << config.bitrate_mode << ")"
               << " 编码=" << config.video_codec
               << " 预热=" << config.capture_warmup_sec << "s"
-              << " 采集格式=" << config.capture_format
               << " 设备=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
               << " flexfec=" << (config.enable_flexfec ? "on" : "off")
               << std::endl;

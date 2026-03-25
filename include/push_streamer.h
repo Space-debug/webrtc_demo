@@ -17,8 +17,6 @@ struct PushStreamerConfig {
     int video_fps{30};
     int video_device_index{0};      /// 设备索引，与 --list-cameras 输出对应
     std::string video_device_path;  /// 设备路径，如 /dev/video11，优先于 index
-    std::string capture_format{"auto"};  /// 采集格式: auto|yuyv|mjpeg。yuyv/mjpeg 需 v4l2loopback
-    std::string loopback_device;    /// v4l2loopback 设备路径，capture_format 非 auto 时使用
     bool enable_audio{false};  /// 默认纯视频；true 时仍不创建麦克风流，仅放宽 SDP 音频意向
     bool test_capture_only{false};  /// 仅测试采集，不创建 offer/连接
     bool test_encode_mode{false};   /// 本地回环验证 H264 编码（采集→编码→接收）
@@ -115,7 +113,6 @@ public:
     bool IsStreaming() const { return is_streaming_; }
 
     /// 对每个活跃 PeerConnection 调用 GetStats，单行打印中文时延摘要（毫秒，含采集/编码/ICE RTT 等）。
-    /// MJPEG+采集桥接且启用 libjpeg-turbo 时附加 JPEG 解码最近/平均耗时。
     /// 无多订阅者连接时，若存在默认 peer_connection_ 则对其采样（如非信令单连接）。
     /// 与 WEBRTC_LATENCY_STATS_PROBE 环境变量配合周期打印。
     void LogLatencyStatsForAllPeers(std::ostream& out);

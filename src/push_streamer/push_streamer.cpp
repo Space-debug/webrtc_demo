@@ -1,6 +1,5 @@
 #include "push_streamer.h"
 #include "camera_utils.h"
-#include "capture_bridge.h"
 #include "webrtc_field_trials.h"
 #include <libwebrtc.h>
 
@@ -123,8 +122,7 @@ static std::string FormatMsOptional(const std::optional<double>& v, int prec) {
 static void DumpLatencyStatsForPc(std::ostream& out,
                                   libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
                                   const std::string& peer_tag,
-                                  int timeout_ms,
-                                  const std::string& append_suffix) {
+                                  int timeout_ms) {
     using clock = std::chrono::system_clock;
     const int64_t t_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
@@ -138,11 +136,10 @@ static void DumpLatencyStatsForPc(std::ostream& out,
     std::future<void> fut = done->get_future();
 
     pc->GetStats(
-        [done, &out, t_ms, peer_tag, append_suffix](
+        [done, &out, t_ms, peer_tag](
             const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
             if (reports.size() == 0) {
-                out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats"
-                    << append_suffix << "\n";
+                out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats\n";
                 out << std::flush;
                 done->set_value();
                 return;
@@ -179,8 +176,7 @@ static void DumpLatencyStatsForPc(std::ostream& out,
 
             if (!any) {
                 out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
-                    << " note=no_known_latency_fields stats_timestamp_ms=" << ts_ms.str() << append_suffix
-                    << "\n";
+                    << " note=no_known_latency_fields stats_timestamp_ms=" << ts_ms.str() << "\n";
             } else {
                 out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
                     << " stats_timestamp_ms=" << ts_ms.str()
@@ -191,7 +187,7 @@ static void DumpLatencyStatsForPc(std::ostream& out,
                     << " 对端反馈RTT：" << FormatMsOptional(sum.remote_rtt_ms, 3) << "ms"
                     << " 对端抖动：" << FormatMsOptional(sum.remote_jitter_ms, 3) << "ms"
                     << " 平均RTCP间隔：" << FormatMsOptional(sum.avg_rtcp_interval_ms, 2) << "ms"
-                    << append_suffix << " (累计项为连接期累计; 无字段显示为-)\n";
+                    << " (累计项为连接期累计; 无字段显示为-)\n";
             }
             out << std::flush;
             done->set_value();
@@ -407,11 +403,6 @@ public:
         video_track_ = nullptr;
         video_source_ = nullptr;
         video_capturer_ = nullptr;
-
-        if (capture_bridge_) {
-            capture_bridge_->Stop();
-            capture_bridge_.reset();
-        }
 
         if (factory_) {
             factory_->Terminate();
@@ -685,40 +676,12 @@ public:
     }
 
     bool CreateMediaTracks() {
-        std::string device_for_libwebrtc = config_.video_device_path;
-        auto fmt = CaptureBridge::ParseFormat(config_.capture_format);
-
-        // YUYV/MJPEG 模式：启动采集桥接，libwebrtc 从 loopback 读取
-        if ((fmt == CaptureBridge::Format::YUYV || fmt == CaptureBridge::Format::MJPEG) &&
-            !config_.loopback_device.empty() && !config_.video_device_path.empty()) {
-            CaptureBridge::Config bridge_cfg;
-            bridge_cfg.source_device = config_.video_device_path;
-            bridge_cfg.loopback_device = config_.loopback_device;
-            bridge_cfg.format = fmt;
-            bridge_cfg.width = config_.video_width;
-            bridge_cfg.height = config_.video_height;
-            bridge_cfg.fps = config_.video_fps;
-            capture_bridge_ = std::make_unique<CaptureBridge>(bridge_cfg);
-            if (!capture_bridge_->Start()) {
-                std::cerr << "[PushStreamer] 采集桥接启动失败，请检查 v4l2loopback 是否已加载："
-                          << " sudo modprobe v4l2loopback video_nr=12" << std::endl;
-                capture_bridge_.reset();
-                return false;
-            }
-            device_for_libwebrtc = config_.loopback_device;
-            std::cout << "[PushStreamer] 使用采集桥接: " << config_.video_device_path
-                      << " -> " << config_.loopback_device << " ("
-                      << (fmt == CaptureBridge::Format::MJPEG ? "MJPEG" : "YUYV") << ")" << std::endl;
-        }
+        const std::string device_for_libwebrtc = config_.video_device_path;
 
         auto video_device = factory_->GetVideoDevice();
         if (!video_device) {
             std::cerr << "[PushStreamer] GetVideoDevice() 返回空，libwebrtc 可能未启用 V4L2 或依赖缺失"
                       << "（需 libX11、libglib 等，见 docs/linux_arm64_build_notes.md）" << std::endl;
-            if (capture_bridge_) {
-                capture_bridge_->Stop();
-                capture_bridge_.reset();
-            }
             return false;
         }
         uint32_t num = video_device->NumberOfDevices();
@@ -735,10 +698,6 @@ public:
                           << "可能是 libwebrtc 与当前 V4L2 设备不兼容。"
                           << "可尝试指定设备: ./webrtc_push_demo livestream " << v4l2_cams[0].device_path
                           << std::endl;
-            }
-            if (capture_bridge_) {
-                capture_bridge_->Stop();
-                capture_bridge_.reset();
             }
             return false;
         }
@@ -1085,8 +1044,6 @@ public:
     std::unordered_map<std::string, scoped_refptr<libwebrtc::RTCPeerConnection>> peer_connections_;
     std::unordered_map<std::string, std::unique_ptr<ExtraPeerObserver>> extra_peer_observers_;
     std::mutex mutex_;
-    std::unique_ptr<CaptureBridge> capture_bridge_;
-
 public:
     void SetOnSdp(OnSdpCallback cb) { on_sdp_ = std::move(cb); }
     void SetOnIceCandidate(OnIceCandidateCallback cb) { on_ice_candidate_ = std::move(cb); }
@@ -1102,25 +1059,6 @@ public:
     bool SignalingSubscriberOfferOnly() const { return config_.signaling_subscriber_offer_only; }
 
     void LogLatencyStatsForAllPeers(std::ostream& out) {
-        std::string append_suffix;
-        {
-            std::string cf = config_.capture_format;
-            for (auto& ch : cf) {
-                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            }
-            if (capture_bridge_ && CaptureBridge::ParseFormat(cf) == CaptureBridge::Format::MJPEG) {
-                double last_ms = 0;
-                double avg_ms = 0;
-                if (capture_bridge_->GetJpegDecodeTimingMs(&last_ms, &avg_ms)) {
-                    std::ostringstream j;
-                    j << std::fixed << std::setprecision(2);
-                    j << " JPEG解码最近：" << last_ms << "ms JPEG解码平均：" << avg_ms
-                      << "ms(桥接:turbo解压+I420转YUYV)";
-                    append_suffix = j.str();
-                }
-            }
-        }
-
         std::vector<std::pair<std::string, scoped_refptr<libwebrtc::RTCPeerConnection>>> copy;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1135,20 +1073,18 @@ public:
                 pc = peer_connection_;
             }
             if (pc) {
-                DumpLatencyStatsForPc(out, pc, "default", 5000, append_suffix);
+                DumpLatencyStatsForPc(out, pc, "default", 5000);
             } else {
                 using clock = std::chrono::system_clock;
                 const int64_t t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                          clock::now().time_since_epoch())
                                          .count();
-                out << "[stats-latency] t_ms=" << t_ms << " peer=(none) note=no_peerconnection" << append_suffix
-                    << "\n"
-                    << std::flush;
+                out << "[stats-latency] t_ms=" << t_ms << " peer=(none) note=no_peerconnection\n" << std::flush;
             }
             return;
         }
         for (const auto& pr : copy) {
-            DumpLatencyStatsForPc(out, pr.second, pr.first, 5000, append_suffix);
+            DumpLatencyStatsForPc(out, pr.second, pr.first, 5000);
         }
     }
 };

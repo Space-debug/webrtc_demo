@@ -4,6 +4,7 @@
 #
 # 用法:
 #   ./scripts/test_p2p_headless.sh [摄像头设备]
+#   ./scripts/test_p2p_headless.sh --strict-fps [摄像头设备]  # 无头拉流 ≥10s、≥200 帧，校验解码 FPS≈30（±12%）
 #   ./scripts/test_p2p_headless.sh --fec [摄像头设备]       # SDP：发送端 Offer 与客户端收到的 Offer 均含 flexfec/ulpfec
 #   ./scripts/test_p2p_headless.sh --fec-link [摄像头设备] # 已废弃：与 --fec 相同（推流端 FEC 链上统计探针已移除）
 # 环境变量:
@@ -17,12 +18,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 FEC_VERIFY="${FEC_VERIFY:-0}"
+STRICT_FPS=0
 if [ "${1:-}" = "--fec-link" ]; then
     echo "[test] 提示: --fec-link 已废弃（FEC 链上 GetStats 探针已从推流端移除），按 --fec 运行" >&2
     FEC_VERIFY=1
     shift
 elif [ "${1:-}" = "--fec" ]; then
     FEC_VERIFY=1
+    shift
+elif [ "${1:-}" = "--strict-fps" ]; then
+    STRICT_FPS=1
     shift
 fi
 
@@ -192,13 +197,30 @@ sleep 1
 
 H_FRAMES=20
 H_TO=90
+if [ "$STRICT_FPS" = 1 ]; then
+    echo "[test] strict-fps：按解码回调时间戳统计平均 FPS（expect=30 ±12%，≥10s ≥200 帧）"
+    H_FRAMES=200
+    H_TO=120
+fi
 
-echo "[test] 无头拉流（需收到至少 ${H_FRAMES} 帧）"
+echo "[test] 无头拉流（$([ "$STRICT_FPS" = 1 ] && echo "strict FPS" || echo "至少 ${H_FRAMES} 帧")）"
 if [ -n "${PULL_OUT:-}" ]; then
-    "$PULL" --config "$CONFIG_FILE" --headless --frames "$H_FRAMES" --timeout-sec "$H_TO" "127.0.0.1:$PORT" "$STREAM_ID" 2>&1 | tee "$PULL_OUT"
+    if [ "$STRICT_FPS" = 1 ]; then
+        "$PULL" --config "$CONFIG_FILE" --headless --strict-fps --expect-fps 30 --fps-tol 0.12 \
+            --fps-min-sec 10 --fps-min-frames 200 --frames 200 --timeout-sec "$H_TO" \
+            "127.0.0.1:$PORT" "$STREAM_ID" 2>&1 | tee "$PULL_OUT"
+    else
+        "$PULL" --config "$CONFIG_FILE" --headless --frames "$H_FRAMES" --timeout-sec "$H_TO" "127.0.0.1:$PORT" "$STREAM_ID" 2>&1 | tee "$PULL_OUT"
+    fi
     RC=${PIPESTATUS[0]}
 else
-    "$PULL" --config "$CONFIG_FILE" --headless --frames "$H_FRAMES" --timeout-sec "$H_TO" "127.0.0.1:$PORT" "$STREAM_ID"
+    if [ "$STRICT_FPS" = 1 ]; then
+        "$PULL" --config "$CONFIG_FILE" --headless --strict-fps --expect-fps 30 --fps-tol 0.12 \
+            --fps-min-sec 10 --fps-min-frames 200 --frames 200 --timeout-sec "$H_TO" \
+            "127.0.0.1:$PORT" "$STREAM_ID"
+    else
+        "$PULL" --config "$CONFIG_FILE" --headless --frames "$H_FRAMES" --timeout-sec "$H_TO" "127.0.0.1:$PORT" "$STREAM_ID"
+    fi
     RC=$?
 fi
 echo "[test] p2p_player 退出码: $RC"

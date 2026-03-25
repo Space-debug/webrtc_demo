@@ -75,11 +75,7 @@ ENABLE_AUDIO=0
 DEFAULT_STREAM=livestream
 DEFAULT_CAMERA=/dev/video0
 
-# [C] 采集格式与桥接
-CAPTURE_FORMAT=auto
-LOOPBACK_DEVICE=/dev/video12
-
-# [D] 分辨率与帧率
+# [C] 分辨率与帧率
 WIDTH=640
 HEIGHT=480
 FPS=30
@@ -113,38 +109,10 @@ STREAM_livestream_720p_DEGRADATION_PREFERENCE=maintain_resolution
 - 要覆盖“相机支持的所有分辨率”，建议为同一摄像头建立多个 stream profile（如 `livestream`、`livestream_720p`、`livestream_1080p`）。
 - 先用 `v4l2-ctl -d /dev/video0 --list-formats-ext` 查询设备真实支持档位，再写入对应 profile。
 
-### 采集格式（YUYV / MJPEG）
+### 采集与像素格式（V4L2）
 
-支持 UVC 相机的 YUYV 和 MJPEG 出流。  
-`MJPEG` 路径会先解码为 YUV（YUYV）后再进入 H264 编码；`YUYV` 可直接进入编码链路。
-
-| 格式 | 说明 | 依赖 |
-|------|------|------|
-| `auto` | 由 libwebrtc 自动选择（默认） | 无 |
-| `yuyv` | 强制 YUYV 采集，直通编码 | v4l2loopback |
-| `mjpeg` | 强制 MJPEG 采集，先解码为 YUYV 再编码 | v4l2loopback + libjpeg-turbo |
-
-**yuyv / mjpeg 需配合 v4l2loopback**：采集桥接从真实摄像头读取指定格式，输出到虚拟设备，libwebrtc 从虚拟设备读取。
-
-1. 加载 v4l2loopback 并创建虚拟设备（如 /dev/video12）：
-
-```bash
-sudo modprobe v4l2loopback video_nr=12
-```
-
-2. 配置 `config/streams.conf`：
-
-```ini
-CAPTURE_FORMAT=mjpeg
-LOOPBACK_DEVICE=/dev/video12
-DEFAULT_CAMERA=/dev/video11
-```
-
-3. 或命令行指定：
-
-```bash
-./build/bin/webrtc_push_demo livestream /dev/video11 --capture-format mjpeg --loopback /dev/video12
-```
+推流端由 **libwebrtc 直连** 摄像头设备（如 `/dev/video11`）。  
+MJPEG / YUYV 等由 **库与驱动协商**，无需 v4l2loopback 采集桥接。可用 `v4l2-ctl -d /dev/video0 --list-formats-ext` 查看设备能力。
 
 ### WebRTC 自动降级（分辨率/帧率）
 
@@ -239,8 +207,6 @@ START_SIGNALING=0 ./scripts/push.sh cam3 /dev/video12
 ## 常见问题
 
 - **推流卡在连接**：确认 8765 端口可达，且双方网络互通。
-- **MJPEG 报错**：安装 `libjpeg-turbo8-dev` 并重新编译。
-- **yuyv/mjpeg 无法启动**：先执行 `sudo modprobe v4l2loopback video_nr=12`，确保 `LOOPBACK_DEVICE` 与 `video_nr` 对应。
 - 拉流无画面：先确认推流端已开始发送，再启动拉流端。
 - 跨机失败：检查防火墙/路由/DNS/代理策略。
 
