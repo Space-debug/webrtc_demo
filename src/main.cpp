@@ -59,6 +59,9 @@ void PrintUsage(const char* prog) {
               << "  --no-audio        纯视频推流（默认，与 ENABLE_AUDIO=0 一致）\n"
               << "  --enable-audio    允许 SDP 协商音频意向（未实现麦克风采集）\n"
               << "  --enable-flexfec  启用 FlexFEC-03（与配置 ENABLE_FLEXFEC=1 等效，收发端都需开）\n"
+              << "环境变量:\n"
+              << "  WEBRTC_LATENCY_STATS_PROBE=1  周期单行打印延时摘要(毫秒，如采集累计/编码累计/ICE往返等)\n"
+              << "  WEBRTC_LATENCY_STATS_PROBE_INTERVAL_SEC=N  延迟统计间隔秒，默认 2\n"
               << "参数:\n"
               << "  stream_id         流 ID，默认 livestream\n"
               << "  camera            摄像头路径或索引，如 /dev/video11 或 11\n"
@@ -385,23 +388,30 @@ int main(int argc, char* argv[]) {
     std::cout << "推流已启动。拉流端: ./build/bin/p2p_player" << std::endl;
     std::cout << "Press Ctrl+C to stop." << std::endl;
 
-    const char* fec_link_probe = std::getenv("WEBRTC_FEC_LINK_PROBE");
-    int fec_link_interval_sec = 2;
-    if (const char* iv = std::getenv("WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC")) {
+    const char* latency_stats_probe = std::getenv("WEBRTC_LATENCY_STATS_PROBE");
+    int latency_stats_interval_sec = 2;
+    if (const char* iv = std::getenv("WEBRTC_LATENCY_STATS_PROBE_INTERVAL_SEC")) {
         int v = std::atoi(iv);
         if (v > 0) {
-            fec_link_interval_sec = v;
+            latency_stats_interval_sec = v;
         }
     }
 
+    const bool latency_probe_on = latency_stats_probe && latency_stats_probe[0] != '\0' &&
+                                  std::strcmp(latency_stats_probe, "0") != 0;
+    int latency_tick = 0;
+
     while (streamer.IsStreaming()) {
-        if (fec_link_probe && fec_link_probe[0] != '\0' && std::strcmp(fec_link_probe, "0") != 0) {
-            std::this_thread::sleep_for(std::chrono::seconds(fec_link_interval_sec));
-            if (streamer.IsStreaming()) {
-                streamer.LogFecLinkStatsForAllPeers(std::cout);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (!streamer.IsStreaming()) {
+            break;
+        }
+        if (latency_probe_on) {
+            latency_tick++;
+            if (latency_tick >= latency_stats_interval_sec) {
+                latency_tick = 0;
+                streamer.LogLatencyStatsForAllPeers(std::cout);
             }
-        } else {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 

@@ -114,9 +114,11 @@ public:
     /// 是否正在推流
     bool IsStreaming() const { return is_streaming_; }
 
-    /// 对每个订阅者 PeerConnection 调用 GetStats，从 outbound-rtp 抽取 FEC 发送相关计数（若库有暴露）。
-    /// 与 WEBRTC_FEC_LINK_PROBE 配合：用于观察链路上是否持续产生 FEC 发送侧统计。
-    void LogFecLinkStatsForAllPeers(std::ostream& out);
+    /// 对每个活跃 PeerConnection 调用 GetStats，单行打印中文时延摘要（毫秒，含采集/编码/ICE RTT 等）。
+    /// MJPEG+采集桥接且启用 libjpeg-turbo 时附加 JPEG 解码最近/平均耗时。
+    /// 无多订阅者连接时，若存在默认 peer_connection_ 则对其采样（如非信令单连接）。
+    /// 与 WEBRTC_LATENCY_STATS_PROBE 环境变量配合周期打印。
+    void LogLatencyStatsForAllPeers(std::ostream& out);
 
 private:
     class Impl;

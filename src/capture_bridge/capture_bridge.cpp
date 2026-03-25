@@ -1,5 +1,6 @@
 #include "capture_bridge.h"
 #include <fcntl.h>
+#include <chrono>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -67,6 +68,12 @@ bool CaptureBridge::Start() {
     stop_requested_ = false;
     startup_done_ = false;
     startup_ok_ = false;
+#if defined(HAVE_TURBOJPEG)
+    jpeg_decode_last_us_.store(0, std::memory_order_relaxed);
+    jpeg_decode_sum_us_.store(0, std::memory_order_relaxed);
+    jpeg_decode_frames_.store(0, std::memory_order_relaxed);
+    jpeg_decode_has_sample_.store(false, std::memory_order_relaxed);
+#endif
     thread_ = std::make_unique<std::thread>(&CaptureBridge::CaptureLoop, this);
     // 等待后台线程完成初始化，避免“异步失败却返回成功”。
     for (int i = 0; i < 60; ++i) {  // 最多等待约 3 秒
@@ -90,6 +97,29 @@ void CaptureBridge::Stop() {
     }
     thread_.reset();
     running_ = false;
+}
+
+bool CaptureBridge::GetJpegDecodeTimingMs(double* last_ms, double* avg_ms) const {
+#if defined(HAVE_TURBOJPEG)
+    if (!last_ms || !avg_ms) {
+        return false;
+    }
+    if (!jpeg_decode_has_sample_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    unsigned nf = jpeg_decode_frames_.load(std::memory_order_relaxed);
+    if (nf == 0) {
+        return false;
+    }
+    uint64_t sum = jpeg_decode_sum_us_.load(std::memory_order_relaxed);
+    *last_ms = static_cast<double>(jpeg_decode_last_us_.load(std::memory_order_relaxed)) / 1000.0;
+    *avg_ms = static_cast<double>(sum) / static_cast<double>(nf) / 1000.0;
+    return true;
+#else
+    (void)last_ms;
+    (void)avg_ms;
+    return false;
+#endif
 }
 
 void CaptureBridge::CaptureLoop() {
@@ -309,6 +339,7 @@ void CaptureBridge::CaptureLoop() {
 
         if (config_.format == Format::MJPEG) {
 #if defined(HAVE_TURBOJPEG)
+            const auto t_jpeg_start = std::chrono::steady_clock::now();
             tjhandle tj = tjInitDecompress();
             if (!tj) {
                 ioctl(src_fd, VIDIOC_QBUF, &src_buf);
@@ -328,6 +359,14 @@ void CaptureBridge::CaptureLoop() {
                 uint8_t* v_plane = u_plane + ((w + 1) / 2) * ((h + 1) / 2);
                 I420ToYUYV(y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
                            yuyv_buffer.data(), w * 2, w, h);
+                const auto t_jpeg_end = std::chrono::steady_clock::now();
+                const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(t_jpeg_end - t_jpeg_start)
+                                       .count();
+                const uint64_t u64 = us > 0 ? static_cast<uint64_t>(us) : 0u;
+                jpeg_decode_last_us_.store(u64, std::memory_order_relaxed);
+                jpeg_decode_sum_us_.fetch_add(u64, std::memory_order_relaxed);
+                jpeg_decode_frames_.fetch_add(1u, std::memory_order_relaxed);
+                jpeg_decode_has_sample_.store(true, std::memory_order_relaxed);
                 out_data = yuyv_buffer.data();
                 out_len = yuyv_buffer.size();
             }

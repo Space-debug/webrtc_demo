@@ -5,26 +5,21 @@
 # 用法:
 #   ./scripts/test_p2p_headless.sh [摄像头设备]
 #   ./scripts/test_p2p_headless.sh --fec [摄像头设备]       # SDP：发送端 Offer 与客户端收到的 Offer 均含 flexfec/ulpfec
-#   ./scripts/test_p2p_headless.sh --fec-link [摄像头设备] # 在 --fec 基础上，用推流端周期性 GetStats 看 fecPacketsSent/fecBytesSent 是否持续增长
+#   ./scripts/test_p2p_headless.sh --fec-link [摄像头设备] # 已废弃：与 --fec 相同（推流端 FEC 链上统计探针已移除）
 # 环境变量:
 #   FEC_VERIFY=1        与 --fec 等效
-#   FEC_LINK_VERIFY=1   与 --fec-link 等效（也可 FEC_VERIFY=1 FEC_LINK_VERIFY=1）
 #   ENABLE_FLEXFEC=1    由脚本在 FEC 模式下自动 export
-#   WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC  推流采样间隔秒，默认 2
 #   FEC_PCAP_VERIFY=1   可选：test-encode 解析 PT + tcpdump+tshark（SRTP 下常仍无 rtp 层）
 #   P2P_TEST_PORT       信令端口，默认 18765
-#
-# --fec-link 在 SRTP 无法解密时依赖 libwebrtc 是否在 outbound-rtp 统计里暴露 fecPacketsSent；若无则 exit 4。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 FEC_VERIFY="${FEC_VERIFY:-0}"
-FEC_LINK_VERIFY="${FEC_LINK_VERIFY:-0}"
 if [ "${1:-}" = "--fec-link" ]; then
+    echo "[test] 提示: --fec-link 已废弃（FEC 链上 GetStats 探针已从推流端移除），按 --fec 运行" >&2
     FEC_VERIFY=1
-    FEC_LINK_VERIFY=1
     shift
 elif [ "${1:-}" = "--fec" ]; then
     FEC_VERIFY=1
@@ -97,11 +92,6 @@ if [ "$FEC_VERIFY" = "1" ]; then
     export ENABLE_FLEXFEC=1
     export WEBRTC_DUMP_REMOTE_OFFER=1
     echo "[test][fec] ENABLE_FLEXFEC=1、WEBRTC_DUMP_REMOTE_OFFER=1；推流进程将带 WEBRTC_DUMP_OFFER=1 打印本地 Offer"
-    if [ "$FEC_LINK_VERIFY" = "1" ]; then
-        export WEBRTC_FEC_LINK_PROBE=1
-        export WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC="${WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC:-2}"
-        echo "[test][fec-link] WEBRTC_FEC_LINK_PROBE=1 INTERVAL=${WEBRTC_FEC_LINK_PROBE_INTERVAL_SEC}s（观察 outbound-rtp 的 fec* 计数）"
-    fi
     if [ "${FEC_PCAP_VERIFY:-0}" = "1" ]; then
         SDP_F=$(mktemp)
         echo "[test][fec] FEC_PCAP_VERIFY=1：短时 test-encode 解析 FEC PT…"
@@ -202,10 +192,6 @@ sleep 1
 
 H_FRAMES=20
 H_TO=90
-if [ "$FEC_VERIFY" = "1" ] && [ "$FEC_LINK_VERIFY" = "1" ]; then
-    H_FRAMES=50
-    H_TO=120
-fi
 
 echo "[test] 无头拉流（需收到至少 ${H_FRAMES} 帧）"
 if [ -n "${PULL_OUT:-}" ]; then
@@ -234,48 +220,6 @@ if [ "$FEC_VERIFY" = "1" ] && [ "$RC" -eq 0 ] && [ -n "${PULL_OUT:-}" ] && [ -f 
     fi
     echo "[test][fec] 通过(SDP): 发送端本地 Offer 含 FEC 行: $PUSH_LINE"
     echo "[test][fec] 通过(SDP): 客户端收到的远端 Offer 含 FEC 行: $PULL_LINE"
-
-    if [ "$FEC_LINK_VERIFY" = "1" ]; then
-        link_ok=0
-        n_pkt=$(grep '\[fec-link\]' "$PUSH_LOG" | grep -c 'fecPacketsSent=[0-9]' || true)
-        n_pkt="${n_pkt//[[:space:]]/}"
-        if [ "${n_pkt:-0}" -ge 2 ]; then
-            v_first=$(grep '\[fec-link\]' "$PUSH_LOG" | grep 'fecPacketsSent=[0-9]' | head -1 | sed -E 's/.*fecPacketsSent=([0-9]+).*/\1/')
-            v_last=$(grep '\[fec-link\]' "$PUSH_LOG" | grep 'fecPacketsSent=[0-9]' | tail -1 | sed -E 's/.*fecPacketsSent=([0-9]+).*/\1/')
-            if [ -n "$v_first" ] && [ -n "$v_last" ] && [ "$v_last" -gt "$v_first" ]; then
-                link_ok=1
-            fi
-        fi
-        if [ "$link_ok" = "0" ]; then
-            n_by=$(grep '\[fec-link\]' "$PUSH_LOG" | grep -c 'fecBytesSent=[0-9]' || true)
-            n_by="${n_by//[[:space:]]/}"
-            if [ "${n_by:-0}" -ge 2 ]; then
-                b_first=$(grep '\[fec-link\]' "$PUSH_LOG" | grep 'fecBytesSent=[0-9]' | head -1 | sed -E 's/.*fecBytesSent=([0-9]+).*/\1/')
-                b_last=$(grep '\[fec-link\]' "$PUSH_LOG" | grep 'fecBytesSent=[0-9]' | tail -1 | sed -E 's/.*fecBytesSent=([0-9]+).*/\1/')
-                if [ -n "$b_first" ] && [ -n "$b_last" ] && [ "$b_last" -gt "$b_first" ]; then
-                    link_ok=1
-                fi
-            fi
-        fi
-        if [ "$link_ok" = "0" ]; then
-            n_nm=$(grep '\[fec-link\]' "$PUSH_LOG" | grep -c 'fec_named_member_max=[1-9]' || true)
-            n_nm="${n_nm//[[:space:]]/}"
-            if [ "${n_nm:-0}" -ge 2 ]; then
-                m_first=$(grep '\[fec-link\]' "$PUSH_LOG" | sed -n 's/.*fec_named_member_max=\([0-9]*\).*/\1/p' | head -1)
-                m_last=$(grep '\[fec-link\]' "$PUSH_LOG" | sed -n 's/.*fec_named_member_max=\([0-9]*\).*/\1/p' | tail -1)
-                if [ -n "$m_first" ] && [ -n "$m_last" ] && [ "$m_last" -gt "$m_first" ]; then
-                    link_ok=1
-                fi
-            fi
-        fi
-        if [ "$link_ok" != "1" ]; then
-            echo "[test][fec-link] 失败: 推流日志中 fecPacketsSent/fecBytesSent 未在多次采样间增长（或字段恒为 KEY_MISSING）。" >&2
-            echo "[test][fec-link] 说明: SRTP 下无法直接数 RTP 包；若库不暴露 outbound fec* 统计则无法用本脚本验证「链路上持续发 FEC」。" >&2
-            grep '\[fec-link\]' "$PUSH_LOG" | tail -20 >&2 || true
-            exit 4
-        fi
-        echo "[test][fec-link] 通过: 发送侧 outbound-rtp 的 FEC 计数随时间上升（反映持续产生 FEC 发送路径）。"
-    fi
 
     if [ -n "${TCPDUMP_PID:-}" ] && kill -0 "$TCPDUMP_PID" 2>/dev/null; then
         kill "$TCPDUMP_PID" 2>/dev/null || true

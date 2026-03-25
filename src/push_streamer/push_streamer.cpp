@@ -29,8 +29,10 @@ using libwebrtc::scoped_refptr;
 #include <cstdlib>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -55,170 +57,155 @@ void EnableAlsaNullDeviceFallback() {
     }
 }
 
-static bool FecStatsNameContainsFec(const std::string& n) {
-    std::string lower;
-    lower.reserve(n.size());
-    for (unsigned char c : n) {
-        lower.push_back(static_cast<char>(std::tolower(c)));
-    }
-    return lower.find("fec") != std::string::npos;
-}
-
-static uint64_t FecStatsMemberToUint(const libwebrtc::RTCStatsMember& m) {
+static std::optional<double> LatencyMemberDoubleSeconds(const libwebrtc::RTCStatsMember& m) {
     using T = libwebrtc::RTCStatsMember::Type;
-    switch (m.GetType()) {
-        case T::kUint64:
-            return m.ValueUint64();
-        case T::kUint32:
-            return m.ValueUint32();
-        case T::kInt64: {
-            int64_t v = m.ValueInt64();
-            return v > 0 ? static_cast<uint64_t>(v) : 0;
-        }
-        case T::kInt32: {
-            int32_t v = m.ValueInt32();
-            return v > 0 ? static_cast<uint64_t>(v) : 0;
-        }
-        default:
-            return 0;
+    if (!m.IsDefined() || m.GetType() != T::kDouble) {
+        return std::nullopt;
+    }
+    return m.ValueDouble();
+}
+
+static void MergeMaxOptional(std::optional<double>* slot, double candidate_ms) {
+    if (!slot->has_value() || candidate_ms > **slot) {
+        *slot = candidate_ms;
     }
 }
 
-static void FecAccumulateFromMembers(const libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>& rep,
-                                     bool* any_fec_named,
-                                     uint64_t* max_val) {
-    if (!rep || !any_fec_named || !max_val) {
+/// 从 GetStats 汇总推流端关心的时延指标（均为毫秒；带「累计」的为 WebRTC 累计量，非单帧）。
+struct LatencyOneLineSummary {
+    std::optional<double> capture_total_ms;           // media-source totalCaptureTime
+    std::optional<double> encode_total_ms;            // outbound-rtp totalEncodeTime
+    std::optional<double> packet_send_delay_total_ms; // outbound-rtp totalPacketSendDelay
+    std::optional<double> ice_current_rtt_ms;         // candidate-pair currentRoundTripTime（多对取最大）
+    std::optional<double> remote_rtt_ms;              // remote-inbound-rtp roundTripTime
+    std::optional<double> remote_jitter_ms;         // remote-inbound-rtp jitter
+    std::optional<double> avg_rtcp_interval_ms;       // averageRtcpInterval（多处可能出现，取最大）
+};
+
+static void AccumulateLatencySummary(const std::string& rtype,
+                                     const std::string& name,
+                                     const libwebrtc::RTCStatsMember& m,
+                                     LatencyOneLineSummary* s) {
+    auto sec = LatencyMemberDoubleSeconds(m);
+    if (!sec) {
         return;
     }
-    const auto members = rep->Members();
-    for (size_t i = 0; i < members.size(); ++i) {
-        const auto& mem = members[i];
-        if (!mem || !mem->IsDefined()) {
-            continue;
+    const double ms = *sec * 1000.0;
+    if (rtype == "media-source" && name == "totalCaptureTime") {
+        MergeMaxOptional(&s->capture_total_ms, ms);
+    } else if (rtype == "outbound-rtp" && name == "totalEncodeTime") {
+        MergeMaxOptional(&s->encode_total_ms, ms);
+    } else if (rtype == "outbound-rtp" && name == "totalPacketSendDelay") {
+        MergeMaxOptional(&s->packet_send_delay_total_ms, ms);
+    } else if (rtype == "candidate-pair" && name == "currentRoundTripTime") {
+        if (ms > 0.0) {
+            MergeMaxOptional(&s->ice_current_rtt_ms, ms);
         }
-        if (!FecStatsNameContainsFec(mem->GetName().std_string())) {
-            continue;
-        }
-        using T = libwebrtc::RTCStatsMember::Type;
-        switch (mem->GetType()) {
-            case T::kUint64:
-            case T::kUint32:
-            case T::kInt64:
-            case T::kInt32:
-                break;
-            default:
-                continue;
-        }
-        uint64_t v = FecStatsMemberToUint(*mem);
-        *any_fec_named = true;
-        if (v > *max_val) {
-            *max_val = v;
-        }
+    } else if (rtype == "remote-inbound-rtp" && name == "roundTripTime") {
+        MergeMaxOptional(&s->remote_rtt_ms, ms);
+    } else if (rtype == "remote-inbound-rtp" && name == "jitter") {
+        MergeMaxOptional(&s->remote_jitter_ms, ms);
+    } else if (name == "averageRtcpInterval") {
+        MergeMaxOptional(&s->avg_rtcp_interval_ms, ms);
     }
 }
 
-static uint64_t FecJsonUintAfterKey(const std::string& j, const char* key) {
-    const std::string needle = std::string("\"") + key + "\"";
-    size_t p = j.find(needle);
-    if (p == std::string::npos) {
-        return UINT64_MAX;
+static std::string FormatMsOptional(const std::optional<double>& v, int prec) {
+    if (!v.has_value()) {
+        return "-";
     }
-    p = j.find(':', p + needle.size());
-    if (p == std::string::npos) {
-        return UINT64_MAX;
-    }
-    ++p;
-    while (p < j.size() && std::isspace(static_cast<unsigned char>(j[p]))) {
-        ++p;
-    }
-    if (p >= j.size() || !std::isdigit(static_cast<unsigned char>(j[p]))) {
-        return UINT64_MAX;
-    }
-    uint64_t v = 0;
-    while (p < j.size() && std::isdigit(static_cast<unsigned char>(j[p]))) {
-        v = v * 10 + static_cast<uint64_t>(j[p] - '0');
-        ++p;
-    }
-    return v;
+    std::ostringstream o;
+    o << std::fixed << std::setprecision(prec) << *v;
+    return o.str();
 }
 
-/// 从 outbound-rtp 报告中汇总 FEC 发送计数（WebRTC 标准字段 fecPacketsSent / fecBytesSent）。
-static void DumpOutboundFecLinkLine(std::ostream& out,
-                                    libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
-                                    const std::string& peer_tag,
-                                    int timeout_ms) {
+/// 对单个 PeerConnection 调用 GetStats，单行输出中文标签（单位 ms）。
+static void DumpLatencyStatsForPc(std::ostream& out,
+                                  libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
+                                  const std::string& peer_tag,
+                                  int timeout_ms,
+                                  const std::string& append_suffix) {
     using clock = std::chrono::system_clock;
     const int64_t t_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
 
     if (!pc) {
-        out << "[fec-link] t_ms=" << t_ms << " peer=" << peer_tag << " err=no_pc\n" << std::flush;
+        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " err=no_pc\n" << std::flush;
         return;
     }
 
-    struct Agg {
-        uint64_t fec_packets_sent{UINT64_MAX};
-        uint64_t fec_bytes_sent{UINT64_MAX};
-        bool any_fec_member{false};
-        uint64_t fec_member_max{0};
-    };
-    auto agg = std::make_shared<Agg>();
     auto done = std::make_shared<std::promise<void>>();
     std::future<void> fut = done->get_future();
 
     pc->GetStats(
-        [agg, done](const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
-            // 不限于 outbound-rtp：部分 libwebrtc 绑定把 fec* 放在其它报告或未区分类型
+        [done, &out, t_ms, peer_tag, append_suffix](
+            const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
+            if (reports.size() == 0) {
+                out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats"
+                    << append_suffix << "\n";
+                out << std::flush;
+                done->set_value();
+                return;
+            }
+
+            LatencyOneLineSummary sum;
+            int64_t latest_ts_us = 0;
             for (size_t i = 0; i < reports.size(); ++i) {
                 const auto& rep = reports[i];
                 if (!rep) {
                     continue;
                 }
-                FecAccumulateFromMembers(rep, &agg->any_fec_member, &agg->fec_member_max);
-                std::string j = rep->ToJson().std_string();
-                uint64_t v = FecJsonUintAfterKey(j, "fecPacketsSent");
-                if (v != UINT64_MAX) {
-                    if (agg->fec_packets_sent == UINT64_MAX || v > agg->fec_packets_sent) {
-                        agg->fec_packets_sent = v;
-                    }
+                if (rep->timestamp_us() > latest_ts_us) {
+                    latest_ts_us = rep->timestamp_us();
                 }
-                v = FecJsonUintAfterKey(j, "fecBytesSent");
-                if (v != UINT64_MAX) {
-                    if (agg->fec_bytes_sent == UINT64_MAX || v > agg->fec_bytes_sent) {
-                        agg->fec_bytes_sent = v;
+                std::string rtype = rep->type().std_string();
+                const auto members = rep->Members();
+                for (size_t j = 0; j < members.size(); ++j) {
+                    const auto& mem = members[j];
+                    if (!mem) {
+                        continue;
                     }
+                    AccumulateLatencySummary(rtype, mem->GetName().std_string(), *mem, &sum);
                 }
             }
+
+            const bool any = sum.capture_total_ms.has_value() || sum.encode_total_ms.has_value() ||
+                             sum.packet_send_delay_total_ms.has_value() || sum.ice_current_rtt_ms.has_value() ||
+                             sum.remote_rtt_ms.has_value() || sum.remote_jitter_ms.has_value() ||
+                             sum.avg_rtcp_interval_ms.has_value();
+
+            std::ostringstream ts_ms;
+            ts_ms << std::fixed << std::setprecision(3) << (static_cast<double>(latest_ts_us) / 1000.0);
+
+            if (!any) {
+                out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
+                    << " note=no_known_latency_fields stats_timestamp_ms=" << ts_ms.str() << append_suffix
+                    << "\n";
+            } else {
+                out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
+                    << " stats_timestamp_ms=" << ts_ms.str()
+                    << " 采集累计：" << FormatMsOptional(sum.capture_total_ms, 2) << "ms"
+                    << " 编码累计：" << FormatMsOptional(sum.encode_total_ms, 2) << "ms"
+                    << " RTP发送排队累计：" << FormatMsOptional(sum.packet_send_delay_total_ms, 2) << "ms"
+                    << " ICE当前往返：" << FormatMsOptional(sum.ice_current_rtt_ms, 3) << "ms"
+                    << " 对端反馈RTT：" << FormatMsOptional(sum.remote_rtt_ms, 3) << "ms"
+                    << " 对端抖动：" << FormatMsOptional(sum.remote_jitter_ms, 3) << "ms"
+                    << " 平均RTCP间隔：" << FormatMsOptional(sum.avg_rtcp_interval_ms, 2) << "ms"
+                    << append_suffix << " (累计项为连接期累计; 无字段显示为-)\n";
+            }
+            out << std::flush;
             done->set_value();
         },
         [done, &out, t_ms, peer_tag](const char* err) {
-            out << "[fec-link] t_ms=" << t_ms << " peer=" << peer_tag << " GetStats_error=" << (err ? err : "")
-                << "\n" << std::flush;
+            out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
+                << " GetStats_error=" << (err ? err : "") << "\n"
+                << std::flush;
             done->set_value();
         });
 
     if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
-        out << "[fec-link] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
-        return;
+        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
     }
-
-    std::ostringstream pkt_s;
-    if (agg->fec_packets_sent == UINT64_MAX) {
-        pkt_s << "KEY_MISSING";
-    } else {
-        pkt_s << agg->fec_packets_sent;
-    }
-    std::ostringstream by_s;
-    if (agg->fec_bytes_sent == UINT64_MAX) {
-        by_s << "KEY_MISSING";
-    } else {
-        by_s << agg->fec_bytes_sent;
-    }
-
-    out << "[fec-link] t_ms=" << t_ms << " peer=" << peer_tag << " fecPacketsSent=" << pkt_s.str()
-        << " fecBytesSent=" << by_s.str() << " fec_named_member_max=" << agg->fec_member_max
-        << " has_fec_named_member=" << (agg->any_fec_member ? "1" : "0") << "\n"
-        << std::flush;
 }
 
 }  // namespace
@@ -1114,7 +1101,26 @@ public:
     bool TestCaptureOnly() const { return config_.test_capture_only; }
     bool SignalingSubscriberOfferOnly() const { return config_.signaling_subscriber_offer_only; }
 
-    void LogFecLinkStatsForAllPeers(std::ostream& out) {
+    void LogLatencyStatsForAllPeers(std::ostream& out) {
+        std::string append_suffix;
+        {
+            std::string cf = config_.capture_format;
+            for (auto& ch : cf) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            if (capture_bridge_ && CaptureBridge::ParseFormat(cf) == CaptureBridge::Format::MJPEG) {
+                double last_ms = 0;
+                double avg_ms = 0;
+                if (capture_bridge_->GetJpegDecodeTimingMs(&last_ms, &avg_ms)) {
+                    std::ostringstream j;
+                    j << std::fixed << std::setprecision(2);
+                    j << " JPEG解码最近：" << last_ms << "ms JPEG解码平均：" << avg_ms
+                      << "ms(桥接:turbo解压+I420转YUYV)";
+                    append_suffix = j.str();
+                }
+            }
+        }
+
         std::vector<std::pair<std::string, scoped_refptr<libwebrtc::RTCPeerConnection>>> copy;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1123,15 +1129,26 @@ public:
             }
         }
         if (copy.empty()) {
-            using clock = std::chrono::system_clock;
-            const int64_t t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     clock::now().time_since_epoch())
-                                     .count();
-            out << "[fec-link] t_ms=" << t_ms << " peer=(none) note=no_subscriber_connections\n" << std::flush;
+            scoped_refptr<libwebrtc::RTCPeerConnection> pc;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pc = peer_connection_;
+            }
+            if (pc) {
+                DumpLatencyStatsForPc(out, pc, "default", 5000, append_suffix);
+            } else {
+                using clock = std::chrono::system_clock;
+                const int64_t t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         clock::now().time_since_epoch())
+                                         .count();
+                out << "[stats-latency] t_ms=" << t_ms << " peer=(none) note=no_peerconnection" << append_suffix
+                    << "\n"
+                    << std::flush;
+            }
             return;
         }
         for (const auto& pr : copy) {
-            DumpOutboundFecLinkLine(out, pr.second, pr.first, 5000);
+            DumpLatencyStatsForPc(out, pr.second, pr.first, 5000, append_suffix);
         }
     }
 };
@@ -1214,8 +1231,8 @@ unsigned int PushStreamer::GetDecodedFrameCount() const {
     return impl_->GetDecodedFrameCount();
 }
 
-void PushStreamer::LogFecLinkStatsForAllPeers(std::ostream& out) {
-    impl_->LogFecLinkStatsForAllPeers(out);
+void PushStreamer::LogLatencyStatsForAllPeers(std::ostream& out) {
+    impl_->LogLatencyStatsForAllPeers(out);
 }
 
 }  // namespace webrtc_demo

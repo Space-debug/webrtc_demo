@@ -1,6 +1,7 @@
 #ifndef CAPTURE_BRIDGE_H
 #define CAPTURE_BRIDGE_H
 
+#include <cstdint>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -37,6 +38,9 @@ public:
     bool IsRunning() const { return running_; }
     unsigned long GetFrameCount() const { return frame_count_; }
 
+    /// 仅 MJPEG 且已成功解码过至少一帧时返回 true；*last_ms/*avg_ms 为 turbo 解压+I420→YUYV 耗时(ms)。
+    bool GetJpegDecodeTimingMs(double* last_ms, double* avg_ms) const;
+
     /// 从字符串解析格式：yuyv, mjpeg, auto
     static Format ParseFormat(const std::string& s);
 
@@ -49,6 +53,12 @@ private:
     std::atomic<bool> startup_done_{false};
     std::atomic<bool> startup_ok_{false};
     std::atomic<unsigned long> frame_count_{0};
+#if defined(HAVE_TURBOJPEG)
+    std::atomic<uint64_t> jpeg_decode_last_us_{0};
+    std::atomic<uint64_t> jpeg_decode_sum_us_{0};
+    std::atomic<unsigned> jpeg_decode_frames_{0};
+    std::atomic<bool> jpeg_decode_has_sample_{false};
+#endif
     std::unique_ptr<std::thread> thread_;
 };
 
