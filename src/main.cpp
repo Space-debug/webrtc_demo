@@ -58,8 +58,8 @@ void PrintUsage(const char* prog) {
               << "  --enable-audio    允许 SDP 协商音频意向（未实现麦克风采集）\n"
               << "  --enable-flexfec  启用 FlexFEC-03（与配置 ENABLE_FLEXFEC=1 等效，收发端都需开）\n"
               << "环境变量:\n"
-              << "  WEBRTC_LATENCY_STATS_PROBE=1  周期单行打印延时摘要(毫秒，如采集累计/编码累计/ICE往返等)\n"
-              << "  WEBRTC_LATENCY_STATS_PROBE_INTERVAL_SEC=N  延迟统计间隔秒，默认 2\n"
+              << "  WEBRTC_LATENCY_STATS_PROBE=1  每采集 N 帧打印一行延时摘要(毫秒)；N 见下一项，默认 50\n"
+              << "  WEBRTC_LATENCY_STATS_EVERY_FRAMES=N  与上一项配合，默认 50\n"
               << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N  创建 Offer 前至少 N 帧(0=关)，覆盖配置 CAPTURE_GATE_MIN_FRAMES\n"
               << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N  等待门限最久 N 秒，覆盖 CAPTURE_GATE_MAX_WAIT_SEC\n"
               << "参数:\n"
@@ -399,29 +399,32 @@ int main(int argc, char* argv[]) {
     std::cout << "Press Ctrl+C to stop." << std::endl;
 
     const char* latency_stats_probe = std::getenv("WEBRTC_LATENCY_STATS_PROBE");
-    int latency_stats_interval_sec = 2;
-    if (const char* iv = std::getenv("WEBRTC_LATENCY_STATS_PROBE_INTERVAL_SEC")) {
-        int v = std::atoi(iv);
+    int latency_stats_every_frames = 50;
+    if (const char* nf = std::getenv("WEBRTC_LATENCY_STATS_EVERY_FRAMES")) {
+        int v = std::atoi(nf);
         if (v > 0) {
-            latency_stats_interval_sec = v;
+            latency_stats_every_frames = v;
         }
     }
 
     const bool latency_probe_on = latency_stats_probe && latency_stats_probe[0] != '\0' &&
                                   std::strcmp(latency_stats_probe, "0") != 0;
-    int latency_tick = 0;
+    unsigned int latency_next_frame_milestone =
+        static_cast<unsigned int>(latency_stats_every_frames);
 
     while (streamer.IsStreaming()) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (latency_probe_on) {
+            const unsigned int n = streamer.GetFrameCount();
+            while (n >= latency_next_frame_milestone) {
+                streamer.LogLatencyStatsForAllPeers(std::cout);
+                latency_next_frame_milestone += static_cast<unsigned int>(latency_stats_every_frames);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } else {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
         if (!streamer.IsStreaming()) {
             break;
-        }
-        if (latency_probe_on) {
-            latency_tick++;
-            if (latency_tick >= latency_stats_interval_sec) {
-                latency_tick = 0;
-                streamer.LogLatencyStatsForAllPeers(std::cout);
-            }
         }
     }
 
