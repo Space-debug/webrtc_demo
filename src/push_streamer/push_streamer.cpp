@@ -21,15 +21,19 @@ using libwebrtc::scoped_refptr;
 #include <rtc_video_track.h>
 #include <helper.h>
 
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -62,6 +66,30 @@ static std::optional<double> LatencyMemberDoubleSeconds(const libwebrtc::RTCStat
         return std::nullopt;
     }
     return m.ValueDouble();
+}
+
+/// media-source totalCaptureTime: spec is seconds (double). Some bindings expose integer milliseconds.
+static std::optional<double> MediaSourceTotalCaptureTimeMs(const libwebrtc::RTCStatsMember& m) {
+    using T = libwebrtc::RTCStatsMember::Type;
+    if (!m.IsDefined()) {
+        return std::nullopt;
+    }
+    if (m.GetType() == T::kDouble) {
+        return m.ValueDouble() * 1000.0;
+    }
+    if (m.GetType() == T::kUint64) {
+        return static_cast<double>(m.ValueUint64());
+    }
+    if (m.GetType() == T::kInt64) {
+        return static_cast<double>(m.ValueInt64());
+    }
+    if (m.GetType() == T::kUint32) {
+        return static_cast<double>(m.ValueUint32());
+    }
+    if (m.GetType() == T::kInt32) {
+        return static_cast<double>(m.ValueInt32());
+    }
+    return std::nullopt;
 }
 
 static std::optional<uint64_t> LatencyMemberUint64(const libwebrtc::RTCStatsMember& m) {
@@ -124,14 +152,18 @@ static void AccumulateLatencySummary(const std::string& rtype,
         }
         return;
     }
+    if (rtype == "media-source" && name == "totalCaptureTime") {
+        if (auto cap_ms = MediaSourceTotalCaptureTimeMs(m)) {
+            MergeMaxOptional(&s->capture_total_ms, *cap_ms);
+        }
+        return;
+    }
     auto sec = LatencyMemberDoubleSeconds(m);
     if (!sec) {
         return;
     }
     const double ms = *sec * 1000.0;
-    if (rtype == "media-source" && name == "totalCaptureTime") {
-        MergeMaxOptional(&s->capture_total_ms, ms);
-    } else if (rtype == "outbound-rtp" && name == "totalEncodeTime") {
+    if (rtype == "outbound-rtp" && name == "totalEncodeTime") {
         MergeMaxOptional(&s->encode_total_ms, ms);
     } else if (rtype == "outbound-rtp" && name == "totalPacketSendDelay") {
         MergeMaxOptional(&s->packet_send_delay_total_ms, ms);
@@ -161,6 +193,144 @@ static std::string FormatMsOptional(const std::optional<double>& v, int prec) {
 
 enum class LatencyPollStatus { Ok, Empty, Error, Timeout };
 
+static bool GetStatsFullDumpEnabled() {
+    const char* v = std::getenv("WEBRTC_GETSTATS_DUMP");
+    return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+static bool GetStatsDumpJsonOnly() {
+    const char* v = std::getenv("WEBRTC_GETSTATS_DUMP_JSON_ONLY");
+    return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+static bool GetStatsDumpMembersExtra() {
+    const char* v = std::getenv("WEBRTC_GETSTATS_DUMP_MEMBERS");
+    return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+static int GetStatsDumpIntervalMs() {
+    const char* v = std::getenv("WEBRTC_GETSTATS_DUMP_INTERVAL_MS");
+    if (!v || v[0] == '\0') {
+        return 0;
+    }
+    return std::atoi(v);
+}
+
+/// One-line representation for RTCStatsMember (sequences/maps summarized).
+static std::string StatsMemberValueOneLine(const libwebrtc::RTCStatsMember& m) {
+    using T = libwebrtc::RTCStatsMember::Type;
+    if (!m.IsDefined()) {
+        return "(undefined)";
+    }
+    switch (m.GetType()) {
+        case T::kBool:
+            return m.ValueBool() ? "true" : "false";
+        case T::kInt32:
+            return std::to_string(m.ValueInt32());
+        case T::kUint32:
+            return std::to_string(m.ValueUint32());
+        case T::kInt64:
+            return std::to_string(m.ValueInt64());
+        case T::kUint64:
+            return std::to_string(m.ValueUint64());
+        case T::kDouble:
+            return std::to_string(m.ValueDouble());
+        case T::kString:
+            return m.ValueString().std_string();
+        case T::kSequenceBool: {
+            const auto s = m.ValueSequenceBool();
+            return "seq<bool>[" + std::to_string(s.size()) + "]";
+        }
+        case T::kSequenceInt32: {
+            const auto s = m.ValueSequenceInt32();
+            return "seq<int32>[" + std::to_string(s.size()) + "]";
+        }
+        case T::kSequenceUint32: {
+            const auto s = m.ValueSequenceUint32();
+            return "seq<uint32>[" + std::to_string(s.size()) + "]";
+        }
+        case T::kSequenceInt64: {
+            const auto s = m.ValueSequenceInt64();
+            return "seq<int64>[" + std::to_string(s.size()) + "]";
+        }
+        case T::kSequenceUint64: {
+            const auto s = m.ValueSequenceUint64();
+            return "seq<uint64>[" + std::to_string(s.size()) + "]";
+        }
+        case T::kSequenceDouble: {
+            const auto s = m.ValueSequenceDouble();
+            return "seq<double>[" + std::to_string(s.size()) + "]";
+        }
+        case T::kSequenceString: {
+            const auto s = m.ValueSequenceString();
+            return "seq<string>[" + std::to_string(s.size()) + "]";
+        }
+        case T::kMapStringUint64: {
+            const auto mp = m.ValueMapStringUint64();
+            return "map<string,uint64>[" + std::to_string(mp.size()) + "]";
+        }
+        case T::kMapStringDouble: {
+            const auto mp = m.ValueMapStringDouble();
+            return "map<string,double>[" + std::to_string(mp.size()) + "]";
+        }
+        default:
+            return "(unknown_type)";
+    }
+}
+
+static void MaybeDumpFullGetStatsReports(
+    std::ostream& out,
+    const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports,
+    const char* peer_tag) {
+    if (!GetStatsFullDumpEnabled()) {
+        return;
+    }
+    const int interval_ms = GetStatsDumpIntervalMs();
+    static std::mutex rate_mu;
+    static std::chrono::steady_clock::time_point last_dump{};
+    static bool have_last{false};
+    if (interval_ms > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(rate_mu);
+        if (have_last) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_dump).count();
+            if (elapsed < interval_ms) {
+                return;
+            }
+        }
+        last_dump = now;
+        have_last = true;
+    }
+
+    const char* ptag = (peer_tag && peer_tag[0] != '\0') ? peer_tag : "(pc)";
+    const bool json_only = GetStatsDumpJsonOnly();
+    const bool members_extra = GetStatsDumpMembersExtra();
+    for (size_t i = 0; i < reports.size(); ++i) {
+        const auto& rep = reports[i];
+        if (!rep) {
+            continue;
+        }
+        const std::string j = rep->ToJson().std_string();
+        out << "[getstats-full] peer=" << ptag << " idx=" << i << " type=" << rep->type().std_string()
+            << " id=" << rep->id().std_string() << " ts_us=" << rep->timestamp_us() << "\n";
+        if (!j.empty()) {
+            out << j << "\n";
+        }
+        const bool dump_members = !json_only || members_extra || j.empty();
+        if (dump_members) {
+            const auto members = rep->Members();
+            for (size_t jm = 0; jm < members.size(); ++jm) {
+                const auto& mem = members[jm];
+                if (!mem) {
+                    continue;
+                }
+                out << "  m[" << mem->GetName().std_string() << "]=" << StatsMemberValueOneLine(*mem) << "\n";
+            }
+        }
+        out << std::flush;
+    }
+}
+
 struct LatencyPollResult {
     LatencyPollStatus status{LatencyPollStatus::Ok};
     const char* error_message{nullptr};
@@ -169,8 +339,10 @@ struct LatencyPollResult {
 };
 
 /// 阻塞等待 GetStats 回调，汇总 LatencyOneLineSummary（供瞬时打印与滚动差分共用）。
+/// getstats_peer_tag: label for WEBRTC_GETSTATS_DUMP lines (may be null).
 static LatencyPollResult PollLatencySummaryForPc(libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
-                                                 int timeout_ms) {
+                                                 int timeout_ms,
+                                                 const char* getstats_peer_tag) {
     LatencyPollResult timeout_r;
     timeout_r.status = LatencyPollStatus::Timeout;
     if (!pc) {
@@ -184,13 +356,15 @@ static LatencyPollResult PollLatencySummaryForPc(libwebrtc::scoped_refptr<libweb
     std::future<LatencyPollResult> fut = done->get_future();
 
     pc->GetStats(
-        [done](const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
+        [done, getstats_peer_tag](
+            const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>>& reports) {
             LatencyPollResult out;
             if (reports.size() == 0) {
                 out.status = LatencyPollStatus::Empty;
                 done->set_value(out);
                 return;
             }
+            MaybeDumpFullGetStatsReports(std::cout, reports, getstats_peer_tag);
             int64_t latest_ts_us = 0;
             for (size_t i = 0; i < reports.size(); ++i) {
                 const auto& rep = reports[i];
@@ -227,7 +401,7 @@ static LatencyPollResult PollLatencySummaryForPc(libwebrtc::scoped_refptr<libweb
     return fut.get();
 }
 
-/// 对单个 PeerConnection 调用 GetStats，单行输出中文标签（单位 ms）。
+/// GetStats for one PeerConnection; one line, English keys (ms).
 static void DumpLatencyStatsForPc(std::ostream& out,
                                   libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> pc,
                                   const std::string& peer_tag,
@@ -236,7 +410,7 @@ static void DumpLatencyStatsForPc(std::ostream& out,
     const int64_t t_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
 
-    LatencyPollResult r = PollLatencySummaryForPc(pc, timeout_ms);
+    LatencyPollResult r = PollLatencySummaryForPc(pc, timeout_ms, peer_tag.c_str());
     if (r.status == LatencyPollStatus::Timeout) {
         out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
         return;
@@ -264,22 +438,21 @@ static void DumpLatencyStatsForPc(std::ostream& out,
     if (!any) {
         out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
             << " note=no_known_latency_fields stats_timestamp_ms=" << ts_ms.str()
-            << " (stats_timestamp_ms=RTC报表时间戳; 与配置 LATENCY_STATS_WINDOW_FRAMES 的窗长无关)\n";
+            << " (stats_timestamp_ms=RTC report clock; unrelated to LATENCY_STATS_WINDOW_FRAMES)\n";
     } else {
         out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " stats_timestamp_ms=" << ts_ms.str()
-            << " 采集累计：" << FormatMsOptional(sum.capture_total_ms, 2) << "ms"
-            << " 编码累计：" << FormatMsOptional(sum.encode_total_ms, 2) << "ms"
-            << " RTP发送排队累计：" << FormatMsOptional(sum.packet_send_delay_total_ms, 2) << "ms"
-            << " ICE当前往返：" << FormatMsOptional(sum.ice_current_rtt_ms, 3) << "ms"
-            << " 对端反馈RTT：" << FormatMsOptional(sum.remote_rtt_ms, 3) << "ms"
-            << " 对端抖动：" << FormatMsOptional(sum.remote_jitter_ms, 3) << "ms"
-            << " 平均RTCP间隔：" << FormatMsOptional(sum.avg_rtcp_interval_ms, 2) << "ms"
-            << " 对端RTT累计和：" << FormatMsOptional(sum.remote_total_rtt_sum_ms, 2) << "ms"
-            << " 对端RTT样本数：" << (sum.remote_rtt_measurements.has_value()
-                                         ? std::to_string(*sum.remote_rtt_measurements)
-                                         : std::string("-"))
-            << " (stats_timestamp_ms=RTC报表时间戳; 带「累计」的项为连接期累计量；"
-               "窗内 ms/帧见 [stats-latency-avg]；无字段=-)\n";
+            << " capture_total_ms=" << FormatMsOptional(sum.capture_total_ms, 2)
+            << " encode_total_ms=" << FormatMsOptional(sum.encode_total_ms, 2)
+            << " rtp_send_queue_total_ms=" << FormatMsOptional(sum.packet_send_delay_total_ms, 2)
+            << " ice_rtt_ms=" << FormatMsOptional(sum.ice_current_rtt_ms, 3)
+            << " remote_feedback_rtt_ms=" << FormatMsOptional(sum.remote_rtt_ms, 3)
+            << " remote_jitter_ms=" << FormatMsOptional(sum.remote_jitter_ms, 3)
+            << " avg_rtcp_interval_ms=" << FormatMsOptional(sum.avg_rtcp_interval_ms, 2)
+            << " remote_rtt_sum_ms=" << FormatMsOptional(sum.remote_total_rtt_sum_ms, 2)
+            << " remote_rtt_measurements=" << (sum.remote_rtt_measurements.has_value()
+                                                  ? std::to_string(*sum.remote_rtt_measurements)
+                                                  : std::string("-"))
+            << " (cumulative=session totals; ms/frame rolling in [stats-latency-avg]; missing=-)\n";
     }
     out << std::flush;
 }
@@ -320,6 +493,103 @@ static std::optional<double> EndpointMeanMs(const std::optional<double>& a, cons
     return std::nullopt;
 }
 
+static bool LatencyPipelineVerbose() {
+    const char* v = std::getenv("WEBRTC_LATENCY_PIPELINE_VERBOSE");
+    return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+static void PrintLatencyPipelineLegendEnglish(std::ostream& out) {
+    static std::atomic<bool> legend_printed{false};
+    if (legend_printed.exchange(true)) {
+        return;
+    }
+    out << "[latency-pipeline] legend=v1 lang=en\n";
+    out << "[latency-pipeline] scope=push_path_only end_to_end_includes_receiver_wifi_jitter_buffer_decode\n";
+    out << "[latency-pipeline] NOT_MEASURABLE_in_app=SensorExposure,SensorReadout,CameraBufferEnqueue,"
+           "KernelUrbToV4l2Buffer reason=no_V4L2_timestamp_in_libwebrtc_wrapper_see_usr_if_fields\n";
+    out << "[latency-pipeline] NOT_MEASURABLE_separate=MJPEGDecode reason=inside_libwebrtc_VideoCapture "
+           "often_fused_with_USB_read_if_pixel_format_MJPEG\n";
+    out << "[latency-pipeline] REFERENCE=UserspaceFrameReceived alias=VideoTrack_OnFrame after_capture_"
+           "and_optional_MJPEG_to_I420_inside_libwebrtc\n";
+    out << "[latency-pipeline] frame_spacing_ms=time_between_OnFrame_callbacks not_equal_to_sensor_latency "
+           "healthy_30fps_about_33.33\n";
+    out << "[latency-pipeline] H264_Encode_ms_per_frame=WebRTC_outbound_rtp_totalEncodeTime_delta_over_window\n";
+    out << "[latency-pipeline] RTP_SendPath_ms_per_frame=WebRTC_outbound_rtp_totalPacketSendDelay_delta_over_"
+           "window includes_pacing_queue_not_packetize_only\n";
+    out << "[latency-pipeline] target_e2e_under_200ms_stable needs_wired_or_clean_5GHz plus_headroom_above_"
+           "min_bitrate see_streams_conf_LATENCY_TARGET_EN\n";
+    out << std::flush;
+}
+
+/// 用户态：相邻两次 OnFrame 的时间间隔（ms）的滚动统计；反映采集+投递节拍与抖动，非内核 VB2 单段时延。
+struct UserInterFrameRoll {
+    double mean_ms{0};
+    double std_ms{0};
+    unsigned n{0};
+    double nominal_if_ms{0};  ///< 1000/fps（配置），用于与均值比较
+};
+
+static void AppendUserInterFrameStats(std::ostream& out, const UserInterFrameRoll& u) {
+    if (u.n == 0) {
+        out << " usr_if_mean_ms=- usr_if_std_ms=- usr_if_n=0 usr_if_nom_ms=- usr_if_skew_ms=-";
+        return;
+    }
+    out << " usr_if_mean_ms=" << std::fixed << std::setprecision(3) << u.mean_ms << " usr_if_std_ms=" << std::setprecision(3)
+        << u.std_ms << " usr_if_n=" << u.n;
+    if (u.nominal_if_ms > 0.0) {
+        const double skew = std::fabs(u.mean_ms - u.nominal_if_ms);
+        out << " usr_if_nom_ms=" << std::setprecision(3) << u.nominal_if_ms << " usr_if_skew_ms=" << std::setprecision(3)
+            << skew;
+    } else {
+        out << " usr_if_nom_ms=- usr_if_skew_ms=-";
+    }
+}
+
+static void EmitEnglishPipelineStages(std::ostream& out,
+                                     const std::string& peer_tag,
+                                     unsigned int fc,
+                                     unsigned int df,
+                                     double frame_spacing_ms,
+                                     const std::optional<double>& capture_ms_pf,
+                                     const std::optional<double>& encode_ms_pf,
+                                     const std::optional<double>& rtp_send_path_ms_pf,
+                                     const UserInterFrameRoll& user_if) {
+    PrintLatencyPipelineLegendEnglish(out);
+    out << "[latency-pipeline] peer=" << peer_tag << " capture_frame_index=" << fc << " stats_window_frames=" << df
+        << "\n";
+    out << "[latency-pipeline] stage=SensorExposure_ms status=NOT_MEASURABLE\n";
+    out << "[latency-pipeline] stage=SensorReadout_ms status=NOT_MEASURABLE\n";
+    out << "[latency-pipeline] stage=CameraBufferEnqueue_ms status=NOT_MEASURABLE\n";
+    out << "[latency-pipeline] stage=KernelUrbToV4l2Buffer_ms status=NOT_MEASURABLE\n";
+    if (user_if.n > 0) {
+        out << "[latency-pipeline] stage=UserspaceOnFrame_interval_roll_ms status=OBSERVABLE mean_ms="
+            << std::fixed << std::setprecision(4) << user_if.mean_ms << " std_ms=" << user_if.std_ms << " n="
+            << user_if.n << " note=last_up_to_128_gaps_not_kernel_latency\n";
+    } else {
+        out << "[latency-pipeline] stage=UserspaceOnFrame_interval_roll_ms status=NA\n";
+    }
+    out << "[latency-pipeline] stage=UserspaceBufferOrMmap_delivery_spacing_ms value="
+        << std::fixed << std::setprecision(3) << frame_spacing_ms
+        << " note=OnFrame_to_OnFrame_not_sub_stage_latency\n";
+    out << "[latency-pipeline] stage=MJPEG_Decode_ms status=NOT_MEASURABLE_SEPARATE value_if_YUYV=0_typically\n";
+    out << "[latency-pipeline] stage=H264_Encode_ms_per_frame status="
+        << (encode_ms_pf.has_value() ? "OBSERVABLE" : "NA")
+        << " value_ms=" << FormatMsOptional(encode_ms_pf, 4) << "\n";
+    out << "[latency-pipeline] stage=RTP_Packetize_and_send_queue_ms_per_frame status="
+        << (rtp_send_path_ms_pf.has_value() ? "OBSERVABLE" : "NA")
+        << " value_ms=" << FormatMsOptional(rtp_send_path_ms_pf, 4)
+        << " note=totalPacketSendDelay_delta_over_df_frames\n";
+    if (capture_ms_pf.has_value()) {
+        out << "[latency-pipeline] stage=MediaSource_totalCaptureTime_ms_per_frame status=OBSERVABLE "
+               "value_ms="
+            << std::fixed << std::setprecision(4) << *capture_ms_pf
+            << " note=WebRTC_cumulative_often_sparse_check_docs\n";
+    } else {
+        out << "[latency-pipeline] stage=MediaSource_totalCaptureTime_ms_per_frame status=NA\n";
+    }
+    out << std::flush;
+}
+
 struct LatencyPeerRollState {
     bool have_baseline{false};
     unsigned baseline_fc{0};
@@ -331,22 +601,27 @@ static void ApplyLatencyRollStep(std::ostream& out,
                                  const LatencyPollResult& poll,
                                  unsigned int fc,
                                  unsigned int window_frames,
-                                 LatencyPeerRollState* st) {
+                                 LatencyPeerRollState* st,
+                                 double frame_spacing_ms,
+                                 const UserInterFrameRoll& user_if) {
     using clock = std::chrono::system_clock;
     const int64_t t_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
 
     if (poll.status == LatencyPollStatus::Timeout) {
-        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
+        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " error=stats_timeout\n"
+            << std::flush;
         return;
     }
     if (poll.status == LatencyPollStatus::Error) {
         out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag
-            << " GetStats_error=" << (poll.error_message ? poll.error_message : "") << "\n" << std::flush;
+            << " error=GetStats msg=" << (poll.error_message ? poll.error_message : "") << "\n"
+            << std::flush;
         return;
     }
     if (poll.status == LatencyPollStatus::Empty) {
-        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats\n" << std::flush;
+        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats\n"
+            << std::flush;
         return;
     }
 
@@ -369,23 +644,31 @@ static void ApplyLatencyRollStep(std::ostream& out,
     std::ostringstream ts_ms;
     ts_ms << std::fixed << std::setprecision(3) << (static_cast<double>(poll.latest_ts_us) / 1000.0);
 
-    out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " stats_timestamp_ms=" << ts_ms.str()
-        << " fc=" << fc << " df=" << df
-        << " 采集_ms/帧=" << FormatMsOptional(DeltaPerFrameMs(a.capture_total_ms, cur.capture_total_ms, df), 4)
-        << " 编码_ms/帧=" << FormatMsOptional(DeltaPerFrameMs(a.encode_total_ms, cur.encode_total_ms, df), 4)
-        << " RTP排队_ms/帧="
-        << FormatMsOptional(DeltaPerFrameMs(a.packet_send_delay_total_ms, cur.packet_send_delay_total_ms, df), 4)
-        << " RTCP间隔窗端均_ms="
-        << FormatMsOptional(EndpointMeanMs(a.avg_rtcp_interval_ms, cur.avg_rtcp_interval_ms), 2)
-        << " ICE_RTT窗端均_ms=" << FormatMsOptional(EndpointMeanMs(a.ice_current_rtt_ms, cur.ice_current_rtt_ms), 3)
-        << " 对端反馈RTT窗端均_ms=" << FormatMsOptional(EndpointMeanMs(a.remote_rtt_ms, cur.remote_rtt_ms), 3)
-        << " 对端抖动窗端均_ms=" << FormatMsOptional(EndpointMeanMs(a.remote_jitter_ms, cur.remote_jitter_ms), 3)
-        << " 对端RTT样本均_ms="
+    const auto d_capture = DeltaPerFrameMs(a.capture_total_ms, cur.capture_total_ms, df);
+    const auto d_encode = DeltaPerFrameMs(a.encode_total_ms, cur.encode_total_ms, df);
+    const auto d_rtp = DeltaPerFrameMs(a.packet_send_delay_total_ms, cur.packet_send_delay_total_ms, df);
+
+    // One line per rolling window (delta cumulative / df). Verbose multi-line: WEBRTC_LATENCY_PIPELINE_VERBOSE=1.
+    out << std::fixed << std::setprecision(3)
+        << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " ts_ms=" << ts_ms.str()
+        << " fc=" << fc << " win=" << df << " if_ms=" << frame_spacing_ms
+        << " cap_ms_pf=" << FormatMsOptional(d_capture, 4)
+        << " enc_ms_pf=" << FormatMsOptional(d_encode, 4)
+        << " rtp_q_ms_pf=" << FormatMsOptional(d_rtp, 4)
+        << " ice_ms=" << FormatMsOptional(EndpointMeanMs(a.ice_current_rtt_ms, cur.ice_current_rtt_ms), 3)
+        << " rem_rtt_ms=" << FormatMsOptional(EndpointMeanMs(a.remote_rtt_ms, cur.remote_rtt_ms), 3)
+        << " rem_jit_ms=" << FormatMsOptional(EndpointMeanMs(a.remote_jitter_ms, cur.remote_jitter_ms), 3)
+        << " rem_rtt_samp_ms="
         << FormatMsOptional(RttSampleMeanMsInWindow(a.remote_total_rtt_sum_ms, cur.remote_total_rtt_sum_ms,
                                                     a.remote_rtt_measurements, cur.remote_rtt_measurements),
-                            3)
-        << " (累计类为Δ/Δ帧≈窗内每采集帧平均; ICE/抖动/RTCP间隔为两次采样端点均值; 无字段=-)\n"
+                            3);
+    AppendUserInterFrameStats(out, user_if);
+    out << "\n"
+        << std::defaultfloat
         << std::flush;
+    if (LatencyPipelineVerbose()) {
+        EmitEnglishPipelineStages(out, peer_tag, fc, df, frame_spacing_ms, d_capture, d_encode, d_rtp, user_if);
+    }
 
     st->baseline = cur;
     st->baseline_fc = fc;
@@ -396,11 +679,23 @@ static void ApplyLatencyRollStep(std::ostream& out,
 class FrameCountingRenderer
     : public libwebrtc::RTCVideoRenderer<libwebrtc::scoped_refptr<libwebrtc::RTCVideoFrame>> {
 public:
+    static constexpr size_t kInterFrameRing = 128;
+
     using OnFrameCallback = webrtc_demo::OnFrameCallback;
     explicit FrameCountingRenderer(OnFrameCallback cb) : on_frame_(std::move(cb)) {}
 
     void OnFrame(libwebrtc::scoped_refptr<libwebrtc::RTCVideoFrame> frame) override {
         if (!frame) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (have_last_frame_time_) {
+            const double ms = std::chrono::duration<double, std::milli>(now - last_frame_time_).count();
+            last_inter_frame_ms_.store(ms, std::memory_order_relaxed);
+            RecordInterFrameGap(ms);
+        } else {
+            have_last_frame_time_ = true;
+        }
+        last_frame_time_ = now;
+
         unsigned int n = ++frame_count_;
         if (on_frame_) {
             on_frame_(n, frame->width(), frame->height());
@@ -409,8 +704,57 @@ public:
 
     unsigned int GetFrameCount() const { return frame_count_; }
 
+    /// Time between last two OnFrame callbacks (ms); ~1000/fps when healthy. Not per-sensor-stage latency.
+    double GetLastInterFrameMs() const { return last_inter_frame_ms_.load(std::memory_order_relaxed); }
+
+    /// Rolling mean/std of last up to kInterFrameRing inter-frame gaps (ms).
+    void GetRollingInterFrameStats(double* mean_ms, double* std_ms, unsigned* n_out) const {
+        std::lock_guard<std::mutex> lock(if_mu_);
+        if (if_n_ == 0) {
+            *mean_ms = 0;
+            *std_ms = 0;
+            *n_out = 0;
+            return;
+        }
+        double sum = 0;
+        for (size_t i = 0; i < if_n_; ++i) {
+            const size_t idx = (if_w_ + kInterFrameRing - 1 - i) % kInterFrameRing;
+            sum += if_ring_[idx];
+        }
+        const double m = sum / static_cast<double>(if_n_);
+        *mean_ms = m;
+        if (if_n_ < 2) {
+            *std_ms = 0;
+        } else {
+            double v = 0;
+            for (size_t i = 0; i < if_n_; ++i) {
+                const size_t idx = (if_w_ + kInterFrameRing - 1 - i) % kInterFrameRing;
+                const double d = if_ring_[idx] - m;
+                v += d * d;
+            }
+            *std_ms = std::sqrt(v / static_cast<double>(if_n_ - 1));
+        }
+        *n_out = static_cast<unsigned>(if_n_);
+    }
+
 private:
+    void RecordInterFrameGap(double ms) {
+        std::lock_guard<std::mutex> lock(if_mu_);
+        if_ring_[if_w_ % kInterFrameRing] = ms;
+        if_w_++;
+        if (if_n_ < kInterFrameRing) {
+            if_n_++;
+        }
+    }
+
     std::atomic<unsigned int> frame_count_{0};
+    std::chrono::steady_clock::time_point last_frame_time_{};
+    bool have_last_frame_time_{false};
+    std::atomic<double> last_inter_frame_ms_{0.0};
+    mutable std::mutex if_mu_;
+    std::array<double, kInterFrameRing> if_ring_{};
+    size_t if_w_{0};
+    size_t if_n_{0};
     OnFrameCallback on_frame_;
 };
 
@@ -513,14 +857,14 @@ public:
 
     bool Initialize() {
         webrtc_demo::EnsureFlexfecFieldTrials(config_.enable_flexfec, config_.flexfec_field_trials);
-        std::cout << "[PushStreamer] 初始化 LibWebRTC..." << std::endl;
+        std::cout << "[PushStreamer] Initializing LibWebRTC..." << std::endl;
         if (!libwebrtc::LibWebRTC::Initialize()) {
             std::cerr << "[PushStreamer] LibWebRTC init failed" << std::endl;
             return false;
         }
-        std::cout << "[PushStreamer] LibWebRTC 初始化成功" << std::endl;
+        std::cout << "[PushStreamer] LibWebRTC initialized" << std::endl;
 
-        std::cout << "[PushStreamer] 创建 PeerConnectionFactory..." << std::endl;
+        std::cout << "[PushStreamer] Creating PeerConnectionFactory..." << std::endl;
         factory_ = libwebrtc::LibWebRTC::CreateRTCPeerConnectionFactory();
         if (!factory_) {
             std::cerr << "[PushStreamer] CreateRTCPeerConnectionFactory failed" << std::endl;
@@ -539,7 +883,7 @@ public:
                 EnableAlsaNullDeviceFallback();
                 factory_ = libwebrtc::LibWebRTC::CreateRTCPeerConnectionFactory();
                 if (factory_ && factory_->Initialize()) {
-                    std::cout << "[PushStreamer] PeerConnectionFactory 初始化恢复成功（video-only）"
+                    std::cout << "[PushStreamer] PeerConnectionFactory init recovered (video-only)"
                               << std::endl;
                 } else {
                     std::cerr << "[PushStreamer] warning: factory initialize still failed, "
@@ -550,7 +894,7 @@ public:
                 return false;
             }
         }
-        std::cout << "[PushStreamer] PeerConnectionFactory 创建成功" << std::endl;
+        std::cout << "[PushStreamer] PeerConnectionFactory created" << std::endl;
 
         return CreatePeerConnection();
     }
@@ -599,7 +943,7 @@ public:
     }
 
     bool CreatePeerConnection() {
-        std::cout << "[PushStreamer] 创建 PeerConnection (stun=" << config_.stun_server << ")..." << std::endl;
+        std::cout << "[PushStreamer] Creating PeerConnection (stun=" << config_.stun_server << ")..." << std::endl;
         libwebrtc::RTCConfiguration rtc_config;
         rtc_config.ice_servers[0].uri = config_.stun_server;
         if (!config_.turn_server.empty()) {
@@ -609,7 +953,9 @@ public:
         }
         // 减少多网卡干扰：禁用 IPv6 和 link-local，避免 ICE 选错路径导致 0 RTP
         rtc_config.disable_ipv6 = true;
+        rtc_config.disable_ipv6_on_wifi = true;
         rtc_config.disable_link_local_networks = true;
+        rtc_config.bundle_policy = libwebrtc::kBundlePolicyMaxBundle;
         // 仅 UDP：低延迟、画面稳定；本机推拉流需添加路由: sudo ip route add <本机IP>/32 dev lo
         rtc_config.tcp_candidate_policy = libwebrtc::TcpCandidatePolicy::kTcpCandidatePolicyDisabled;
         // 抗花屏：DSCP 标记提升 QoS，WebRTC 默认已启用 NACK/PLI 重传
@@ -626,7 +972,7 @@ public:
         }
 
         peer_connection_->RegisterRTCPeerConnectionObserver(this);
-        std::cout << "[PushStreamer] PeerConnection 创建成功" << std::endl;
+        std::cout << "[PushStreamer] PeerConnection created" << std::endl;
 
         if (!CreateMediaTracks()) {
             return false;
@@ -644,7 +990,7 @@ public:
         peer_connection_->AddTrack(video_track_, stream_ids);
         ApplyVideoCodecPreferences(peer_connection_);
         ApplyEncodingParameters(peer_connection_);
-        std::cout << "[PushStreamer] 已添加视频轨道 (stream_id=" << config_.stream_id << ")" << std::endl;
+        std::cout << "[PushStreamer] Video track added (stream_id=" << config_.stream_id << ")" << std::endl;
 
         return true;
     }
@@ -661,7 +1007,7 @@ public:
 
         auto caps = factory_->GetRtpSenderCapabilities(libwebrtc::RTCMediaType::VIDEO);
         if (!caps) {
-            std::cerr << "[PushStreamer] GetRtpSenderCapabilities(VIDEO) 为空，跳过编解码器排序" << std::endl;
+            std::cerr << "[PushStreamer] GetRtpSenderCapabilities(VIDEO) empty, skip codec ordering" << std::endl;
             return;
         }
 
@@ -700,8 +1046,8 @@ public:
         }
 
         if (preferred.empty()) {
-            std::cout << "[PushStreamer] SetCodecPreferences 跳过: 无与 VIDEO_CODEC=" << config_.video_codec
-                      << " 匹配的 sender 能力项" << std::endl;
+            std::cout << "[PushStreamer] SetCodecPreferences skipped: no sender capability matching VIDEO_CODEC="
+                      << config_.video_codec << std::endl;
             return;
         }
 
@@ -717,8 +1063,8 @@ public:
             auto tr = transceivers[i];
             if (!tr || tr->media_type() != libwebrtc::RTCMediaType::VIDEO) continue;
             tr->SetCodecPreferences(lw);
-            std::cout << "[PushStreamer] SetCodecPreferences: 优先 " << want << "（" << preferred.size()
-                      << " 项置前 / 共 " << ordered.size() << " 项），Offer 中对应 PT 将排在 VP8 等之前"
+            std::cout << "[PushStreamer] SetCodecPreferences: prefer " << want << " (" << preferred.size()
+                      << " preferred / " << ordered.size() << " total); video PT order in Offer before VP8 etc."
                       << std::endl;
             return;
         }
@@ -757,9 +1103,9 @@ public:
                     libwebrtc::RTCDegradationPreference::MAINTAIN_FRAMERATE);
             }
             if (sender->set_parameters(params)) {
-                std::cout << "[PushStreamer] 编码参数已应用: 码率 "
+                std::cout << "[PushStreamer] Encoding params applied: bitrate "
                           << config_.min_bitrate_kbps << "-" << config_.max_bitrate_kbps
-                          << " kbps, 策略=" << config_.degradation_preference << std::endl;
+                          << " kbps, degradation=" << config_.degradation_preference << std::endl;
             }
             break;
         }
@@ -775,7 +1121,9 @@ public:
             rtc_config.ice_servers[1].password = config_.turn_password;
         }
         rtc_config.disable_ipv6 = true;
+        rtc_config.disable_ipv6_on_wifi = true;
         rtc_config.disable_link_local_networks = true;
+        rtc_config.bundle_policy = libwebrtc::kBundlePolicyMaxBundle;
         rtc_config.tcp_candidate_policy = libwebrtc::TcpCandidatePolicy::kTcpCandidatePolicyDisabled;
         rtc_config.enable_dscp = true;
         if (!config_.enable_audio) {
@@ -814,7 +1162,7 @@ public:
         ApplyEncodingParameters(pc);
         peer_connections_[peer_id] = pc;
         extra_peer_observers_[peer_id] = std::move(observer);
-        std::cout << "[PushStreamer] 创建订阅者 PeerConnection 成功: " << peer_id << std::endl;
+        std::cout << "[PushStreamer] Subscriber PeerConnection created: " << peer_id << std::endl;
         return true;
     }
 
@@ -867,24 +1215,23 @@ public:
 
         auto video_device = factory_->GetVideoDevice();
         if (!video_device) {
-            std::cerr << "[PushStreamer] GetVideoDevice() 返回空，libwebrtc 可能未启用 V4L2 或依赖缺失"
-                      << "（需 libX11、libglib 等，见 docs/linux_arm64_build_notes.md）" << std::endl;
+            std::cerr << "[PushStreamer] GetVideoDevice() null; libwebrtc may lack V4L2 or deps "
+                      << "(libX11, libglib, etc.; see docs/linux_arm64_build_notes.md)" << std::endl;
             return false;
         }
         uint32_t num = video_device->NumberOfDevices();
         if (num == 0) {
-            std::cerr << "[PushStreamer] libwebrtc 枚举到 0 个设备（NumberOfDevices=0）" << std::endl;
+            std::cerr << "[PushStreamer] libwebrtc enumerated 0 devices (NumberOfDevices=0)" << std::endl;
             auto v4l2_cams = webrtc_demo::ListUsbCameras();
             if (v4l2_cams.empty()) {
-                std::cerr << "[PushStreamer] V4L2 也未检测到摄像头。请检查：\n"
-                          << "  1. 摄像头是否已连接\n"
-                          << "  2. 是否有权限访问 /dev/video*（需 video 组或 root）\n"
-                          << "  3. 运行: ./webrtc_push_demo --list-cameras" << std::endl;
+                std::cerr << "[PushStreamer] V4L2 also found no camera. Check:\n"
+                          << "  1. Camera plugged in\n"
+                          << "  2. Permission on /dev/video* (video group or root)\n"
+                          << "  3. Run: ./webrtc_push_demo --list-cameras" << std::endl;
             } else {
-                std::cerr << "[PushStreamer] 但 V4L2 检测到 " << v4l2_cams.size() << " 个设备，"
-                          << "可能是 libwebrtc 与当前 V4L2 设备不兼容。"
-                          << "可尝试指定设备: ./webrtc_push_demo livestream " << v4l2_cams[0].device_path
-                          << std::endl;
+                std::cerr << "[PushStreamer] V4L2 sees " << v4l2_cams.size()
+                          << " device(s); libwebrtc may be incompatible with this node. "
+                          << "Try: ./webrtc_push_demo livestream " << v4l2_cams[0].device_path << std::endl;
             }
             return false;
         }
@@ -981,10 +1328,10 @@ public:
 
         // 摄像头预热：默认 3 秒，可通过 CAPTURE_WARMUP_SEC 调整（慢主板可酌情减小）。
         if (config_.capture_warmup_sec > 0) {
-            std::cout << "[PushStreamer] 摄像头预热 " << config_.capture_warmup_sec << " 秒..." << std::endl;
+            std::cout << "[PushStreamer] Camera warmup " << config_.capture_warmup_sec << "s..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(config_.capture_warmup_sec));
         } else {
-            std::cout << "[PushStreamer] 摄像头预热已关闭 (CAPTURE_WARMUP_SEC=0)" << std::endl;
+            std::cout << "[PushStreamer] Camera warmup off (CAPTURE_WARMUP_SEC=0)" << std::endl;
         }
 
         return true;
@@ -1005,20 +1352,20 @@ public:
         }
         using clock = std::chrono::steady_clock;
         const auto deadline = clock::now() + std::chrono::seconds(max_wait);
-        std::cout << "[PushStreamer] 采集门限: 等待至少 " << need << " 帧再创建 Offer（" << context
-                  << "），最长 " << max_wait << "s" << std::endl;
+        std::cout << "[PushStreamer] Capture gate: need >= " << need << " frames before Offer (" << context
+                  << "), max wait " << max_wait << "s" << std::endl;
         while (clock::now() < deadline) {
             if (frame_counter_->GetFrameCount() >= static_cast<unsigned int>(need)) {
-                std::cout << "[PushStreamer] 采集门限已满足: " << frame_counter_->GetFrameCount() << " 帧（"
-                          << context << "）" << std::endl;
+                std::cout << "[PushStreamer] Capture gate OK: " << frame_counter_->GetFrameCount() << " frames ("
+                          << context << ")" << std::endl;
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
         }
         const unsigned got = frame_counter_->GetFrameCount();
-        std::cerr << "[PushStreamer] 采集门限未满足: " << got << "/" << need << " 帧（" << max_wait
-                  << "s 内），跳过本次 Offer（" << context
-                  << "）。请检查摄像头占用、节点是否正确、或增大 CAPTURE_GATE_MAX_WAIT_SEC" << std::endl;
+        std::cerr << "[PushStreamer] Capture gate failed: " << got << "/" << need << " frames in " << max_wait
+                  << "s; skip Offer (" << context
+                  << "). Check camera in use, device node, or raise CAPTURE_GATE_MAX_WAIT_SEC" << std::endl;
         return false;
     }
 
@@ -1026,7 +1373,7 @@ public:
         if (!WaitForCaptureGate("default")) {
             return;
         }
-        std::cout << "[PushStreamer] 创建默认 Offer..." << std::endl;
+        std::cout << "[PushStreamer] Creating default Offer..." << std::endl;
         CreateOfferOnConnection("", peer_connection_);
     }
 
@@ -1051,7 +1398,7 @@ public:
         if (!WaitForCaptureGate(std::string("peer=") + peer_id)) {
             return;
         }
-        std::cout << "[PushStreamer] 为订阅者创建 Offer: " << peer_id << std::endl;
+        std::cout << "[PushStreamer] Creating Offer for subscriber: " << peer_id << std::endl;
         CreateOfferOnConnection(peer_id, pc);
     }
 
@@ -1068,14 +1415,14 @@ public:
             if (it != peer_connections_.end()) pc = it->second;
         }
         if (!pc) {
-            std::cerr << "[PushStreamer] SetRemoteDescription 找不到 peer: " << peer_id << std::endl;
+            std::cerr << "[PushStreamer] SetRemoteDescription: peer not found: " << peer_id << std::endl;
             return;
         }
-        std::cout << "[PushStreamer] 设置远端描述 peer=" << (peer_id.empty() ? "default" : peer_id)
+        std::cout << "[PushStreamer] SetRemoteDescription peer=" << (peer_id.empty() ? "default" : peer_id)
                   << " type=" << type << " len=" << sdp.size() << std::endl;
         pc->SetRemoteDescription(
             libwebrtc::string(sdp.c_str()), libwebrtc::string(type.c_str()),
-            []() { std::cout << "[PushStreamer] SetRemoteDescription 成功" << std::endl; },
+            []() { std::cout << "[PushStreamer] SetRemoteDescription OK" << std::endl; },
             [](const char* err) {
                 std::cerr << "[PushStreamer] SetRemoteDescription failed: " << err << std::endl;
             });
@@ -1094,16 +1441,16 @@ public:
             if (it != peer_connections_.end()) pc = it->second;
         }
         if (!pc) {
-            std::cerr << "[PushStreamer] AddCandidate 找不到 peer: " << peer_id << std::endl;
+            std::cerr << "[PushStreamer] AddCandidate: peer not found: " << peer_id << std::endl;
             return;
         }
-        std::cout << "[PushStreamer] 添加远端 ICE 候选 peer=" << (peer_id.empty() ? "default" : peer_id)
+        std::cout << "[PushStreamer] AddRemoteIceCandidate peer=" << (peer_id.empty() ? "default" : peer_id)
                   << " mid=" << mid << " idx=" << mline_index << std::endl;
         pc->AddCandidate(libwebrtc::string(mid.c_str()), mline_index, libwebrtc::string(candidate.c_str()));
     }
 
     void DoLoopbackExchange(const std::string& offer_type, const std::string& offer_sdp) {
-        std::cout << "[PushStreamer] 本地回环：创建接收端，验证 H264 编码..." << std::endl;
+        std::cout << "[PushStreamer] Loopback: creating receiver for H264 validation..." << std::endl;
         libwebrtc::RTCConfiguration rtc_config;
         rtc_config.ice_servers[0].uri = config_.stun_server;
         rtc_config.disable_ipv6 = true;
@@ -1116,7 +1463,7 @@ public:
         auto constraints = libwebrtc::RTCMediaConstraints::Create();
         receiver_ = factory_->Create(rtc_config, constraints);
         if (!receiver_) {
-            std::cerr << "[PushStreamer] 创建回环接收端失败" << std::endl;
+            std::cerr << "[PushStreamer] Failed to create loopback receiver" << std::endl;
             return;
         }
         loopback_observer_ = std::make_unique<LoopbackReceiverObserver>(
@@ -1136,7 +1483,7 @@ public:
             libwebrtc::string(offer_sdp.c_str()), libwebrtc::string(offer_type.c_str()),
             [this]() { OnReceiverRemoteDescriptionSet(); },
             [](const char* err) {
-                std::cerr << "[PushStreamer] 接收端 SetRemoteDescription 失败: " << err << std::endl;
+                std::cerr << "[PushStreamer] Receiver SetRemoteDescription failed: " << err << std::endl;
             });
     }
 
@@ -1155,11 +1502,11 @@ public:
                     ans_sdp, ans_type,
                     [this]() { OnReceiverLocalDescriptionSet(); },
                     [](const char* err) {
-                        std::cerr << "[PushStreamer] 接收端 SetLocalDescription 失败: " << err << std::endl;
+                        std::cerr << "[PushStreamer] Receiver SetLocalDescription failed: " << err << std::endl;
                     });
             },
             [](const char* err) {
-                std::cerr << "[PushStreamer] CreateAnswer 失败: " << err << std::endl;
+                std::cerr << "[PushStreamer] CreateAnswer failed: " << err << std::endl;
             },
             ans_constraints);
     }
@@ -1169,10 +1516,10 @@ public:
             libwebrtc::string(loopback_answer_sdp_.c_str()),
             libwebrtc::string(loopback_answer_type_.c_str()),
             []() {
-                std::cout << "[PushStreamer] 回环 SDP 交换完成，等待 ICE 连接..." << std::endl;
+                std::cout << "[PushStreamer] Loopback SDP exchange done, waiting for ICE..." << std::endl;
             },
             [](const char* err) {
-                std::cerr << "[PushStreamer] SetRemoteDescription 失败: " << err << std::endl;
+                std::cerr << "[PushStreamer] SetRemoteDescription failed: " << err << std::endl;
             });
     }
 
@@ -1210,14 +1557,14 @@ public:
         const char* names[] = {"New", "Gathering", "Complete"};
         int idx = static_cast<int>(state);
         if (idx >= 0 && idx < 3) {
-            std::cout << "[PushStreamer] ICE 收集状态: " << names[idx] << std::endl;
+            std::cout << "[PushStreamer] ICE gathering state: " << names[idx] << std::endl;
         }
     }
     void OnIceConnectionState(libwebrtc::RTCIceConnectionState state) override {
         const char* names[] = {"New", "Checking", "Connected", "Completed", "Failed", "Disconnected", "Closed"};
         int idx = static_cast<int>(state);
         if (idx >= 0 && idx < 7) {
-            std::cout << "[PushStreamer] ICE 状态: " << names[idx] << std::endl;
+            std::cout << "[PushStreamer] ICE connection state: " << names[idx] << std::endl;
         }
     }
     void OnIceCandidate(scoped_refptr<libwebrtc::RTCIceCandidate> candidate) override {
@@ -1333,9 +1680,17 @@ public:
                 pc = peer_connection_;
             }
             if (pc) {
-                LatencyPollResult r = PollLatencySummaryForPc(pc, 5000);
+                LatencyPollResult r = PollLatencySummaryForPc(pc, 5000, "default");
+                const double spacing = frame_counter_ ? frame_counter_->GetLastInterFrameMs() : 0.0;
+                UserInterFrameRoll uif;
+                if (frame_counter_) {
+                    frame_counter_->GetRollingInterFrameStats(&uif.mean_ms, &uif.std_ms, &uif.n);
+                }
+                if (config_.video_fps > 0) {
+                    uif.nominal_if_ms = 1000.0 / static_cast<double>(config_.video_fps);
+                }
                 std::lock_guard<std::mutex> lock(latency_roll_mu_);
-                ApplyLatencyRollStep(out, "default", r, fc, w, &latency_roll_["default"]);
+                ApplyLatencyRollStep(out, "default", r, fc, w, &latency_roll_["default"], spacing, uif);
             } else {
                 using clock = std::chrono::system_clock;
                 const int64_t t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1346,10 +1701,18 @@ public:
             }
             return;
         }
+        const double spacing = frame_counter_ ? frame_counter_->GetLastInterFrameMs() : 0.0;
+        UserInterFrameRoll uif;
+        if (frame_counter_) {
+            frame_counter_->GetRollingInterFrameStats(&uif.mean_ms, &uif.std_ms, &uif.n);
+        }
+        if (config_.video_fps > 0) {
+            uif.nominal_if_ms = 1000.0 / static_cast<double>(config_.video_fps);
+        }
         for (const auto& pr : copy) {
-            LatencyPollResult r = PollLatencySummaryForPc(pr.second, 5000);
+            LatencyPollResult r = PollLatencySummaryForPc(pr.second, 5000, pr.first.c_str());
             std::lock_guard<std::mutex> lock(latency_roll_mu_);
-            ApplyLatencyRollStep(out, pr.first, r, fc, w, &latency_roll_[pr.first]);
+            ApplyLatencyRollStep(out, pr.first, r, fc, w, &latency_roll_[pr.first], spacing, uif);
         }
     }
 };

@@ -25,10 +25,10 @@ void SignalHandler(int signum) {
 }
 
 void ListCameras() {
-    std::cout << "=== 本地 USB 摄像头列表 (V4L2) ===" << std::endl;
+    std::cout << "=== USB cameras (V4L2) ===" << std::endl;
     auto cameras = ListUsbCameras();
     if (cameras.empty()) {
-        std::cout << "未检测到摄像头" << std::endl;
+        std::cout << "No cameras found." << std::endl;
         return;
     }
     for (const auto& cam : cameras) {
@@ -39,32 +39,38 @@ void ListCameras() {
         }
         std::cout << std::endl;
     }
-    std::cout << "\n使用示例: ./webrtc_push_demo stream_001 /dev/video11" << std::endl;
-    std::cout << "或: ./webrtc_push_demo stream_001 11" << std::endl;
+    std::cout << "\nExample: ./webrtc_push_demo stream_001 /dev/video11" << std::endl;
+    std::cout << "Or:     ./webrtc_push_demo stream_001 11" << std::endl;
 }
 
 void PrintUsage(const char* prog) {
-    std::cout << "用法: " << prog << " [选项] [stream_id] [camera]\n"
-              << "选项:\n"
-              << "  --config FILE     从配置文件加载（默认 config/streams.conf）\n"
-              << "  --list-cameras    列出本地 USB 摄像头后退出\n"
-              << "  --test-capture    仅验证采集，运行 10 秒后打印帧数并退出\n"
-              << "  --test-encode     本地回环验证 H264 编码，运行 10 秒后退出\n"
-              << "  --signaling ADDR  P2P 信令服务器地址，默认 127.0.0.1:8765\n"
-              << "  --width W         分辨率宽，默认 640\n"
-              << "  --height H        分辨率高，默认 360\n"
-              << "  --fps F           帧率，默认 15\n"
-              << "  --no-audio        纯视频推流（默认，与 ENABLE_AUDIO=0 一致）\n"
-              << "  --enable-audio    允许 SDP 协商音频意向（未实现麦克风采集）\n"
-              << "  --enable-flexfec  启用 FlexFEC-03（与配置 ENABLE_FLEXFEC=1 等效，收发端都需开）\n"
-              << "环境变量:\n"
-              << "  WEBRTC_LATENCY_STATS_PROBE=0|1  若设置则覆盖配置 LATENCY_STATS_ENABLE（非 0 为开）\n"
-              << "  WEBRTC_LATENCY_STATS_WINDOW_FRAMES=N  覆盖配置窗长；对累计量做 Δ/Δ帧 得到 ms/帧（默认 60）\n"
-              << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N  创建 Offer 前至少 N 帧(0=关)，覆盖配置 CAPTURE_GATE_MIN_FRAMES\n"
-              << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N  等待门限最久 N 秒，覆盖 CAPTURE_GATE_MAX_WAIT_SEC\n"
-              << "参数:\n"
-              << "  stream_id         流 ID；省略时用配置 STREAM_ID\n"
-              << "  camera            摄像头；省略时用 STREAM_<stream_id>_CAMERA\n"
+    std::cout << "Usage: " << prog << " [options] [stream_id] [camera]\n"
+              << "Options:\n"
+              << "  --config FILE     Config file (default config/streams.conf)\n"
+              << "  --list-cameras    List USB cameras and exit\n"
+              << "  --test-capture    Capture only, 10s, print frame count, exit\n"
+              << "  --test-encode     Loopback H264 test, 10s, exit\n"
+              << "  --signaling ADDR  Signaling server (default 127.0.0.1:8765)\n"
+              << "  --width W         Video width (default 640)\n"
+              << "  --height H        Video height (default 360)\n"
+              << "  --fps F           Frame rate (default 15)\n"
+              << "  --no-audio        Video only (same as ENABLE_AUDIO=0)\n"
+              << "  --enable-audio    Allow audio in SDP (no mic capture)\n"
+              << "  --enable-flexfec  FlexFEC-03 (peer must match)\n"
+              << "Environment:\n"
+              << "  WEBRTC_LATENCY_STATS_PROBE=0|1   Overrides LATENCY_STATS_ENABLE\n"
+              << "  WEBRTC_LATENCY_STATS_WINDOW_FRAMES=N   Rolling stats window (default 60)\n"
+              << "  WEBRTC_LATENCY_PIPELINE_VERBOSE=1   Extra multi-line [latency-pipeline] after each window\n"
+              << "  WEBRTC_GETSTATS_DUMP=1   Full push GetStats: [getstats-full] + JSON + per-member m[] lines\n"
+              << "  WEBRTC_GETSTATS_DUMP_JSON_ONLY=1   JSON only (skip m[] lines if JSON non-empty)\n"
+              << "  WEBRTC_GETSTATS_DUMP_INTERVAL_MS=N   Min ms between full dumps (0=every GetStats poll)\n"
+              << "  WEBRTC_TEST_ENCODE_GETSTATS=1   During --test-encode, dump GetStats at ~3s and ~6s\n"
+              << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N   Min frames before Offer (0=off)\n"
+              << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N   Max wait for gate (seconds)\n"
+              << "  [stats-latency-avg] also prints usr_if_*: rolling OnFrame interval mean/std vs nominal fps\n"
+              << "Arguments:\n"
+              << "  stream_id         Stream ID; omitted -> STREAM_ID in config\n"
+              << "  camera            Device path/index; omitted -> STREAM_<id>_CAMERA\n"
               << std::endl;
 }
 
@@ -82,8 +88,8 @@ static std::string FindConfigPath(const char* prog, const std::string& config_ar
 }
 
 int main(int argc, char* argv[]) {
-    std::cout << "=== WebRTC P2P 推流 Demo ===" << std::endl;
-    std::cout << "[Main] 解析参数..." << std::endl;
+    std::cout << "=== WebRTC P2P publisher demo ===" << std::endl;
+    std::cout << "[Main] Parsing arguments..." << std::endl;
 
     PushStreamerConfig config;
     std::string signaling_url = "127.0.0.1:8765";
@@ -287,22 +293,23 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cout << "[Main] 配置: stream_id=" << config.stream_id
-              << " 分辨率=" << config.video_width << "x" << config.video_height
+    std::cout << "[Main] Config: stream_id=" << config.stream_id
+              << " resolution=" << config.video_width << "x" << config.video_height
               << " fps=" << config.video_fps
-              << " 码率=" << config.target_bitrate_kbps << "kbps(" << config.bitrate_mode << ")"
-              << " 编码=" << config.video_codec
-              << " 预热=" << config.capture_warmup_sec << "s"
-              << " 采集门限=" << (config.capture_gate_min_frames > 0
-                                    ? std::to_string(config.capture_gate_min_frames) + "帧≤" +
-                                          std::to_string(config.capture_gate_max_wait_sec) + "s"
-                                    : std::string("off"))
-              << " 设备=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
+              << " bitrate=" << config.target_bitrate_kbps << "kbps(" << config.bitrate_mode << ")"
+              << " codec=" << config.video_codec
+              << " warmup=" << config.capture_warmup_sec << "s"
+              << " capture_gate=" << (config.capture_gate_min_frames > 0
+                                        ? std::to_string(config.capture_gate_min_frames) + "frames<=" +
+                                              std::to_string(config.capture_gate_max_wait_sec) + "s"
+                                        : std::string("off"))
+              << " device=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
               << " flexfec=" << (config.enable_flexfec ? "on" : "off")
               << std::endl;
     if (config.keyframe_interval > 0) {
-        std::cout << "[Main] 提示: 当前 libwebrtc 封装未暴露强制关键帧间隔接口，"
-                  << "KEYFRAME_INTERVAL 会由编码器自适应与 RTCP PLI/FIR 机制主导" << std::endl;
+        std::cout << "[Main] Note: keyframe interval not exposed in this libwebrtc binding; "
+                     "encoder + RTCP PLI/FIR drive GOP."
+                  << std::endl;
     }
 
     if (use_signaling) {
@@ -314,11 +321,11 @@ int main(int argc, char* argv[]) {
 
     std::unique_ptr<SignalingClient> signaling;
     if (use_signaling) {
-        std::cout << "[Main] 使用信令模式，服务器: " << signaling_url << std::endl;
+        std::cout << "[Main] Signaling mode, server: " << signaling_url << std::endl;
         signaling = std::make_unique<SignalingClient>(signaling_url, "publisher", config.stream_id);
         g_signaling = signaling.get();
     } else {
-        std::cout << "[Main] 无信令模式 (test-capture/test-encode)" << std::endl;
+        std::cout << "[Main] No signaling (test-capture / test-encode)" << std::endl;
     }
 
     std::signal(SIGINT, SignalHandler);
@@ -327,48 +334,48 @@ int main(int argc, char* argv[]) {
     if (use_signaling && signaling) {
         signaling->SetOnAnswer([&streamer](const std::string& peer_id, const std::string& type,
                                            const std::string& sdp) {
-            std::cout << "[信令] 收到 answer peer=" << peer_id << " (type=" << type
-                      << ", sdp_len=" << sdp.size() << ")，设置远端描述" << std::endl;
+            std::cout << "[Signaling] Received answer peer=" << peer_id << " (type=" << type
+                      << ", sdp_len=" << sdp.size() << ") SetRemoteDescription" << std::endl;
             streamer.SetRemoteDescriptionForPeer(peer_id, type, sdp);
         });
         signaling->SetOnIce([&streamer](const std::string& peer_id, const std::string& mid, int mline_index,
                                         const std::string& candidate) {
-            std::cout << "[信令] 收到 ICE 候选 peer=" << peer_id << " mid=" << mid << " idx=" << mline_index
+            std::cout << "[Signaling] ICE candidate peer=" << peer_id << " mid=" << mid << " idx=" << mline_index
                       << " candidate=" << (candidate.size() > 60 ? candidate.substr(0, 60) + "..." : candidate) << std::endl;
             streamer.AddRemoteIceCandidateForPeer(peer_id, mid, mline_index, candidate);
         });
         signaling->SetOnSubscriberJoin([&streamer](const std::string& peer_id) {
-            std::cout << "[信令] 新拉流端加入: " << peer_id << "，创建独立 Offer" << std::endl;
+            std::cout << "[Signaling] Subscriber joined: " << peer_id << " CreateOfferForPeer" << std::endl;
             streamer.CreateOfferForPeer(peer_id);
         });
         signaling->SetOnSubscriberLeave([](const std::string& peer_id) {
-            std::cout << "[信令] 拉流端离线: " << peer_id << std::endl;
+            std::cout << "[Signaling] Subscriber left: " << peer_id << std::endl;
         });
         signaling->SetOnError([](const std::string& msg) {
-            std::cerr << "[信令] 错误: " << msg << std::endl;
+            std::cerr << "[Signaling] Error: " << msg << std::endl;
         });
 
         streamer.SetOnSdpCallback([&signaling](const std::string& peer_id, const std::string& type,
                                                           const std::string& sdp) {
             if (type != "offer") return;
-            std::cout << "[信令] 发送 offer peer=" << (peer_id.empty() ? "default" : peer_id)
+            std::cout << "[Signaling] Send offer peer=" << (peer_id.empty() ? "default" : peer_id)
                       << " (sdp_len=" << sdp.size() << ")" << std::endl;
             signaling->SendOffer(sdp, peer_id);
         });
         streamer.SetOnIceCandidateCallback(
             [&signaling](const std::string& peer_id, const std::string& mid, int mline_index,
                          const std::string& candidate) {
-                std::cout << "[信令] 发送 ICE 候选 peer=" << (peer_id.empty() ? "default" : peer_id)
+                std::cout << "[Signaling] Send ICE candidate peer=" << (peer_id.empty() ? "default" : peer_id)
                           << " mid=" << mid << " idx=" << mline_index << std::endl;
                 signaling->SendIceCandidate(mid, mline_index, candidate, peer_id);
             });
 
-        std::cout << "[Main] 连接信令服务器..." << std::endl;
+        std::cout << "[Main] Connecting to signaling..." << std::endl;
         if (!signaling->Start()) {
-            std::cerr << "[信令] 启动失败。请先运行: ./build/bin/signaling_server 或 ./scripts/start_p2p.sh" << std::endl;
+            std::cerr << "[Signaling] Start failed. Run ./build/bin/signaling_server or ./scripts/start_p2p.sh" << std::endl;
             return 1;
         }
-        std::cout << "[Main] 信令连接成功" << std::endl;
+        std::cout << "[Main] Signaling connected" << std::endl;
     } else {
         streamer.SetOnSdpCallback([](const std::string& peer_id, const std::string& type,
                                      const std::string& sdp) {
@@ -390,47 +397,49 @@ int main(int argc, char* argv[]) {
 
     if (test_capture) {
         streamer.SetOnFrameCallback([](unsigned int n, int w, int h) {
-            if (n == 1) std::cout << "[采集] 首帧: " << w << "x" << h << std::endl;
-            else if (n % 50 == 0) std::cout << "[采集] 已收到 " << n << " 帧" << std::endl;
+            if (n == 1) std::cout << "[Capture] First frame: " << w << "x" << h << std::endl;
+            else if (n % 50 == 0) std::cout << "[Capture] Frames received: " << n << std::endl;
         });
     }
     if (test_encode) {
         streamer.SetOnConnectionStateCallback([](ConnectionState state) {
             const char* names[] = {"New", "Connecting", "Connected", "Disconnected", "Failed", "Closed"};
-            std::cout << "[回环] " << names[static_cast<int>(state)] << std::endl;
+            std::cout << "[Loopback] " << names[static_cast<int>(state)] << std::endl;
         });
     }
 
-    std::cout << "[Main] 启动推流器..." << std::endl;
+    std::cout << "[Main] Starting publisher..." << std::endl;
     if (!streamer.Start()) {
-        std::cerr << "[Main] 启动失败。Try --list-cameras to see available cameras." << std::endl;
+        std::cerr << "[Main] Start failed. Try --list-cameras." << std::endl;
         return 1;
     }
-    std::cout << "[Main] 推流器已启动" << std::endl;
+    std::cout << "[Main] Publisher started" << std::endl;
 
     if (test_capture) {
-        std::cout << "[test-capture] 采集 10 秒..." << std::endl;
+        std::cout << "[test-capture] Running 10s capture..." << std::endl;
         for (int i = 0; i < 10 && streamer.IsStreaming(); ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         unsigned int total = streamer.GetFrameCount();
         streamer.Stop();
-        std::cout << "总帧数: " << total << std::endl;
+        std::cout << "Total frames: " << total << std::endl;
         return total > 0 ? 0 : 1;
     }
 
     if (test_encode) {
-        std::cout << "[test-encode] 本地回环 10 秒..." << std::endl;
+        std::cout << "[test-encode] Loopback 10s..." << std::endl;
         for (int i = 0; i < 10 && streamer.IsStreaming(); ++i) {
+            if (std::getenv("WEBRTC_TEST_ENCODE_GETSTATS") && (i == 3 || i == 6)) {
+                streamer.LogLatencyStatsForAllPeers(std::cout);
+            }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         unsigned int total = streamer.GetDecodedFrameCount();
         streamer.Stop();
-        std::cout << "解码帧数: " << total << std::endl;
+        std::cout << "Decoded frames: " << total << std::endl;
         return total > 0 ? 0 : 1;
     }
 
-    std::cout << "推流已启动。拉流端: ./build/bin/p2p_player" << std::endl;
     std::cout << "Press Ctrl+C to stop." << std::endl;
 
     bool latency_probe_on = config.latency_stats_enable;

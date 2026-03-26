@@ -167,7 +167,7 @@ public:
 
     bool Initialize() {
         webrtc_demo::EnsureFlexfecFieldTrials(flexfec_enable_, flexfec_override_);
-        std::cout << "[P2pPlayer] 初始化 LibWebRTC..." << std::endl;
+        std::cout << "[P2pPlayer] Initializing LibWebRTC..." << std::endl;
         if (!libwebrtc::LibWebRTC::Initialize()) return false;
         factory_ = libwebrtc::LibWebRTC::CreateRTCPeerConnectionFactory();
         if (!factory_) {
@@ -186,7 +186,7 @@ public:
                 return false;
             }
         }
-        std::cout << "[P2pPlayer] 创建 PeerConnection (recvonly)..." << std::endl;
+        std::cout << "[P2pPlayer] Creating PeerConnection (recvonly)..." << std::endl;
         return CreatePeerConnection();
     }
 
@@ -209,7 +209,9 @@ public:
         libwebrtc::RTCConfiguration rtc_config;
         rtc_config.ice_servers[0].uri = libwebrtc::string("stun:stun.l.google.com:19302");
         rtc_config.disable_ipv6 = true;
+        rtc_config.disable_ipv6_on_wifi = true;
         rtc_config.disable_link_local_networks = true;
+        rtc_config.bundle_policy = libwebrtc::kBundlePolicyMaxBundle;
         // 仅 UDP：低延迟、画面稳定
         rtc_config.tcp_candidate_policy = libwebrtc::TcpCandidatePolicy::kTcpCandidatePolicyDisabled;
         // 抗花屏：DSCP QoS 标记
@@ -227,7 +229,7 @@ public:
         auto init = libwebrtc::RTCRtpTransceiverInit::Create(
             libwebrtc::RTCRtpTransceiverDirection::kRecvOnly, stream_ids, encodings);
         peer_connection_->AddTransceiver(libwebrtc::RTCMediaType::VIDEO, init);
-        std::cout << "[P2pPlayer] PeerConnection 创建成功" << std::endl;
+        std::cout << "[P2pPlayer] PeerConnection created" << std::endl;
         return true;
     }
 
@@ -273,7 +275,7 @@ public:
 
     void OnTrack(libwebrtc::scoped_refptr<libwebrtc::RTCRtpTransceiver> t) override {
         if (!t || !t->receiver()) return;
-        std::cout << "[P2pPlayer] OnTrack: 收到视频轨道" << std::endl;
+        std::cout << "[P2pPlayer] OnTrack: video track received" << std::endl;
         auto track = t->receiver()->track();
         if (!track || std::strcmp(track->kind().c_string(), "video") != 0) return;
         auto vt = libwebrtc::scoped_refptr<libwebrtc::RTCVideoTrack>(
@@ -287,7 +289,7 @@ public:
     void OnAddTrack(libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::RTCMediaStream>>,
                     libwebrtc::scoped_refptr<libwebrtc::RTCRtpReceiver> r) override {
         if (!r) return;
-        std::cout << "[P2pPlayer] OnAddTrack: 添加视频轨道到渲染器" << std::endl;
+        std::cout << "[P2pPlayer] OnAddTrack: attach video track to renderer" << std::endl;
         auto track = r->track();
         if (!track || std::strcmp(track->kind().c_string(), "video") != 0) return;
         auto vt = libwebrtc::scoped_refptr<libwebrtc::RTCVideoTrack>(
@@ -309,7 +311,7 @@ public:
 
     void OnIceCandidate(libwebrtc::scoped_refptr<libwebrtc::RTCIceCandidate> c) override {
         if (c && signaling_) {
-            std::cout << "[P2pPlayer] 发送 ICE 候选 mid=" << c->sdp_mid().std_string() << std::endl;
+            std::cout << "[P2pPlayer] Send ICE candidate mid=" << c->sdp_mid().std_string() << std::endl;
             signaling_->SendIceCandidate(c->sdp_mid().std_string(), c->sdp_mline_index(),
                                          c->candidate().std_string());
         }
@@ -444,7 +446,7 @@ void P2pPlayer::Play() {
 
     impl_->signaling_->SetOnOffer([this](const std::string& peer_id, const std::string& type,
                                          const std::string& sdp) {
-        std::cout << "[P2pPlayer] 收到 offer from=" << peer_id
+        std::cout << "[P2pPlayer] Received offer from=" << peer_id
                   << " (type=" << type << ", len=" << sdp.size() << ")" << std::endl;
         if (std::getenv("WEBRTC_DUMP_REMOTE_OFFER")) {
             std::cout << "\n--- Remote offer SDP (from publisher via signaling) ---\n"
@@ -454,7 +456,7 @@ void P2pPlayer::Play() {
     });
     impl_->signaling_->SetOnIce([this](const std::string& peer_id, const std::string& mid, int mline_index,
                                        const std::string& candidate) {
-        std::cout << "[P2pPlayer] 收到 ICE 候选 from=" << peer_id << " mid=" << mid
+        std::cout << "[P2pPlayer] Received ICE candidate from=" << peer_id << " mid=" << mid
                   << " idx=" << mline_index << std::endl;
         impl_->AddRemoteIceCandidate(mid, mline_index, candidate);
     });

@@ -17,9 +17,6 @@ struct UsbCameraInfo {
 /// 枚举本地所有 USB 摄像头（V4L2）
 std::vector<UsbCameraInfo> ListUsbCameras();
 
-/// 从设备路径解析设备编号，如 /dev/video11 -> 11
-int ParseVideoDeviceIndex(const std::string& device_path);
-
 /// 获取设备的 bus_info（用于与 libwebrtc 的 device id 匹配）
 std::string GetDeviceBusInfo(const std::string& device_path);
 

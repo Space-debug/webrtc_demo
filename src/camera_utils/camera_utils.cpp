@@ -3,9 +3,6 @@
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#include <cstring>
-#include <dirent.h>
-#include <iostream>
 
 namespace webrtc_demo {
 
@@ -24,7 +21,6 @@ static bool IsVideoCaptureDevice(const std::string& path) {
 
 std::vector<UsbCameraInfo> ListUsbCameras() {
     std::vector<UsbCameraInfo> cameras;
-    std::vector<std::string> video_devices;
 
     // 枚举 /dev/video*
     for (int i = 0; i < 32; ++i) {
@@ -52,15 +48,6 @@ std::vector<UsbCameraInfo> ListUsbCameras() {
     }
 
     return cameras;
-}
-
-int ParseVideoDeviceIndex(const std::string& device_path) {
-    // /dev/video11 -> 11
-    size_t pos = device_path.rfind("video");
-    if (pos == std::string::npos) return -1;
-    pos += 5;  // strlen("video")
-    if (pos >= device_path.size()) return -1;
-    return std::atoi(device_path.c_str() + pos);
 }
 
 std::string GetDeviceBusInfo(const std::string& device_path) {

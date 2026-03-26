@@ -83,7 +83,8 @@ SignalingClient::~SignalingClient() {
 }
 
 bool SignalingClient::Connect() {
-    std::cout << "[Signaling] 连接 " << host_ << ":" << port_ << " (role=" << role_ << ")..." << std::endl;
+    std::cout << "[Signaling] Connecting to " << host_ << ":" << port_ << " (role=" << role_ << ")..."
+              << std::endl;
     sock_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd_ < 0) {
         if (on_error_) on_error_(std::string("socket: ") + strerror(errno));
@@ -106,7 +107,7 @@ bool SignalingClient::Connect() {
         sock_fd_ = -1;
         return false;
     }
-    std::cout << "[Signaling] TCP 连接成功" << std::endl;
+    std::cout << "[Signaling] TCP connected" << std::endl;
 
     std::ostringstream reg;
     reg << "{\"type\":\"register\",\"role\":\"" << role_ << "\",\"stream_id\":\""
@@ -118,7 +119,7 @@ bool SignalingClient::Connect() {
         sock_fd_ = -1;
         return false;
     }
-    std::cout << "[Signaling] 注册成功 (role=" << role_ << ")" << std::endl;
+    std::cout << "[Signaling] Registered (role=" << role_ << ")" << std::endl;
     return true;
 }
 
@@ -159,7 +160,7 @@ std::string SignalingClient::ResolveTargetPeer(const std::string& to_peer_id) co
 void SignalingClient::SendOffer(const std::string& sdp, const std::string& to_peer_id) {
     std::string target = ResolveTargetPeer(to_peer_id);
     if (role_ == "publisher" && target.empty()) {
-        std::cerr << "[Signaling] 忽略未指定目标订阅者的 offer" << std::endl;
+        std::cerr << "[Signaling] Ignoring offer without subscriber target" << std::endl;
         return;
     }
     std::ostringstream oss;

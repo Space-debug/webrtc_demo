@@ -45,27 +45,27 @@ static void PrintHeadlessFpsSummary(std::ostream& out, unsigned total_frames, do
     out << std::fixed << std::setprecision(3);
     if (total_frames >= 2 && span_sec > 1e-9) {
         const double fps = static_cast<double>(total_frames - 1) / span_sec;
-        out << "[Headless] 帧率统计: 解码回调间隔 " << span_sec << " s, 帧数 " << total_frames
-            << ", 平均 FPS " << std::setprecision(2) << fps << "（由首末帧时间戳，(N-1)/Δt）\n";
+        out << "[Headless] FPS: decode span " << span_sec << " s, frames " << total_frames
+            << ", avg FPS " << std::setprecision(2) << fps << " ((N-1)/delta_t)\n";
     } else {
-        out << "[Headless] 帧率统计: 帧数不足或间隔过短，无法计算 FPS\n";
+        out << "[Headless] FPS: not enough frames or span too short\n";
     }
 }
 
 static void PrintPlayerUsage(const char* prog) {
-    std::cout << "用法: " << prog << " [选项] [信令地址] [stream_id]\n"
-              << "选项:\n"
-              << "  --config FILE      配置文件路径\n"
-              << "  --headless         无窗口：仅通过控制台统计解码帧，适合 SSH/远程\n"
-              << "  --frames N         headless 模式下收到至少 N 帧即成功退出（默认 30）\n"
-              << "  --timeout-sec S    headless 超时秒数（默认 120）\n"
-              << "  --strict-fps       headless：按解码回调 steady_clock 统计平均 FPS 并校验区间\n"
-              << "  --expect-fps F     与 --strict-fps 配合，期望 FPS（默认 30）\n"
-              << "  --fps-tol R        相对容差，通过区间为 [F*(1-R), F*(1+R)]（默认 0.12）\n"
-              << "  --fps-min-sec T    strict 模式下首帧至末帧至少间隔 T 秒（默认 10）\n"
-              << "  --fps-min-frames M strict 模式下至少 M 帧（默认 150，且不小于 --frames）\n"
-              << "  --enable-flexfec   启用 FlexFEC-03（与 ENABLE_FLEXFEC=1 一致，推流端也需开）\n"
-              << "  -h, --help         显示本帮助\n"
+    std::cout << "Usage: " << prog << " [options] [signaling_host:port] [stream_id]\n"
+              << "Options:\n"
+              << "  --config FILE      Config file path\n"
+              << "  --headless         No window; log decoded frames (SSH-friendly)\n"
+              << "  --frames N         Headless: exit OK after N frames (default 30); 0 = run until disconnect\n"
+              << "  --timeout-sec S    Headless timeout seconds (default 120; ignored when --frames 0)\n"
+              << "  --strict-fps       Headless: check avg FPS from decode callbacks\n"
+              << "  --expect-fps F     With --strict-fps, expected FPS (default 30)\n"
+              << "  --fps-tol R        Relative tol; pass band [F*(1-R), F*(1+R)] (default 0.12)\n"
+              << "  --fps-min-sec T    Strict: min span first-to-last frame in s (default 10)\n"
+              << "  --fps-min-frames M Strict: min frames (default 150, >= --frames)\n"
+              << "  --enable-flexfec   FlexFEC-03 (publisher must match)\n"
+              << "  -h, --help         This help\n"
               << std::endl;
 }
 
@@ -100,7 +100,6 @@ int main(int argc, char* argv[]) {
             ++i;
         } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             need_frames = static_cast<unsigned>(std::atoi(argv[i + 1]));
-            if (need_frames < 1) need_frames = 1;
             i += 2;
         } else if (strcmp(argv[i], "--timeout-sec") == 0 && i + 1 < argc) {
             timeout_sec = std::atoi(argv[i + 1]);
@@ -164,22 +163,26 @@ int main(int argc, char* argv[]) {
     }
 
     if (strict_fps && !headless) {
-        std::cerr << "[Headless] --strict-fps 仅适用于 --headless，已忽略\n";
+        std::cerr << "[Headless] --strict-fps needs --headless; ignored\n";
         strict_fps = false;
     }
+    if (strict_fps && need_frames == 0) {
+        std::cerr << "[Headless] --strict-fps requires --frames >= 1\n";
+        return 1;
+    }
 
-    std::cout << "=== WebRTC P2P 拉流" << (headless ? " (无头/仅日志)" : " (SDL2)") << " ===" << std::endl;
-    std::cout << "信令: " << url << " 流: " << stream_id << std::endl;
+    std::cout << "=== WebRTC P2P player" << (headless ? " (headless)" : " (SDL2)") << " ===" << std::endl;
+    std::cout << "Signaling: " << url << " stream: " << stream_id << std::endl;
     if (!headless) {
-        std::cout << "按 Esc 或关闭窗口退出" << std::endl;
+        std::cout << "Press Esc or close window to exit" << std::endl;
     }
 
     std::unique_ptr<p2p::SdlDisplay> display;
     if (!headless) {
-        display = std::make_unique<p2p::SdlDisplay>("WebRTC P2P 拉流");
+        display = std::make_unique<p2p::SdlDisplay>("WebRTC P2P player");
         if (!display->IsOpen()) {
-            std::cerr << "SDL 窗口创建失败，请安装: sudo apt install libsdl2-dev\n"
-                      << "或远程/无显示时使用: " << argv[0] << " --headless ..." << std::endl;
+            std::cerr << "SDL window failed; install: sudo apt install libsdl2-dev\n"
+                      << "Or use headless: " << argv[0] << " --headless ..." << std::endl;
             return 1;
         }
     }
@@ -208,8 +211,7 @@ int main(int argc, char* argv[]) {
                 decode_timing->last = now;
             }
             if (n == 1 || n <= 5 || n % 10 == 0) {
-                std::cout << "[Headless] 已收到解码帧 #" << n << " 分辨率 " << width << "x" << height
-                          << std::endl;
+                std::cout << "[Headless] Decoded frame #" << n << " " << width << "x" << height << std::endl;
             }
         } else if (display) {
             display->UpdateFrame(argb, width, height, stride);
@@ -228,14 +230,23 @@ int main(int argc, char* argv[]) {
     player.Play();
 
     if (headless) {
+        if (need_frames == 0) {
+            std::cout << "[Headless] Running until publisher disconnect or Ctrl+C..." << std::endl;
+            while (player.IsPlaying()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            g_player = nullptr;
+            std::cout << "Exited." << std::endl;
+            return 0;
+        }
         const unsigned eff_min_frames =
             strict_fps ? std::max(need_frames, fps_min_frames) : need_frames;
         if (strict_fps) {
-            std::cout << "[Headless] strict-fps: 期望 " << expect_fps << " FPS, 容差 ±" << (fps_rel_tol * 100.0)
-                      << "%, 至少 " << eff_min_frames << " 帧且首末间隔 ≥ " << fps_min_measure_sec << " s\n";
+            std::cout << "[Headless] strict-fps: expect " << expect_fps << " FPS, tol ±" << (fps_rel_tol * 100.0)
+                      << "%, need " << eff_min_frames << " frames and span >= " << fps_min_measure_sec << " s\n";
         }
-        std::cout << "[Headless] 等待推流端 offer，目标至少 " << eff_min_frames << " 帧，超时 " << timeout_sec
-                  << " 秒..." << std::endl;
+        std::cout << "[Headless] Waiting for publisher offer, need " << eff_min_frames << " frames, timeout "
+                  << timeout_sec << " s..." << std::endl;
         using clock = std::chrono::steady_clock;
         auto deadline = clock::now() + std::chrono::seconds(timeout_sec);
         while (player.IsPlaying() && clock::now() < deadline) {
@@ -256,10 +267,10 @@ int main(int argc, char* argv[]) {
                     const double low = expect_fps * (1.0 - fps_rel_tol);
                     const double high = expect_fps * (1.0 + fps_rel_tol);
                     PrintHeadlessFpsSummary(std::cout, df, span_sec);
-                    std::cout << std::fixed << std::setprecision(2) << "[Headless] strict-fps: 判定区间 [" << low
-                              << ", " << high << "] 实际 " << fps << std::endl;
+                    std::cout << std::fixed << std::setprecision(2) << "[Headless] strict-fps: band [" << low
+                              << ", " << high << "] actual " << fps << std::endl;
                     if (fps >= low && fps <= high) {
-                        std::cout << "[Headless] 拉流验证成功：共收到 " << df << " 帧，FPS 校验通过" << std::endl;
+                        std::cout << "[Headless] Playback check OK: " << df << " frames, FPS in band" << std::endl;
                         if (std::getenv("P2P_FEC_STATS_VERIFY")) {
                             player.DumpInboundFecReceiverStats(std::cout, 5000);
                         }
@@ -267,7 +278,7 @@ int main(int argc, char* argv[]) {
                         g_player = nullptr;
                         return 0;
                     }
-                    std::cerr << "[Headless] FPS 校验未通过（退出码 3）" << std::endl;
+                    std::cerr << "[Headless] FPS check failed (exit 3)" << std::endl;
                     player.Stop();
                     g_player = nullptr;
                     return 3;
@@ -276,7 +287,7 @@ int main(int argc, char* argv[]) {
                 if (timing_ok && df >= 2) {
                     PrintHeadlessFpsSummary(std::cout, df, span_sec);
                 }
-                std::cout << "[Headless] 拉流验证成功：共收到 " << df << " 帧" << std::endl;
+                std::cout << "[Headless] Playback check OK: " << df << " frames" << std::endl;
                 if (std::getenv("P2P_FEC_STATS_VERIFY")) {
                     player.DumpInboundFecReceiverStats(std::cout, 5000);
                 }
@@ -300,11 +311,11 @@ int main(int argc, char* argv[]) {
             if (timing_ok && df >= 2) {
                 PrintHeadlessFpsSummary(std::cerr, df, span_sec);
             }
-            std::cerr << "[Headless] 超时：仅收到 " << df << " 帧（需要 " << eff_min_frames;
+            std::cerr << "[Headless] Timeout: got " << df << " frames (need " << eff_min_frames;
             if (strict_fps) {
-                std::cerr << "，且 strict 要求间隔 ≥ " << fps_min_measure_sec << " s";
+                std::cerr << "; strict needs span >= " << fps_min_measure_sec << " s";
             }
-            std::cerr << "）" << std::endl;
+            std::cerr << ")" << std::endl;
             player.Stop();
             g_player = nullptr;
             return 2;
@@ -320,6 +331,6 @@ int main(int argc, char* argv[]) {
     }
 
     g_player = nullptr;
-    std::cout << "退出." << std::endl;
+    std::cout << "Exited." << std::endl;
     return 0;
 }

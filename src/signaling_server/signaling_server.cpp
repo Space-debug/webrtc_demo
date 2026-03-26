@@ -218,7 +218,7 @@ void EpollCtl(int op, int fd, uint32_t events) {
     ev.events = events;
     ev.data.fd = fd;
     if (epoll_ctl(g_epoll_fd, op, fd, &ev) != 0) {
-        std::cerr << "[信令] epoll_ctl failed fd=" << fd << std::endl;
+        std::cerr << "[Signaling] epoll_ctl failed fd=" << fd << std::endl;
     }
 }
 
@@ -393,7 +393,7 @@ void RemoveClientResources(int fd, const std::shared_ptr<Client>&) {
                 auto pub_it = g_publishers.find(removed_stream_id);
                 if (pub_it != g_publishers.end() && pub_it->second.first == fd) {
                     g_publishers.erase(pub_it);
-                    LogVerbose(std::string("[信令] 推流端离线 stream=") + removed_stream_id);
+                    LogVerbose(std::string("[Signaling] publisher disconnected stream=") + removed_stream_id);
                 }
             } else if (role == "subscriber") {
                 auto sub_it = g_subscribers.find(removed_stream_id);
@@ -402,8 +402,8 @@ void RemoveClientResources(int fd, const std::shared_ptr<Client>&) {
                     if (sub_it->second.empty()) {
                         g_subscribers.erase(sub_it);
                     }
-                    LogVerbose(std::string("[信令] 拉流端离线 stream=") + removed_stream_id + " sub=" +
-                               removed_sub_id);
+                    LogVerbose(std::string("[Signaling] subscriber disconnected stream=") + removed_stream_id +
+                               " sub=" + removed_sub_id);
                 }
             }
         }
@@ -512,7 +512,7 @@ bool HandleInitialRegister(int fd, const std::string& msg) {
                     }
                 }
                 CloseClientFd(old_fd);
-                LogVerbose(std::string("[信令] 替换旧推流端 stream=") + client->stream_id);
+                LogVerbose(std::string("[Signaling] replaced publisher stream=") + client->stream_id);
             }
             g_publishers[client->stream_id] = {fd, pub_id};
             g_fd_to_info[fd] = {client->stream_id, pub_id, "publisher"};
@@ -522,8 +522,8 @@ bool HandleInitialRegister(int fd, const std::string& msg) {
             g_clients[fd] = client;
         }
 
-        LogVerbose(std::string("[信令] 推流端已连接 stream=") + client->stream_id + " (fd=" + std::to_string(fd) +
-                   ", id=" + pub_id + ")");
+        LogVerbose(std::string("[Signaling] publisher connected stream=") + client->stream_id +
+                   " (fd=" + std::to_string(fd) + ", id=" + pub_id + ")");
 
         SendJsonLine(fd, std::string("{\"type\":\"welcome\",\"id\":\"") + pub_id + "\"}");
         {
@@ -560,8 +560,9 @@ bool HandleInitialRegister(int fd, const std::string& msg) {
             g_clients[fd] = client;
         }
 
-        LogVerbose(std::string("[信令] 拉流端已连接 stream=") + client->stream_id + " (fd=" + std::to_string(fd) +
-                   ", id=" + sub_id + "), 该流订阅者: " + std::to_string(sub_count));
+        LogVerbose(std::string("[Signaling] subscriber connected stream=") + client->stream_id +
+                   " (fd=" + std::to_string(fd) + ", id=" + sub_id + "), subscribers_on_stream=" +
+                   std::to_string(sub_count));
 
         SendJsonLine(fd, std::string("{\"type\":\"welcome\",\"id\":\"") + sub_id + "\"}");
         NotifyPublisherSubscriberEvent(client->stream_id, "subscriber_join", sub_id);
@@ -657,10 +658,10 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, SignalHandler);
     std::signal(SIGTERM, SignalHandler);
 
-    std::cout << "WebRTC P2P 信令服务器: 0.0.0.0:" << port << " (TCP epoll, pool=" << pool_threads << ")"
+    std::cout << "WebRTC P2P signaling server: 0.0.0.0:" << port << " (TCP epoll, pool=" << pool_threads << ")"
               << std::endl;
-    std::cout << "多流：推流 register publisher + stream_id；拉流 register subscriber + stream_id" << std::endl;
-    std::cout << "详细日志: SIGNALING_VERBOSE=1 ；线程数: argv[2] 或 SIGNALING_POOL_THREADS" << std::endl;
+    std::cout << "Multi-stream: publisher register + stream_id; subscriber register + stream_id" << std::endl;
+    std::cout << "Verbose: SIGNALING_VERBOSE=1; threads: argv[2] or SIGNALING_POOL_THREADS" << std::endl;
 
     std::vector<epoll_event> events(256);
 
@@ -751,6 +752,6 @@ int main(int argc, char* argv[]) {
     }
     g_workers.reset();
 
-    std::cout << "信令服务器已退出" << std::endl;
+    std::cout << "Signaling server exited" << std::endl;
     return 0;
 }

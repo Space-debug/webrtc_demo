@@ -35,7 +35,7 @@ SdlDisplay::SdlDisplay(const std::string& title) : title_(title) {
         SDL_Quit();
         return;
     }
-    std::cout << "[SdlDisplay] 窗口已创建，等待首帧..." << std::endl;
+    std::cout << "[SdlDisplay] Window created, waiting for first frame..." << std::endl;
 }
 
 SdlDisplay::~SdlDisplay() {

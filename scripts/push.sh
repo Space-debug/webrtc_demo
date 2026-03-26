@@ -12,30 +12,30 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # [A] 帮助信息
 print_usage() {
     cat <<'EOF'
-用法:
+Usage:
   ./scripts/push.sh [stream_id] [camera]
 
-参数:
-  stream_id   流 ID（省略时用 config 的 STREAM_ID）
-  camera      摄像头路径或索引（省略时用 STREAM_<stream_id>_CAMERA）
+Args:
+  stream_id   Stream ID (default: STREAM_ID from config)
+  camera      Device path or index (default: STREAM_<stream_id>_CAMERA)
 
-环境变量（按功能分区）:
-  [配置文件]
+Environment (by area):
+  [Config file]
     CONFIG_FILE=./config/streams.conf
 
-  [连接与会话]
-    SIGNALING_ADDR=...       # 设置时才覆盖 config
-    START_SIGNALING=...      # 未设置时取 config
-    AUTO_LOCAL_ROUTE=...     # 未设置时取 config
+  [Connection / session]
+    SIGNALING_ADDR=...       # Overrides config only if set
+    START_SIGNALING=...      # From config if unset
+    AUTO_LOCAL_ROUTE=...     # From config if unset
 
-  [采样参数]
+  [Capture]
     WIDTH=...
     HEIGHT=...
-    FPS=...                  # 设置时才覆盖 config
+    FPS=...                  # Overrides config only if set
 
-说明:
-  1) 默认完全按 config/streams.conf 运行。
-  2) 仅当你显式传入参数/环境变量时，才覆盖配置文件。
+Notes:
+  1) By default everything comes from config/streams.conf.
+  2) CLI args / env vars override only when you set them explicitly.
 EOF
 }
 
@@ -98,7 +98,7 @@ PUSH_BIN="${PROJECT_ROOT}/build/bin/webrtc_push_demo"
 SIG_BIN="${PROJECT_ROOT}/build/bin/signaling_server"
 
 if [ ! -f "$PUSH_BIN" ] || [ ! -f "$SIG_BIN" ]; then
-    echo "错误: 请先执行 ./scripts/build.sh 构建项目" >&2
+    echo "Error: run ./scripts/build.sh first" >&2
     exit 1
 fi
 
@@ -121,12 +121,12 @@ if [ "$START_SIGNALING" = "1" ]; then
     pkill -f "signaling_server" 2>/dev/null || true
     sleep 1
 
-    echo "[push] 启动信令服务器: 0.0.0.0:${signaling_port}"
+    echo "[push] Starting signaling server: 0.0.0.0:${signaling_port}"
     "$SIG_BIN" "$signaling_port" &
     SIGNALING_PID=$!
     sleep 1
     if ! kill -0 "$SIGNALING_PID" 2>/dev/null; then
-        echo "错误: 信令服务器启动失败（端口 ${signaling_port} 可能被占用）" >&2
+        echo "Error: signaling server failed to start (port ${signaling_port} may be in use)" >&2
         exit 1
     fi
 fi

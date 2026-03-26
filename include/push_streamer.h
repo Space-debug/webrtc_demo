@@ -121,12 +121,10 @@ public:
     /// 是否正在推流
     bool IsStreaming() const { return is_streaming_; }
 
-    /// 对每个活跃 PeerConnection 调用 GetStats，单行打印中文时延摘要（毫秒，含采集/编码/ICE RTT 等）。
-    /// 无多订阅者连接时，若存在默认 peer_connection_ 则对其采样（如非信令单连接）。
-    /// 与 WEBRTC_LATENCY_STATS_PROBE 环境变量配合周期打印。
+    /// GetStats one-line latency summary per active PeerConnection (English logs).
     void LogLatencyStatsForAllPeers(std::ostream& out);
 
-    /// 按 latency_stats_window_frames 间隔对 GetStats 累计量做差分，输出 ms/帧及对端 RTT 样本均值等（推荐与配置 LATENCY_STATS_* 使用）。
+    /// Rolling window delta/GetStats (see LATENCY_STATS_*). English [stats-latency-avg] and [latency-pipeline].
     void LogLatencyStatsRollingAvg(std::ostream& out);
 
 private:

@@ -49,12 +49,12 @@ void EnsureFlexfecFieldTrials(bool enable_flexfec, const std::string& override_t
     }
 
     if (::setenv("WEBRTC_FIELD_TRIALS", out.c_str(), 1) != 0) {
-        std::cerr << "[WebRTC] setenv WEBRTC_FIELD_TRIALS 失败" << std::endl;
+        std::cerr << "[WebRTC] setenv WEBRTC_FIELD_TRIALS failed" << std::endl;
         return;
     }
 
-    std::cout << "[WebRTC] ENABLE_FLEXFEC: 已设置 WEBRTC_FIELD_TRIALS（FlexFEC-03），长度=" << out.size()
-              << "。拉流端也需 ENABLE_FLEXFEC=1。" << std::endl;
+    std::cout << "[WebRTC] ENABLE_FLEXFEC: set WEBRTC_FIELD_TRIALS (FlexFEC-03), len=" << out.size()
+              << ". Receiver needs ENABLE_FLEXFEC=1 too." << std::endl;
 }
 
 }  // namespace webrtc_demo
