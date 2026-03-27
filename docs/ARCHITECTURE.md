@@ -7,29 +7,27 @@ webrtc_demo/
 ├── CMakeLists.txt          # 顶层 CMake 配置
 ├── config/                 # 配置文件
 ├── docs/                   # 文档
-├── include/                # 项目公共头文件
+├── include/                # 项目公共头文件（如 push_streamer.h）
 ├── scripts/                # 构建与运行脚本
-├── src/                    # 源代码
-│   ├── main.cpp            # 程序入口
-│   └── push_streamer/      # 推流模块
-└── 3rdparty/              # 第三方库
-    └── libwebrtc/         # 按平台/架构组织
-        ├── linux/arm64/
-        ├── linux/x64/
-        └── win/x64/
+├── src/
+│   ├── app/                # push_demo.cpp（推流） pull_demo.cpp（拉流）
+│   ├── sdk/
+│   │   └── media/          # 推拉流：PushStreamer、PullSubscriber、采集轨道等
+│   └── tools/              # 独立工具（如 signaling_server）
+└── 3rdparty/
+    └── libwebrtc/
+        ├── include/        # 官方 WebRTC 头文件树
+        └── lib/linux/arm64/libwebrtc.a
 ```
 
 ## 模块说明
 
-### PushStreamer
+### PushStreamer / PullSubscriber
 
-推流核心类，负责：
+- **PushStreamer**（`include/push_streamer.h`）：推流；采集、Offer/ICE 回调、多订阅者等。
+- **PullSubscriber**（`include/pull_subscriber.h`）：拉流；Answer、解码帧回调（ARGB）、与同一 TCP 信令协议对接。
 
-- 初始化 libwebrtc
-- 创建 PeerConnection 和媒体轨道
-- 从摄像头采集视频
-- 生成 SDP Offer 和 ICE 候选
-- 通过回调将 SDP/ICE 交给上层做信令交换
+演示接线见 `src/app/push_demo.cpp`、`pull_demo.cpp`（最少集成示例）。
 
 ### 信令流程
 

@@ -1,0 +1,525 @@
+#include "push_streamer.h"
+#include "camera_utils.h"
+#include "config_loader.h"
+#include "signaling_client.h"
+#include <cctype>
+#include <chrono>
+#include <csignal>
+#include <cstring>
+#include <fstream>
+#include <cstdlib>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <vector>
+
+using namespace webrtc_demo;
+
+static PushStreamer* g_streamer = nullptr;
+static SignalingClient* g_signaling = nullptr;
+
+void SignalHandler(int signum) {
+    std::cout << "\n[Main] Received signal " << signum << ", stopping..." << std::endl;
+    if (g_streamer) {
+        g_streamer->Stop();
+    }
+}
+
+void ListCameras() {
+    std::cout << "=== USB cameras (V4L2) ===" << std::endl;
+    auto cameras = ListUsbCameras();
+    if (cameras.empty()) {
+        std::cout << "No cameras found." << std::endl;
+        return;
+    }
+    for (const auto& cam : cameras) {
+        std::cout << "  [" << cam.index << "] " << cam.device_path
+                  << " - " << cam.device_name;
+        if (!cam.bus_info.empty()) {
+            std::cout << " (" << cam.bus_info << ")";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << "\nExample: ./webrtc_push_demo stream_001 /dev/video11" << std::endl;
+    std::cout << "Or:     ./webrtc_push_demo stream_001 11" << std::endl;
+}
+
+void PrintUsage(const char* prog) {
+    std::cout << "Usage: " << prog << " [options] [stream_id] [camera]\n"
+              << "Options:\n"
+              << "  --config FILE     Config file (default config/streams.conf)\n"
+              << "  --list-cameras    List USB cameras and exit\n"
+              << "  --test-capture    Capture only, 10s, print frame count, exit\n"
+              << "  --test-encode     Loopback H264 test, 10s, exit\n"
+              << "  --signaling ADDR  Signaling server (default 127.0.0.1:8765)\n"
+              << "  --width W         Video width (default 640)\n"
+              << "  --height H        Video height (default 360)\n"
+              << "  --fps F           Frame rate (default 15)\n"
+              << "  --no-audio        Video only (same as ENABLE_AUDIO=0)\n"
+              << "  --enable-audio    Allow audio in SDP (no mic capture)\n"
+              << "  --enable-flexfec  FlexFEC-03 (peer must match)\n"
+              << "Environment:\n"
+              << "  WEBRTC_LATENCY_STATS_PROBE=0|1   Overrides LATENCY_STATS_ENABLE\n"
+              << "  WEBRTC_LATENCY_STATS_WINDOW_FRAMES=N   Rolling stats window (default 60)\n"
+              << "  WEBRTC_LATENCY_STATS_POLL_MS=N   When probe on, main-loop sleep ms (default 250, clamp 20-10000)\n"
+              << "  WEBRTC_LATENCY_PIPELINE_VERBOSE=1   Extra multi-line [latency-pipeline] after each window\n"
+              << "  WEBRTC_GETSTATS_DUMP=1   Full push GetStats: [getstats-full] + JSON + per-member m[] lines\n"
+              << "  WEBRTC_GETSTATS_DUMP_JSON_ONLY=1   JSON only (skip m[] lines if JSON non-empty)\n"
+              << "  WEBRTC_GETSTATS_DUMP_INTERVAL_MS=N   Min ms between full dumps (0=every GetStats poll)\n"
+              << "  WEBRTC_TEST_ENCODE_GETSTATS=1   During --test-encode, dump GetStats at ~3s and ~6s\n"
+              << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N   Min frames before Offer (0=off)\n"
+              << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N   Max wait for gate (seconds)\n"
+              << "  [stats-latency-avg] also prints usr_if_*: rolling OnFrame interval mean/std vs nominal fps\n"
+              << "Arguments:\n"
+              << "  stream_id         Stream ID; omitted -> STREAM_ID in config\n"
+              << "  camera            Device path/index; omitted -> STREAM_<id>_CAMERA\n"
+              << std::endl;
+}
+
+static std::string FindConfigPath(const char* prog, const std::string& config_arg) {
+    if (!config_arg.empty()) return config_arg;
+    std::string prog_path(prog);
+    size_t slash = prog_path.find_last_of("/\\");
+    std::string dir = (slash != std::string::npos) ? prog_path.substr(0, slash) : ".";
+    for (const char* sub : {"/config/streams.conf", "/../config/streams.conf"}) {
+        std::string path = dir + sub;
+        std::ifstream f(path);
+        if (f) return path;
+    }
+    return "";
+}
+
+int main(int argc, char* argv[]) {
+    std::cout << "=== WebRTC P2P publisher demo ===" << std::endl;
+    std::cout << "[Main] Parsing arguments..." << std::endl;
+
+    PushStreamerConfig config;
+    std::string signaling_url = "127.0.0.1:8765";
+    std::string config_path;
+    std::optional<std::string> cmdline_signaling;
+    std::optional<int> cmdline_width;
+    std::optional<int> cmdline_height;
+    std::optional<int> cmdline_fps;
+    std::optional<bool> cmdline_enable_audio;
+    bool cmdline_enable_flexfec = false;
+    bool use_signaling = true;
+    bool test_capture = false;
+    bool test_encode = false;
+
+    int arg_idx = 1;
+    while (arg_idx < argc) {
+        if (strcmp(argv[arg_idx], "--list-cameras") == 0) {
+            ListCameras();
+            return 0;
+        }
+        if (strcmp(argv[arg_idx], "-h") == 0 || strcmp(argv[arg_idx], "--help") == 0) {
+            PrintUsage(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[arg_idx], "--config") == 0 && arg_idx + 1 < argc) {
+            config_path = argv[++arg_idx];
+        } else if (strcmp(argv[arg_idx], "--test-capture") == 0) {
+            test_capture = true;
+            use_signaling = false;
+        } else if (strcmp(argv[arg_idx], "--test-encode") == 0) {
+            test_encode = true;
+            use_signaling = false;
+        } else if (strcmp(argv[arg_idx], "--signaling") == 0 && arg_idx + 1 < argc) {
+            cmdline_signaling = std::string(argv[++arg_idx]);
+        } else if (strcmp(argv[arg_idx], "--width") == 0 && arg_idx + 1 < argc) {
+            cmdline_width = std::atoi(argv[++arg_idx]);
+        } else if (strcmp(argv[arg_idx], "--height") == 0 && arg_idx + 1 < argc) {
+            cmdline_height = std::atoi(argv[++arg_idx]);
+        } else if (strcmp(argv[arg_idx], "--fps") == 0 && arg_idx + 1 < argc) {
+            cmdline_fps = std::atoi(argv[++arg_idx]);
+        } else if (strcmp(argv[arg_idx], "--no-audio") == 0) {
+            cmdline_enable_audio = false;
+        } else if (strcmp(argv[arg_idx], "--enable-audio") == 0) {
+            cmdline_enable_audio = true;
+        } else if (strcmp(argv[arg_idx], "--enable-flexfec") == 0) {
+            cmdline_enable_flexfec = true;
+        } else if (argv[arg_idx][0] != '-') {
+            break;
+        }
+        arg_idx++;
+    }
+    std::string stream_id = (arg_idx < argc) ? argv[arg_idx++] : "";
+    std::string camera_arg = (arg_idx < argc) ? argv[arg_idx++] : "";
+
+    if (config_path.empty()) config_path = FindConfigPath(argv[0], "");
+    webrtc_demo::ConfigLoader cfg;
+    bool config_loaded = false;
+    if (!config_path.empty()) {
+        if (cfg.Load(config_path)) {
+            config_loaded = true;
+            std::cout << "[Main] Loaded config: " << config_path << std::endl;
+        } else {
+            std::cerr << "[Main] Warning: failed to load config file: " << config_path
+                      << " (using program defaults)\n";
+        }
+    }
+    if (config_loaded) {
+        if (stream_id.empty()) {
+            stream_id = cfg.Get("STREAM_ID", "livestream");
+        }
+        signaling_url = cfg.GetStream(stream_id, "SIGNALING_ADDR",
+                                      cfg.Get("SIGNALING_ADDR", "127.0.0.1:8765"));
+        config.video_width = cfg.GetStreamInt(stream_id, "WIDTH", 1280);
+        config.video_height = cfg.GetStreamInt(stream_id, "HEIGHT", 720);
+        config.video_fps = cfg.GetStreamInt(stream_id, "FPS", 30);
+        if (camera_arg.empty()) {
+            camera_arg = cfg.GetStream(stream_id, "CAMERA", "");
+        }
+        config.bitrate_mode = cfg.GetStream(stream_id, "BITRATE_MODE", "");
+        if (config.bitrate_mode.empty()) {
+            config.bitrate_mode = "vbr";
+        }
+        config.target_bitrate_kbps = cfg.GetStreamInt(stream_id, "TARGET_BITRATE", 2200);
+        config.min_bitrate_kbps = cfg.GetStreamInt(stream_id, "MIN_BITRATE", 1200);
+        config.max_bitrate_kbps = cfg.GetStreamInt(stream_id, "MAX_BITRATE", 3500);
+        config.degradation_preference = cfg.GetStream(stream_id, "DEGRADATION_PREFERENCE", "");
+        if (config.degradation_preference.empty()) {
+            config.degradation_preference = "balanced";
+        }
+        {
+            std::string icep = cfg.GetStream(stream_id, "ICE_PRIORITIZE_LIKELY_PAIRS", "");
+            if (icep.empty()) {
+                icep = "1";
+            }
+            for (auto& c : icep) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            config.ice_prioritize_likely_pairs =
+                (icep == "1" || icep == "true" || icep == "yes" || icep == "on");
+        }
+        config.video_network_priority = cfg.GetStream(stream_id, "VIDEO_NETWORK_PRIORITY", "high");
+        config.video_encoding_max_framerate = cfg.GetStreamInt(stream_id, "VIDEO_ENCODING_MAX_FPS", 0);
+        config.video_codec = cfg.GetStream(stream_id, "VIDEO_CODEC", "");
+        if (config.video_codec.empty()) {
+            config.video_codec = "h264";
+        }
+        config.h264_profile = cfg.GetStream(stream_id, "H264_PROFILE", "");
+        if (config.h264_profile.empty()) {
+            config.h264_profile = "main";
+        }
+        config.h264_level = cfg.GetStream(stream_id, "H264_LEVEL", "");
+        if (config.h264_level.empty()) {
+            config.h264_level = "3.0";
+        }
+        config.keyframe_interval = cfg.GetStreamInt(stream_id, "KEYFRAME_INTERVAL", 0);
+        config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
+        config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
+        config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);
+        {
+            std::string ea = cfg.GetStream(stream_id, "ENABLE_AUDIO", "");
+            if (ea.empty()) {
+                ea = "0";
+            }
+            for (auto& c : ea) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            config.enable_audio = (ea == "1" || ea == "true" || ea == "yes" || ea == "on");
+        }
+        {
+            std::string ef = cfg.GetStream(stream_id, "ENABLE_FLEXFEC", "");
+            if (ef.empty()) {
+                ef = "0";
+            }
+            for (auto& c : ef) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            config.enable_flexfec =
+                (ef == "1" || ef == "true" || ef == "yes" || ef == "on");
+            config.flexfec_field_trials = cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", "");
+        }
+        {
+            std::string ls = cfg.GetStream(stream_id, "LATENCY_STATS_ENABLE", "");
+            if (ls.empty()) {
+                ls = "0";
+            }
+            for (auto& c : ls) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            config.latency_stats_enable =
+                (ls == "1" || ls == "true" || ls == "yes" || ls == "on");
+            config.latency_stats_window_frames =
+                cfg.GetStreamInt(stream_id, "LATENCY_STATS_WINDOW_FRAMES", 60);
+            config.latency_stats_poll_ms = cfg.GetStreamInt(stream_id, "LATENCY_STATS_POLL_MS", 250);
+            if (config.latency_stats_poll_ms < 20) {
+                config.latency_stats_poll_ms = 20;
+            }
+            if (config.latency_stats_poll_ms > 10000) {
+                config.latency_stats_poll_ms = 10000;
+            }
+        }
+    }
+    if (cmdline_enable_audio.has_value()) config.enable_audio = *cmdline_enable_audio;
+    if (cmdline_signaling.has_value()) signaling_url = *cmdline_signaling;
+    if (cmdline_width.has_value()) config.video_width = *cmdline_width;
+    if (cmdline_height.has_value()) config.video_height = *cmdline_height;
+    if (cmdline_fps.has_value()) config.video_fps = *cmdline_fps;
+    if (const char* ef_env = std::getenv("ENABLE_FLEXFEC")) {
+        std::string s(ef_env);
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s == "1" || s == "true" || s == "yes" || s == "on") {
+            config.enable_flexfec = true;
+        } else if (s == "0" || s == "false" || s == "no" || s == "off") {
+            config.enable_flexfec = false;
+        }
+    }
+    if (cmdline_enable_flexfec) {
+        config.enable_flexfec = true;
+    }
+    if (const char* g = std::getenv("WEBRTC_CAPTURE_GATE_MIN_FRAMES")) {
+        config.capture_gate_min_frames = std::atoi(g);
+    }
+    if (const char* gw = std::getenv("WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC")) {
+        config.capture_gate_max_wait_sec = std::atoi(gw);
+    }
+    if (const char* lw = std::getenv("WEBRTC_LATENCY_STATS_WINDOW_FRAMES")) {
+        int v = std::atoi(lw);
+        if (v > 0) {
+            config.latency_stats_window_frames = v;
+        }
+    }
+    if (const char* lp = std::getenv("WEBRTC_LATENCY_STATS_POLL_MS")) {
+        int v = std::atoi(lp);
+        if (v >= 20 && v <= 10000) {
+            config.latency_stats_poll_ms = v;
+        }
+    }
+    if (stream_id.empty()) stream_id = "livestream";
+
+    config.stream_id = stream_id;
+    if (!camera_arg.empty()) {
+        if (strncmp(camera_arg.c_str(), "/dev/video", 10) == 0 || camera_arg[0] == '/')
+            config.video_device_path = camera_arg;
+        else
+            config.video_device_index = std::atoi(camera_arg.c_str());
+    }
+
+    if (test_capture) config.test_capture_only = true;
+    if (test_encode) config.test_encode_mode = true;
+
+    // 码率模式归一化：
+    // - cbr: 用 target 作为固定码率（min=max=target）
+    // - vbr: 继续使用 min/max 边界，target 仅用于日志与配置语义
+    {
+        std::string mode = config.bitrate_mode;
+        for (auto& c : mode) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        config.bitrate_mode = mode;
+        if (config.min_bitrate_kbps <= 0) config.min_bitrate_kbps = 100;
+        if (config.max_bitrate_kbps <= 0) config.max_bitrate_kbps = 2000;
+        if (config.min_bitrate_kbps > config.max_bitrate_kbps) {
+            std::swap(config.min_bitrate_kbps, config.max_bitrate_kbps);
+        }
+        if (config.target_bitrate_kbps <= 0) {
+            config.target_bitrate_kbps = (config.min_bitrate_kbps + config.max_bitrate_kbps) / 2;
+        }
+        if (config.target_bitrate_kbps < config.min_bitrate_kbps) {
+            config.target_bitrate_kbps = config.min_bitrate_kbps;
+        }
+        if (config.target_bitrate_kbps > config.max_bitrate_kbps) {
+            config.target_bitrate_kbps = config.max_bitrate_kbps;
+        }
+        if (config.capture_warmup_sec < 0) {
+            config.capture_warmup_sec = 0;
+        }
+        if (config.capture_gate_min_frames < 0) {
+            config.capture_gate_min_frames = 0;
+        }
+        if (config.capture_gate_max_wait_sec < 1) {
+            config.capture_gate_max_wait_sec = 1;
+        }
+        if (config.bitrate_mode == "cbr") {
+            config.min_bitrate_kbps = config.target_bitrate_kbps;
+            config.max_bitrate_kbps = config.target_bitrate_kbps;
+        }
+    }
+
+    std::cout << "[Main] Config: stream_id=" << config.stream_id
+              << " resolution=" << config.video_width << "x" << config.video_height
+              << " fps=" << config.video_fps
+              << " bitrate=" << config.target_bitrate_kbps << "kbps(" << config.bitrate_mode << ")"
+              << " ice_prioritize_likely=" << (config.ice_prioritize_likely_pairs ? "on" : "off")
+              << " video_net_prio=" << config.video_network_priority
+              << " codec=" << config.video_codec
+              << " warmup=" << config.capture_warmup_sec << "s"
+              << " capture_gate=" << (config.capture_gate_min_frames > 0
+                                        ? std::to_string(config.capture_gate_min_frames) + "frames<=" +
+                                              std::to_string(config.capture_gate_max_wait_sec) + "s"
+                                        : std::string("off"))
+              << " device=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
+              << " flexfec=" << (config.enable_flexfec ? "on" : "off")
+              << std::endl;
+    if (config.keyframe_interval > 0) {
+        std::cout << "[Main] Note: keyframe interval not exposed in this libwebrtc binding; "
+                     "encoder + RTCP PLI/FIR drive GOP."
+                  << std::endl;
+    }
+
+    if (use_signaling) {
+        config.signaling_subscriber_offer_only = true;
+    }
+
+    PushStreamer streamer(config);
+    g_streamer = &streamer;
+
+    std::unique_ptr<SignalingClient> signaling;
+    if (use_signaling) {
+        std::cout << "[Main] Signaling mode, server: " << signaling_url << std::endl;
+        signaling = std::make_unique<SignalingClient>(signaling_url, "publisher", config.stream_id);
+        g_signaling = signaling.get();
+    } else {
+        std::cout << "[Main] No signaling (test-capture / test-encode)" << std::endl;
+    }
+
+    std::signal(SIGINT, SignalHandler);
+    std::signal(SIGTERM, SignalHandler);
+
+    std::shared_ptr<std::vector<std::string>> subscriber_pending;
+    std::shared_ptr<std::mutex> subscriber_pending_mu;
+
+    if (use_signaling && signaling) {
+        subscriber_pending = std::make_shared<std::vector<std::string>>();
+        subscriber_pending_mu = std::make_shared<std::mutex>();
+        signaling->SetOnAnswer([&streamer](const std::string& peer_id, const std::string& type,
+                                           const std::string& sdp) {
+            std::cout << "[Signaling] Received answer peer=" << peer_id << " (type=" << type
+                      << ", sdp_len=" << sdp.size() << ") SetRemoteDescription" << std::endl;
+            streamer.SetRemoteDescriptionForPeer(peer_id, type, sdp);
+        });
+        signaling->SetOnIce([&streamer](const std::string& peer_id, const std::string& mid, int mline_index,
+                                        const std::string& candidate) {
+            std::cout << "[Signaling] ICE candidate peer=" << peer_id << " mid=" << mid << " idx=" << mline_index
+                      << " candidate=" << (candidate.size() > 60 ? candidate.substr(0, 60) + "..." : candidate) << std::endl;
+            streamer.AddRemoteIceCandidateForPeer(peer_id, mid, mline_index, candidate);
+        });
+        signaling->SetOnSubscriberJoin(
+            [subscriber_pending, subscriber_pending_mu](const std::string& peer_id) {
+                std::cout << "[Signaling] Subscriber joined: " << peer_id << " (queued for main thread)"
+                          << std::endl;
+                std::lock_guard<std::mutex> lk(*subscriber_pending_mu);
+                subscriber_pending->push_back(peer_id);
+            });
+        signaling->SetOnSubscriberLeave([](const std::string& peer_id) {
+            std::cout << "[Signaling] Subscriber left: " << peer_id << std::endl;
+        });
+        signaling->SetOnError([](const std::string& msg) {
+            std::cerr << "[Signaling] Error: " << msg << std::endl;
+        });
+
+        streamer.SetOnSdpCallback([&signaling](const std::string& peer_id, const std::string& type,
+                                                          const std::string& sdp) {
+            if (type != "offer") return;
+            std::cout << "[Signaling] Send offer peer=" << (peer_id.empty() ? "default" : peer_id)
+                      << " (sdp_len=" << sdp.size() << ")" << std::endl;
+            signaling->SendOffer(sdp, peer_id);
+        });
+        streamer.SetOnIceCandidateCallback(
+            [&signaling](const std::string& peer_id, const std::string& mid, int mline_index,
+                         const std::string& candidate) {
+                std::cout << "[Signaling] Send ICE candidate peer=" << (peer_id.empty() ? "default" : peer_id)
+                          << " mid=" << mid << " idx=" << mline_index << std::endl;
+                signaling->SendIceCandidate(mid, mline_index, candidate, peer_id);
+            });
+
+        std::cout << "[Main] Connecting to signaling..." << std::endl;
+        if (!signaling->Start()) {
+            std::cerr << "[Signaling] Start failed. Run ./build/bin/signaling_server or ./scripts/push.sh" << std::endl;
+            return 1;
+        }
+        std::cout << "[Main] Signaling connected" << std::endl;
+    } else {
+        streamer.SetOnSdpCallback([](const std::string& peer_id, const std::string& type,
+                                     const std::string& sdp) {
+            std::cout << "\n--- Local " << type << " ---\n" << sdp << "\n--- End ---\n" << std::endl;
+        });
+        streamer.SetOnIceCandidateCallback(
+            [](const std::string& peer_id, const std::string& mid, int mline_index,
+               const std::string& candidate) {
+                std::cout << "[ICE] peer=" << (peer_id.empty() ? "default" : peer_id)
+                          << " mid=" << mid << " index=" << mline_index
+                          << " candidate=" << candidate << std::endl;
+            });
+    }
+
+    streamer.SetOnConnectionStateCallback([](ConnectionState state) {
+        const char* names[] = {"New", "Connecting", "Connected", "Disconnected", "Failed", "Closed"};
+        std::cout << "[State] " << names[static_cast<int>(state)] << std::endl;
+    });
+
+    if (test_capture) {
+        streamer.SetOnFrameCallback([](unsigned int n, int w, int h) {
+            if (n == 1) std::cout << "[Capture] First frame: " << w << "x" << h << std::endl;
+            else if (n % 50 == 0) std::cout << "[Capture] Frames received: " << n << std::endl;
+        });
+    }
+    if (test_encode) {
+        streamer.SetOnConnectionStateCallback([](ConnectionState state) {
+            const char* names[] = {"New", "Connecting", "Connected", "Disconnected", "Failed", "Closed"};
+            std::cout << "[Loopback] " << names[static_cast<int>(state)] << std::endl;
+        });
+    }
+
+    std::cout << "[Main] Starting publisher..." << std::endl;
+    if (!streamer.Start()) {
+        std::cerr << "[Main] Start failed. Try --list-cameras." << std::endl;
+        return 1;
+    }
+    std::cout << "[Main] Publisher started" << std::endl;
+
+    if (test_capture) {
+        std::cout << "[test-capture] Running 10s capture..." << std::endl;
+        for (int i = 0; i < 10 && streamer.IsStreaming(); ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        unsigned int total = streamer.GetFrameCount();
+        streamer.Stop();
+        std::cout << "Total frames: " << total << std::endl;
+        return total > 0 ? 0 : 1;
+    }
+
+    if (test_encode) {
+        std::cout << "[test-encode] Loopback 10s..." << std::endl;
+        for (int i = 0; i < 10 && streamer.IsStreaming(); ++i) {
+            if (std::getenv("WEBRTC_TEST_ENCODE_GETSTATS") && (i == 3 || i == 6)) {
+                streamer.LogLatencyStatsForAllPeers(std::cout);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        unsigned int total = streamer.GetDecodedFrameCount();
+        streamer.Stop();
+        std::cout << "Decoded frames: " << total << std::endl;
+        return total > 0 ? 0 : 1;
+    }
+
+    std::cout << "Press Ctrl+C to stop." << std::endl;
+
+    bool latency_probe_on = config.latency_stats_enable;
+    if (const char* latency_stats_probe = std::getenv("WEBRTC_LATENCY_STATS_PROBE")) {
+        latency_probe_on =
+            (latency_stats_probe[0] != '\0' && std::strcmp(latency_stats_probe, "0") != 0);
+    }
+
+    while (streamer.IsStreaming()) {
+        if (subscriber_pending && subscriber_pending_mu) {
+            std::vector<std::string> batch;
+            {
+                std::lock_guard<std::mutex> lk(*subscriber_pending_mu);
+                batch.swap(*subscriber_pending);
+            }
+            for (const auto& peer_id : batch) {
+                std::cout << "[Main] CreateOfferForPeer " << peer_id << std::endl;
+                streamer.CreateOfferForPeer(peer_id);
+            }
+        }
+        if (latency_probe_on) {
+            streamer.LogLatencyStatsRollingAvg(std::cout);
+            std::this_thread::sleep_for(std::chrono::milliseconds(config.latency_stats_poll_ms));
+        } else {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!streamer.IsStreaming()) {
+            break;
+        }
+    }
+
+    g_streamer = nullptr;
+    g_signaling = nullptr;
+    std::cout << "Demo exited." << std::endl;
+    return 0;
+}

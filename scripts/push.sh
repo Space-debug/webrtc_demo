@@ -1,169 +1,65 @@
 #!/bin/bash
-# 一键推流脚本（按功能分区组织）
-# - 支持按 stream_id 推流
-# - 可选自动拉起 signaling_server
-# - 与 config/streams.conf、README 的术语保持一致
-
+# 推流：读 config/streams.conf，可选自动起信令、本机回环路由
 set -euo pipefail
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+CONFIG="${CONFIG_FILE:-$ROOT/config/streams.conf}"
 
-# [A] 帮助信息
-print_usage() {
-    cat <<'EOF'
-Usage:
-  ./scripts/push.sh [stream_id] [camera]
-
-Args:
-  stream_id   Stream ID (default: STREAM_ID from config)
-  camera      Device path or index (default: STREAM_<stream_id>_CAMERA)
-
-Environment (by area):
-  [Config file]
-    CONFIG_FILE=./config/streams.conf
-
-  [Connection / session]
-    SIGNALING_ADDR=...       # Overrides config only if set
-    START_SIGNALING=...      # From config if unset
-    AUTO_LOCAL_ROUTE=...     # From config if unset
-
-  [Capture]
-    WIDTH=...
-    HEIGHT=...
-    FPS=...                  # Overrides config only if set
-
-Notes:
-  1) By default everything comes from config/streams.conf.
-  2) CLI args / env vars override only when you set them explicitly.
-EOF
-}
-
-if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    print_usage
-    exit 0
-fi
-
-# [B] 配置文件与读取函数
-CONFIG_FILE="${CONFIG_FILE:-${PROJECT_ROOT}/config/streams.conf}"
 cfg_get() {
-    local key="$1"
-    local def="$2"
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "$def"
-        return
-    fi
-    local v
-    v="$(
-        awk -F= -v key="$key" '
-            function trim(s){ gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s); return s }
-            {
-                line=$0
-                sub(/#.*/, "", line)
-                if (index(line, "=")==0) next
-                k=trim(substr(line, 1, index(line, "=")-1))
-                val=trim(substr(line, index(line, "=")+1))
-                if (k==key) last=val
-            }
-            END { if (last!="") print last }
-        ' "$CONFIG_FILE"
-    )"
-    if [ -n "$v" ]; then
-        echo "$v"
-    else
-        echo "$def"
-    fi
+    local key="$1" def="$2"
+    [ ! -f "$CONFIG" ] && echo "$def" && return
+    local line
+    line="$(grep -E "^[[:space:]]*${key}=" "$CONFIG" | tail -1)" || true
+    [ -z "$line" ] && echo "$def" && return
+    echo "${line#*=}" | sed 's/#.*//' | xargs
 }
 
-# [C] 输入参数（为空则走配置）
+[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && {
+    echo "Usage: ./scripts/push.sh [stream_id] [camera]"
+    echo "环境: CONFIG_FILE  SIGNALING_ADDR  START_SIGNALING  AUTO_LOCAL_ROUTE  WIDTH HEIGHT FPS"
+    exit 0
+}
+
 STREAM_ID="${1:-}"
 CAMERA="${2:-}"
-
-# [D] 连接与会话（优先环境变量，其次配置）
-SIGNALING_ADDR_CFG="$(cfg_get SIGNALING_ADDR 127.0.0.1:8765)"
-SIGNALING_ADDR_EFFECTIVE="${SIGNALING_ADDR:-$SIGNALING_ADDR_CFG}"
+SIG_ADDR="${SIGNALING_ADDR:-$(cfg_get SIGNALING_ADDR 127.0.0.1:8765)}"
 START_SIGNALING="${START_SIGNALING:-$(cfg_get START_SIGNALING 1)}"
 AUTO_LOCAL_ROUTE="${AUTO_LOCAL_ROUTE:-$(cfg_get AUTO_LOCAL_ROUTE 1)}"
 
-case "$(uname -m)" in
-    aarch64|arm64) ARCH="arm64" ;;
-    x86_64|amd64) ARCH="x64" ;;
-    *) ARCH="arm64" ;;
-esac
+case "$(uname -m)" in aarch64|arm64) A=arm64;; x86_64|amd64) A=x64;; *) A=arm64;; esac
+export LD_LIBRARY_PATH="$ROOT/3rdparty/libwebrtc/lib/linux/$A:${LD_LIBRARY_PATH:-}"
 
-LIB_PATH="${PROJECT_ROOT}/3rdparty/libwebrtc/lib/linux/${ARCH}"
-export LD_LIBRARY_PATH="${LIB_PATH}:${LD_LIBRARY_PATH:-}"
+PUSH="$ROOT/build/bin/webrtc_push_demo"
+SIG="$ROOT/build/bin/signaling_server"
+[ -f "$PUSH" ] && [ -f "$SIG" ] || { echo "先执行: ./scripts/build.sh" >&2; exit 1; }
 
-PUSH_BIN="${PROJECT_ROOT}/build/bin/webrtc_push_demo"
-SIG_BIN="${PROJECT_ROOT}/build/bin/signaling_server"
-
-if [ ! -f "$PUSH_BIN" ] || [ ! -f "$SIG_BIN" ]; then
-    echo "Error: run ./scripts/build.sh first" >&2
-    exit 1
-fi
-
-SIGNALING_PID=""
-cleanup() {
-    if [ -n "${SIGNALING_PID}" ] && kill -0 "${SIGNALING_PID}" 2>/dev/null; then
-        kill "${SIGNALING_PID}" 2>/dev/null || true
-    fi
-}
+PORT="${SIG_ADDR##*:}"
+[[ "$PORT" =~ ^[0-9]+$ ]] || PORT=8765
+SIG_PID=""
+cleanup() { [ -n "$SIG_PID" ] && kill "$SIG_PID" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
-# [E] 信令服务（可选自动启动）
-signaling_port="${SIGNALING_ADDR_EFFECTIVE##*:}"
-if ! [[ "$signaling_port" =~ ^[0-9]+$ ]]; then
-    signaling_port="8765"
-fi
-
 if [ "$START_SIGNALING" = "1" ]; then
-    pkill -f "signaling_server ${signaling_port}" 2>/dev/null || true
     pkill -f "signaling_server" 2>/dev/null || true
     sleep 1
-
-    echo "[push] Starting signaling server: 0.0.0.0:${signaling_port}"
-    "$SIG_BIN" "$signaling_port" &
-    SIGNALING_PID=$!
+    "$SIG" "$PORT" &
+    SIG_PID=$!
     sleep 1
-    if ! kill -0 "$SIGNALING_PID" 2>/dev/null; then
-        echo "Error: signaling server failed to start (port ${signaling_port} may be in use)" >&2
-        exit 1
-    fi
 fi
 
-# [F] 本机回环路由（仅 localhost 信令场景）
 if [ "$AUTO_LOCAL_ROUTE" = "1" ]; then
-    host="${SIGNALING_ADDR_EFFECTIVE%%:*}"
-    if [ "$host" = "127.0.0.1" ] || [ "$host" = "localhost" ]; then
-        local_ip="$(ip -4 route get 1 2>/dev/null | awk '{print $7; exit}' | grep -v '^127\.' || true)"
-        if [ -n "$local_ip" ] && ! ip route show | grep -qE "$local_ip(/32)? dev lo"; then
-            sudo ip route add "$local_ip/32" dev lo 2>/dev/null || true
-        fi
+    H="${SIG_ADDR%%:*}"
+    if [ "$H" = "127.0.0.1" ] || [ "$H" = "localhost" ]; then
+        LIP="$(ip -4 route get 1 2>/dev/null | awk '{print $7; exit}' | grep -v '^127\.' || true)"
+        [ -n "$LIP" ] && ! ip route show | grep -qE "$LIP(/32)? dev lo" && sudo ip route add "$LIP/32" dev lo 2>/dev/null || true
     fi
 fi
 
-# [G] 启动推流
-CMD=("$PUSH_BIN" "--config" "$CONFIG_FILE")
-
-# 仅显式设置时覆盖 config
-if [ -n "${SIGNALING_ADDR+x}" ]; then
-    CMD+=("--signaling" "$SIGNALING_ADDR_EFFECTIVE")
-fi
-if [ -n "${WIDTH+x}" ]; then
-    CMD+=("--width" "$WIDTH")
-fi
-if [ -n "${HEIGHT+x}" ]; then
-    CMD+=("--height" "$HEIGHT")
-fi
-if [ -n "${FPS+x}" ]; then
-    CMD+=("--fps" "$FPS")
-fi
-if [ -n "$STREAM_ID" ]; then
-    CMD+=("$STREAM_ID")
-fi
-if [ -n "$CAMERA" ]; then
-    CMD+=("$CAMERA")
-fi
-
-echo "[push] config=${CONFIG_FILE} signaling=${SIGNALING_ADDR_EFFECTIVE} stream=${STREAM_ID:-<from-config>} camera=${CAMERA:-<from-config>}"
+CMD=("$PUSH" "--config" "$CONFIG")
+[ -n "${SIGNALING_ADDR+x}" ] && CMD+=("--signaling" "$SIG_ADDR")
+[ -n "${WIDTH+x}" ] && CMD+=("--width" "$WIDTH")
+[ -n "${HEIGHT+x}" ] && CMD+=("--height" "$HEIGHT")
+[ -n "${FPS+x}" ] && CMD+=("--fps" "$FPS")
+[ -n "$STREAM_ID" ] && CMD+=("$STREAM_ID")
+[ -n "$CAMERA" ] && CMD+=("$CAMERA")
 exec "${CMD[@]}"

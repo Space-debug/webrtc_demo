@@ -20,6 +20,13 @@ std::vector<UsbCameraInfo> ListUsbCameras();
 /// 获取设备的 bus_info（用于与 libwebrtc 的 device id 匹配）
 std::string GetDeviceBusInfo(const std::string& device_path);
 
+/// 获取设备的 card 名称（VIDIOC_QUERYCAP.card），用于与 libwebrtc GetDeviceName 的 name 对齐
+std::string GetDeviceCardName(const std::string& device_path);
+
+/// 将 /dev/videoN 映射为 libwebrtc DeviceInfo 的 device 序号（与 device_info_v4l2 一致：仅计 CAPTURE 节点）
+/// 成功返回 >=0，否则 -1
+int GetWebRtcCaptureDeviceIndexForPath(const std::string& device_path);
+
 }  // namespace webrtc_demo
 
 #endif  // CAMERA_UTILS_H

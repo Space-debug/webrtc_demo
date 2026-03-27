@@ -16,24 +16,20 @@ webrtc_demo/
 ├── docs/
 ├── include/
 ├── src/
-├── examples/
-│   └── p2p_player/             # SDL2 拉流端
+│   ├── app/                    # 仅两个源文件：push_demo.cpp（推流） pull_demo.cpp（拉流）
+│   └── sdk/                    # webrtc_push_sdk 实现
 ├── scripts/
 │   ├── build.sh                # 编译脚本
 │   ├── push.sh                 # 推流脚本（可自动拉起信令）
 │   └── pull.sh                 # 拉流脚本（本地/远端通用）
 └── 3rdparty/
     └── libwebrtc/
-        ├── include/            # 头文件（全平台共享）
-        └── lib/
-            ├── linux/
-            │   ├── arm64/
-            │   │   └── libwebrtc.so
-            │   └── x64/
-            │       └── libwebrtc.so
-            └── win/
-                └── x64/
+        ├── include/                  # Google WebRTC 官方头文件（api/、rtc_base/、third_party/ 等）
+        ├── lib/linux/arm64/libwebrtc.a   # 官方静态库（当前仅 arm64；x64 需自备）
+        └── docs_webrtc_build/        # 官方包内 build_info 等（若有）
 ```
+
+**注意**：官方头文件与原先 `libwebrtc::` 封装 API 不同，业务源码需改为使用 `webrtc` 原生接口后才能编译通过。
 
 ## 依赖
 
@@ -57,8 +53,8 @@ sudo apt install libjpeg-turbo8-dev
 ```
 
 构建产物：
-- `build/bin/webrtc_push_demo`
-- `build/bin/p2p_player`
+- `build/bin/webrtc_push_demo`（推流演示）
+- `build/bin/webrtc_pull_demo`（拉流演示，需 SDL2；未安装则跳过该目标）
 - `build/bin/signaling_server`
 
 ## 配置文件
@@ -145,13 +141,13 @@ SIGNALING_ADDR=192.168.3.222:8765 ./scripts/push.sh livestream /dev/video11
 
 ```bash
 # 直接运行（收到 30 帧后成功退出，退出码 0）
-./build/bin/p2p_player --headless --frames 30 --timeout-sec 120 192.168.3.222:8765 livestream
+./build/bin/webrtc_pull_demo --headless --frames 30 --timeout-sec 120 192.168.3.222:8765 livestream
 
 # 或用脚本
 HEADLESS=1 HEADLESS_FRAMES=20 ./scripts/pull.sh 192.168.3.222:8765 livestream
 ```
 
-本机一键验证（需摄像头）：`./scripts/test_p2p_headless.sh /dev/video0`
+无头拉流示例：`HEADLESS=1 ./scripts/pull.sh`，或 `webrtc_pull_demo --config config/streams.conf --headless`（`--config` 仅用于与推流一致的信令地址/流 ID，拉流专用参数用命令行或环境变量 `HEADLESS`、`HEADLESS_FRAMES` 等）。
 
 ### 3) 多摄像头推流 + 多客户端拉流
 

@@ -33,8 +33,15 @@ struct PushStreamerConfig {
     int min_bitrate_kbps{100};
     int max_bitrate_kbps{2000};
 
-    // 可变分辨率策略
-    std::string degradation_preference{"maintain_framerate"};
+    // 可变分辨率策略：弱网兼顾画质与流畅时建议 balanced
+    std::string degradation_preference{"balanced"};
+
+    /// 发送：优先 ping「更可能成功」的 ICE 候选对，弱网/多网卡时更快切到可用链路
+    bool ice_prioritize_likely_pairs{true};
+    /// 发送：RTP 的 DSCP 优先级（very_low|low|medium|high），路由器支持时有利于实时媒体
+    std::string video_network_priority{"high"};
+    /// 发送：编码器最大帧率上限，0 表示与 video_fps 一致
+    int video_encoding_max_framerate{0};
 
     // 编解码
     std::string video_codec{"h264"};  /// h264|h265|vp8|vp9|av1
@@ -56,6 +63,8 @@ struct PushStreamerConfig {
     bool latency_stats_enable{false};
     /// 至少间隔多少采集帧才输出一行「窗内平均」（默认 60）
     int latency_stats_window_frames{60};
+    /// LATENCY_STATS 开启时主循环睡眠间隔（ms），降低 GetStats 频率以省 CPU（建议 200～500）
+    int latency_stats_poll_ms{250};
 };
 
 /// SDP 回调：用于将 SDP 发送到信令服务器

@@ -1,88 +1,107 @@
 cmake_minimum_required(VERSION 3.14)
-project(webrtc_push_demo LANGUAGES CXX)
+project(webrtc_push_demo LANGUAGES C CXX)
+
+# gold 链预编译 libwebrtc.a 时 .init_array 易出现 CREL 空槽 → 进 main 前 SIGSEGV；bfd 对其中 .eh_frame 报错。
+# 优先使用 LLVM lld（若已安装：apt install lld），否则回退 gold。
+if(UNIX AND NOT APPLE)
+    find_program(WEBRTC_LD_LLD ld.lld)
+    if(WEBRTC_LD_LLD)
+        # 预编译 libwebrtc 含 CREL：链接期把动态重定位应用到输出，避免 .init_array 全零导致启动崩溃
+        set(CMAKE_EXE_LINKER_FLAGS
+            "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld -Wl,--apply-dynamic-relocs -no-pie")
+    else()
+        find_program(WEBRTC_LD_GOLD ld.gold)
+        if(WEBRTC_LD_GOLD)
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=gold")
+        endif()
+    endif()
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# 输出目录
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-# 平台与架构检测
-if(WIN32)
-    set(LIBWEBRTC_PLATFORM "win")
-elseif(UNIX)
-    set(LIBWEBRTC_PLATFORM "linux")
-else()
-    message(FATAL_ERROR "Unsupported platform")
-endif()
+include(${CMAKE_SOURCE_DIR}/cmake/LibWebRTC.cmake)
+message(STATUS "3rdparty/libwebrtc: 官方头文件 + libwebrtc.a；集成方链接 webrtc_push_sdk 即可获得推/拉流与信令等能力。")
 
+set(WEBRTC_PUSH_SDK_DIR ${CMAKE_SOURCE_DIR}/src/sdk)
+
+set(WEBRTC_SDK_SOURCES
+    ${WEBRTC_PUSH_SDK_DIR}/camera/camera_utils.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/config/config_loader.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/signaling/signaling_client.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/media/push_streamer.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/media/camera_video_track_source.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/media/pull_subscriber.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/webrtc/field_trials.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/webrtc/peer_connection_factory.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/platform/alsa_null_fallback.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/webrtc/compat/sequence_checker_expectation_to_string.cpp
+)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-    set(LIBWEBRTC_ARCH "arm64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
-    set(LIBWEBRTC_ARCH "x64")
-else()
-    message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+    list(APPEND WEBRTC_SDK_SOURCES ${WEBRTC_PUSH_SDK_DIR}/webrtc/sme_abi_stubs.c)
 endif()
 
-# libwebrtc 路径：最外层 include（全平台共享）+ lib/<平台>/<架构>
-set(LIBWEBRTC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/libwebrtc)
-set(LIBWEBRTC_INCLUDE_DIR ${LIBWEBRTC_ROOT}/include)
-set(LIBWEBRTC_LIB_DIR ${LIBWEBRTC_ROOT}/lib/${LIBWEBRTC_PLATFORM}/${LIBWEBRTC_ARCH})
+add_library(webrtc_push_sdk STATIC ${WEBRTC_SDK_SOURCES})
 
-# 检查 libwebrtc 是否存在
-if(NOT EXISTS ${LIBWEBRTC_INCLUDE_DIR})
-    message(FATAL_ERROR "libwebrtc include not found at ${LIBWEBRTC_INCLUDE_DIR}")
-endif()
-if(NOT EXISTS ${LIBWEBRTC_LIB_DIR})
-    message(FATAL_ERROR "libwebrtc lib not found at ${LIBWEBRTC_LIB_DIR}. "
-        "Please ensure 3rdparty/libwebrtc/lib/${LIBWEBRTC_PLATFORM}/${LIBWEBRTC_ARCH} exists.")
-endif()
-
-# 主推流可执行文件
-add_executable(webrtc_push_demo
-    src/main.cpp
-    src/camera_utils/camera_utils.cpp
-    src/config_loader/config_loader.cpp
-    src/signaling_client/signaling_client.cpp
-    src/push_streamer/push_streamer.cpp
-    src/webrtc_field_trials/webrtc_field_trials.cpp
+target_include_directories(webrtc_push_sdk
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+    PRIVATE
+        ${WEBRTC_PUSH_SDK_DIR}
+        ${LIBWEBRTC_INCLUDE_DIR}
+        ${LIBWEBRTC_ABSL_INCLUDE_DIR}
+        ${LIBWEBRTC_LIBYUV_INCLUDE_DIR}
 )
 
-target_include_directories(webrtc_push_demo PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${LIBWEBRTC_INCLUDE_DIR}
-)
-# 与 libwebrtc 构建时的 RTC_DESKTOP_DEVICE 保持一致，否则 vtable 错位导致 CreateVideoTrack 崩溃
-target_compile_definitions(webrtc_push_demo PRIVATE RTC_DESKTOP_DEVICE)
+webrtc_push_link_libwebrtc_static_library(webrtc_push_sdk)
 
-target_link_directories(webrtc_push_demo PRIVATE ${LIBWEBRTC_LIB_DIR})
-if(WIN32)
-    target_link_libraries(webrtc_push_demo PRIVATE webrtc)
-else()
-    target_link_libraries(webrtc_push_demo PRIVATE webrtc pthread dl stdc++)
+add_executable(webrtc_push_demo src/app/push_demo.cpp)
+target_link_libraries(webrtc_push_demo PRIVATE webrtc_push_sdk)
+
+find_package(SDL2 QUIET)
+if(NOT SDL2_FOUND)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(SDL2 QUIET sdl2)
+    endif()
 endif()
-
-# RPATH：使用 $ORIGIN 相对路径，无需 LD_LIBRARY_PATH 即可直接运行
-if(UNIX AND NOT APPLE)
-    set_target_properties(webrtc_push_demo PROPERTIES
-        BUILD_RPATH "\$ORIGIN/../../3rdparty/libwebrtc/lib/linux/${LIBWEBRTC_ARCH}"
-        INSTALL_RPATH "\$ORIGIN/../../3rdparty/libwebrtc/lib/linux/${LIBWEBRTC_ARCH}"
+if(NOT SDL2_FOUND)
+    message(WARNING "SDL2 not found: webrtc_pull_demo will not be built (install libsdl2-dev).")
+else()
+    add_executable(webrtc_pull_demo src/app/pull_demo.cpp)
+    target_include_directories(webrtc_pull_demo PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${LIBWEBRTC_INCLUDE_DIR}
+        ${LIBWEBRTC_ABSL_INCLUDE_DIR}
+        ${LIBWEBRTC_LIBYUV_INCLUDE_DIR}
     )
+    if(TARGET SDL2::SDL2)
+        target_link_libraries(webrtc_pull_demo PRIVATE webrtc_push_sdk SDL2::SDL2)
+    else()
+        target_include_directories(webrtc_pull_demo PRIVATE ${SDL2_INCLUDE_DIRS})
+        target_link_libraries(webrtc_pull_demo PRIVATE webrtc_push_sdk ${SDL2_LIBRARIES})
+    endif()
+    if(UNIX AND NOT APPLE)
+        target_compile_definitions(webrtc_pull_demo PRIVATE WEBRTC_POSIX WEBRTC_LINUX)
+        target_compile_options(webrtc_pull_demo PRIVATE -fpermissive)
+    endif()
 endif()
 
-# 安装规则
+install(TARGETS webrtc_push_sdk ARCHIVE DESTINATION lib)
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/ DESTINATION include
+    FILES_MATCHING PATTERN "*.h")
+
 install(TARGETS webrtc_push_demo RUNTIME DESTINATION bin)
+if(TARGET webrtc_pull_demo)
+    install(TARGETS webrtc_pull_demo RUNTIME DESTINATION bin)
+endif()
 
-# P2P 拉流端（纯控制台，打印帧日志）
-add_subdirectory(examples/p2p_player)
-
-# P2P 信令服务器（纯 TCP，替代 Python）
 if(UNIX)
-    add_executable(signaling_server src/signaling_server/signaling_server.cpp)
+    add_executable(signaling_server src/tools/signaling_server.cpp)
     target_link_libraries(signaling_server PRIVATE pthread stdc++)
     install(TARGETS signaling_server RUNTIME DESTINATION bin)
 endif()
-
