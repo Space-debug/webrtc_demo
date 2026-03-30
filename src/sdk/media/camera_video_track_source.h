@@ -9,12 +9,21 @@
 #include <thread>
 #include <vector>
 
+#if defined(WEBRTC_LINUX) && defined(__linux__)
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#endif
+
 #include "api/scoped_refptr.h"
 #include "api/video/video_sink_interface.h"
 #include "media/base/adapted_video_track_source.h"
 #include "modules/video_capture/video_capture.h"
 
 namespace webrtc_demo {
+#if defined(WEBRTC_LINUX) && defined(__linux__) && defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+class RkMppMjpegDecoder;
+#endif
 
 /// Connects VideoCaptureModule output to AdaptedVideoTrackSource for CreateVideoTrack().
 class CameraVideoTrackSource : public webrtc::AdaptedVideoTrackSource,
@@ -26,8 +35,10 @@ public:
     CameraVideoTrackSource(const CameraVideoTrackSource&) = delete;
     CameraVideoTrackSource& operator=(const CameraVideoTrackSource&) = delete;
 
-    /// Start V4L2 capture on device unique id (from DeviceInfo).
-    bool Start(const char* device_unique_id, int width, int height, int fps);
+    /// Start V4L2 capture on device unique id (from DeviceInfo)。
+    /// prefer_mpp_mjpeg_decode：Linux 且编译启用 MPP 时，MJPEG 直采可尝试硬件解码（见 USE_ROCKCHIP_MPP_MJPEG_DECODE）。
+    bool Start(const char* device_unique_id, int width, int height, int fps,
+               bool prefer_mpp_mjpeg_decode = true);
 
     /// Linux 直采路径在 Start 成功后可用；与 config WIDTH/HEIGHT 对比可判断是否要改配置以减少缩放。
     bool GetNegotiatedCaptureSize(int* width, int* height) const;
@@ -51,12 +62,22 @@ public:
 
 private:
     std::atomic<uint32_t> captured_frames_{0};
+    bool prefer_mpp_mjpeg_decode_{true};
 #if defined(WEBRTC_LINUX) && defined(__linux__)
     bool StartDirectV4l2(const char* device_path, int width, int height, int fps);
     void StopDirectV4l2();
     void DirectCaptureThreadMain();
+    /// MJPEG：拷贝压缩帧后尽快 QBUF；在此线程里解码并 OnFrame，避免采集线程被 MPP/软解拖死。
+    void DecodeWorkerThreadMain();
+    void ProcessV4l2CapturedFrame(const uint8_t* src, size_t bytesused);
 
     std::thread direct_thread_;
+    std::thread decode_thread_;
+    std::mutex jpeg_queue_mu_;
+    std::condition_variable jpeg_queue_cv_;
+    std::deque<std::vector<uint8_t>> jpeg_queue_;
+    bool decode_worker_exit_{false};
+    static constexpr size_t kJpegQueueMax = 8;
     std::atomic<bool> direct_run_{false};
     int direct_fd_{-1};
     int direct_cap_w_{0};
@@ -64,6 +85,9 @@ private:
     uint32_t direct_pixfmt_{0};
     std::vector<void*> direct_mmap_;
     std::vector<size_t> direct_mmap_len_;
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    std::unique_ptr<RkMppMjpegDecoder> mjpeg_mpp_;
+#endif
 #endif
     webrtc::scoped_refptr<webrtc::VideoCaptureModule> vcm_;
     std::unique_ptr<webrtc::VideoCaptureModule::DeviceInfo> device_info_;

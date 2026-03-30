@@ -53,9 +53,9 @@ void PrintUsage(const char* prog) {
               << "  --test-capture    Capture only, 10s, print frame count, exit\n"
               << "  --test-encode     Loopback H264 test, 10s, exit\n"
               << "  --signaling ADDR  Signaling server (default 127.0.0.1:8765)\n"
-              << "  --width W         Video width (default 640)\n"
-              << "  --height H        Video height (default 360)\n"
-              << "  --fps F           Frame rate (default 15)\n"
+              << "  --width W         Video width（无 config 时默认 1280，720p）\n"
+              << "  --height H        Video height（无 config 时默认 720）\n"
+              << "  --fps F           Frame rate（无 config 时默认 30）\n"
               << "  --no-audio        Video only (same as ENABLE_AUDIO=0)\n"
               << "  --enable-audio    Allow audio in SDP (no mic capture)\n"
               << "  --enable-flexfec  FlexFEC-03 (peer must match)\n"
@@ -206,6 +206,11 @@ int main(int argc, char* argv[]) {
             config.h264_level = "3.0";
         }
         config.keyframe_interval = cfg.GetStreamInt(stream_id, "KEYFRAME_INTERVAL", 0);
+        config.use_rockchip_mpp_h264 = cfg.GetStreamInt(stream_id, "USE_ROCKCHIP_MPP_H264", 1) != 0;
+        config.use_rockchip_mpp_mjpeg_decode =
+            cfg.GetStreamInt(stream_id, "USE_ROCKCHIP_MPP_MJPEG_DECODE", 1) != 0;
+        config.use_rockchip_dual_mpp_mjpeg_h264 =
+            cfg.GetStreamInt(stream_id, "USE_DUAL_MPP_MJPEG_H264", 0) != 0;
         config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
         config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
         config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);
@@ -333,6 +338,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[Main] Config: stream_id=" << config.stream_id
               << " resolution=" << config.video_width << "x" << config.video_height
               << " fps=" << config.video_fps
+              << " rockchip_mpp_h264=" << (config.use_rockchip_mpp_h264 ? "on" : "off")
               << " bitrate=" << config.target_bitrate_kbps << "kbps(" << config.bitrate_mode << ")"
               << " ice_prioritize_likely=" << (config.ice_prioritize_likely_pairs ? "on" : "off")
               << " video_net_prio=" << config.video_network_priority

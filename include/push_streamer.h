@@ -1,6 +1,7 @@
 #ifndef PUSH_STREAMER_H
 #define PUSH_STREAMER_H
 
+#include <atomic>
 #include <functional>
 #include <iosfwd>
 #include <memory>
@@ -12,8 +13,8 @@ namespace webrtc_demo {
 /// 推流配置
 struct PushStreamerConfig {
     std::string stream_id{"stream_001"};
-    int video_width{640};
-    int video_height{480};
+    int video_width{1280};
+    int video_height{720};
     int video_fps{30};
     int video_device_index{0};      /// 设备索引，与 --list-cameras 输出对应
     std::string video_device_path;  /// 设备路径，如 /dev/video11，优先于 index
@@ -53,6 +54,14 @@ struct PushStreamerConfig {
     int capture_gate_min_frames{0};
     /// 等待采集门限的最长时间（秒），超时则放弃本次 Offer 并打日志
     int capture_gate_max_wait_sec{20};
+
+    /// RK3588 等：H.264 优先 MPP 硬件编码（需 CMake 检测到 rockchip_mpp）。关则用纯软件编码工厂。
+    bool use_rockchip_mpp_h264{true};
+    /// 直采 MJPEG 时用 MPP 解码为 NV12 再转 I420；关则 libyuv 软解。
+    bool use_rockchip_mpp_mjpeg_decode{true};
+    /// 为 true 时允许与 USE_ROCKCHIP_MPP_H264 同时开启 MPP MJPEG 解码（采集硬解 + 编码硬编）。
+    /// 默认 false：部分旧 BSP 同进程双 MPP 曾不稳定；RK 新 BSP + 当前 GStreamer 风格 MJPEG 解码可尝试设为 1。
+    bool use_rockchip_dual_mpp_mjpeg_h264{false};
 
     /// FlexFEC-03：在 LibWebRTC::Initialize 前注入 WEBRTC_FIELD_TRIALS；拉流端也需开启
     bool enable_flexfec{false};
@@ -128,7 +137,7 @@ public:
     unsigned int GetDecodedFrameCount() const;
 
     /// 是否正在推流
-    bool IsStreaming() const { return is_streaming_; }
+    bool IsStreaming() const { return is_streaming_.load(std::memory_order_acquire); }
 
     /// GetStats one-line latency summary per active PeerConnection (English logs).
     void LogLatencyStatsForAllPeers(std::ostream& out);
@@ -139,7 +148,7 @@ public:
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
-    bool is_streaming_{false};
+    std::atomic<bool> is_streaming_{false};
 };
 
 }  // namespace webrtc_demo

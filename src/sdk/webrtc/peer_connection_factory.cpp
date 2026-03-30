@@ -2,6 +2,7 @@
 
 #include "webrtc_peer_connection_factory.h"
 
+#include <cstdlib>
 #include <memory>
 
 #include "api/audio/builtin_audio_processing_builder.h"
@@ -14,10 +15,15 @@
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "rtc_base/thread.h"
 
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+#include "webrtc/rk_mpp_video_encoder_factory.h"
+#endif
+
 namespace webrtc_demo {
 
 void ConfigurePeerConnectionFactoryDependencies(
-    webrtc::PeerConnectionFactoryDependencies& deps) {
+    webrtc::PeerConnectionFactoryDependencies& deps,
+    const PeerConnectionFactoryMediaOptions* media_options) {
   if (deps.task_queue_factory == nullptr) {
     deps.task_queue_factory = webrtc::CreateDefaultTaskQueueFactory();
   }
@@ -45,7 +51,19 @@ void ConfigurePeerConnectionFactoryDependencies(
 #pragma GCC diagnostic pop
 #endif
   if (deps.video_encoder_factory == nullptr) {
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    const bool want_mpp = media_options && media_options->prefer_rockchip_mpp_h264;
+    const char* dis = std::getenv("WEBRTC_DISABLE_MPP_H264");
+    const bool env_disable = dis && dis[0] == '1' && dis[1] == '\0';
+    if (want_mpp && !env_disable) {
+      deps.video_encoder_factory = CreateRockchipMppPreferredVideoEncoderFactory();
+    } else {
+      deps.video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
+    }
+#else
+    (void)media_options;
     deps.video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
+#endif
   }
   if (deps.video_decoder_factory == nullptr) {
     deps.video_decoder_factory = webrtc::CreateBuiltinVideoDecoderFactory();

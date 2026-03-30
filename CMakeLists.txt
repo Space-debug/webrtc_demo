@@ -29,6 +29,10 @@ message(STATUS "3rdparty/libwebrtc: 官方头文件 + libwebrtc.a；集成方链
 
 set(WEBRTC_PUSH_SDK_DIR ${CMAKE_SOURCE_DIR}/src/sdk)
 
+option(WEBRTC_DEMO_ENABLE_ROCKCHIP_MPP
+    "Use Rockchip MPP for H.264 hardware encode when librockchip_mpp is present (e.g. RK3588 BSP)"
+    ON)
+
 set(WEBRTC_SDK_SOURCES
     ${WEBRTC_PUSH_SDK_DIR}/camera/camera_utils.cpp
     ${WEBRTC_PUSH_SDK_DIR}/config/config_loader.cpp
@@ -41,6 +45,24 @@ set(WEBRTC_SDK_SOURCES
     ${WEBRTC_PUSH_SDK_DIR}/platform/alsa_null_fallback.cpp
     ${WEBRTC_PUSH_SDK_DIR}/webrtc/compat/sequence_checker_expectation_to_string.cpp
 )
+
+if(WEBRTC_DEMO_ENABLE_ROCKCHIP_MPP AND UNIX AND NOT APPLE)
+    # 勿事先 set 同名变量，否则会遮蔽 find_* 写入的 CACHE，导致永远判定为未找到。
+    find_path(WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE rk_mpi.h
+        PATHS /usr/include/rockchip
+        DOC "Rockchip MPP headers (rk_mpi.h)")
+    find_library(WEBRTC_DEMO_ROCKCHIP_MPP_LIB rockchip_mpp
+        PATHS /usr/lib/aarch64-linux-gnu /usr/lib/arm-linux-gnueabihf /usr/lib)
+    if(WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE AND WEBRTC_DEMO_ROCKCHIP_MPP_LIB)
+        list(APPEND WEBRTC_SDK_SOURCES
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_h264_encoder.cpp
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_mjpeg_decoder.cpp
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_video_encoder_factory.cpp)
+        message(STATUS "Rockchip MPP: enabled for hardware H264 (${WEBRTC_DEMO_ROCKCHIP_MPP_LIB})")
+    else()
+        message(STATUS "Rockchip MPP: not found (optional); H264 stays software-only on this build host")
+    endif()
+endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     list(APPEND WEBRTC_SDK_SOURCES ${WEBRTC_PUSH_SDK_DIR}/webrtc/sme_abi_stubs.c)
 endif()
@@ -56,6 +78,12 @@ target_include_directories(webrtc_push_sdk
         ${LIBWEBRTC_ABSL_INCLUDE_DIR}
         ${LIBWEBRTC_LIBYUV_INCLUDE_DIR}
 )
+
+if(WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE)
+    target_include_directories(webrtc_push_sdk PRIVATE ${WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE})
+    target_compile_definitions(webrtc_push_sdk PRIVATE WEBRTC_DEMO_HAVE_ROCKCHIP_MPP=1)
+    target_link_libraries(webrtc_push_sdk PUBLIC ${WEBRTC_DEMO_ROCKCHIP_MPP_LIB})
+endif()
 
 webrtc_push_link_libwebrtc_static_library(webrtc_push_sdk)
 
@@ -87,7 +115,9 @@ else()
     endif()
     if(UNIX AND NOT APPLE)
         target_compile_definitions(webrtc_pull_demo PRIVATE WEBRTC_POSIX WEBRTC_LINUX)
-        target_compile_options(webrtc_pull_demo PRIVATE -fpermissive)
+        target_compile_options(webrtc_pull_demo PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-fpermissive>
+            $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
     endif()
 endif()
 

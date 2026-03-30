@@ -1,5 +1,6 @@
 #!/bin/bash
-# 推流：读 config/streams.conf，可选自动起信令、本机回环路由
+# 推流（本机测试推荐入口）：读 config/streams.conf，可选自动起信令、本机回环路由。
+# 拉流测试：另开终端执行 ./scripts/pull.sh（默认无头，持续拉流至断连或 Ctrl+C）。
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
@@ -29,9 +30,10 @@ AUTO_LOCAL_ROUTE="${AUTO_LOCAL_ROUTE:-$(cfg_get AUTO_LOCAL_ROUTE 1)}"
 case "$(uname -m)" in aarch64|arm64) A=arm64;; x86_64|amd64) A=x64;; *) A=arm64;; esac
 export LD_LIBRARY_PATH="$ROOT/3rdparty/libwebrtc/lib/linux/$A:${LD_LIBRARY_PATH:-}"
 
-PUSH="$ROOT/build/bin/webrtc_push_demo"
-SIG="$ROOT/build/bin/signaling_server"
-[ -f "$PUSH" ] && [ -f "$SIG" ] || { echo "先执行: ./scripts/build.sh" >&2; exit 1; }
+BIN_DIR="${WEBRTC_DEMO_BIN:-$ROOT/build/bin}"
+PUSH="$BIN_DIR/webrtc_push_demo"
+SIG="$BIN_DIR/signaling_server"
+[ -f "$PUSH" ] && [ -f "$SIG" ] || { echo "先执行: ./scripts/build.sh 或设置 WEBRTC_DEMO_BIN" >&2; exit 1; }
 
 PORT="${SIG_ADDR##*:}"
 [[ "$PORT" =~ ^[0-9]+$ ]] || PORT=8765

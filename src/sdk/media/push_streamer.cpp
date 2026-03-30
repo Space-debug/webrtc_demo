@@ -55,6 +55,45 @@ namespace webrtc_demo {
 
 namespace {
 
+/// 部分平台在双 PC 回环下 PeerConnection::Close 可能长期阻塞；超时后放弃等待，由进程退出收尾。
+/// @return true 表示 Close 在线程内已返回；false 表示超时（可能仍有后台线程卡在 Close 内）。
+static bool ClosePeerConnectionWithDeadline(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc,
+                                            const char* log_tag,
+                                            int timeout_sec) {
+    if (!pc) {
+        return true;
+    }
+    std::packaged_task<void()> task([pc]() { pc->Close(); });
+    std::future<void> done = task.get_future();
+    std::thread worker(std::move(task));
+    if (done.wait_for(std::chrono::seconds(timeout_sec)) != std::future_status::ready) {
+        std::cerr << "[PushStreamer] " << log_tag << " PeerConnection::Close exceeded " << timeout_sec
+                  << "s; continuing shutdown\n"
+                  << std::flush;
+        worker.detach();
+        return false;
+    }
+    worker.join();
+    return true;
+}
+
+static void StopWebrtcThreadWithDeadline(webrtc::Thread* thread, int timeout_sec) {
+    if (!thread) {
+        return;
+    }
+    std::packaged_task<void()> task([thread]() { thread->Stop(); });
+    std::future<void> done = task.get_future();
+    std::thread worker(std::move(task));
+    if (done.wait_for(std::chrono::seconds(timeout_sec)) != std::future_status::ready) {
+        std::cerr << "[PushStreamer] webrtc signaling Thread::Stop exceeded " << timeout_sec
+                  << "s; continuing shutdown\n"
+                  << std::flush;
+        worker.detach();
+        return;
+    }
+    worker.join();
+}
+
 static std::optional<double> AttrToDoubleMs(const webrtc::Attribute& a) {
     if (!a.has_value()) {
         return std::nullopt;
@@ -764,7 +803,7 @@ private:
             return;
         }
         auto track = r->track();
-        if (!track || track->kind() != "video") {
+        if (!track || track->kind() != webrtc::MediaStreamTrackInterface::kVideoKind) {
             return;
         }
         auto* vt = static_cast<webrtc::VideoTrackInterface*>(track.get());
@@ -774,13 +813,21 @@ private:
         if (!decoded_sink_) {
             decoded_sink_ = std::make_unique<DecodedFrameSink>();
         }
-        decoded_track_ = vt;
-        vt->AddOrUpdateSink(decoded_sink_.get(), webrtc::VideoSinkWants());
+        // OnTrack + OnAddTrack 可能各回调一次；换 track 时必须先从旧 track 摘掉 sink，否则 Teardown 后旧 track
+        // 仍向已销毁的 DecodedFrameSink 投递帧 → 段错误。
+        if (decoded_track_.get() == vt) {
+            return;
+        }
+        if (decoded_track_) {
+            decoded_track_->RemoveSink(decoded_sink_.get());
+        }
+        decoded_track_ = webrtc::scoped_refptr<webrtc::VideoTrackInterface>(vt);
+        decoded_track_->AddOrUpdateSink(decoded_sink_.get(), webrtc::VideoSinkWants());
     }
 
     AddCandidateFn add_to_sender_;
     std::unique_ptr<DecodedFrameSink> decoded_sink_;
-    webrtc::VideoTrackInterface* decoded_track_{nullptr};
+    webrtc::scoped_refptr<webrtc::VideoTrackInterface> decoded_track_;
 };
 
 namespace {
@@ -943,7 +990,9 @@ public:
         }
 
         webrtc::PeerConnectionFactoryDependencies deps;
-        webrtc_demo::ConfigurePeerConnectionFactoryDependencies(deps);
+        webrtc_demo::PeerConnectionFactoryMediaOptions media_opts;
+        media_opts.prefer_rockchip_mpp_h264 = config_.use_rockchip_mpp_h264;
+        webrtc_demo::ConfigurePeerConnectionFactoryDependencies(deps, &media_opts);
         if (!config_.enable_audio) {
             EnableAlsaNullDeviceFallback();
         }
@@ -966,24 +1015,25 @@ public:
         frame_counter_.reset();
         camera_impl_ = nullptr;
 
+        // 回环：先关 receiver（易阻塞，带超时），再关 sender 与多路 PC（与 pull_subscriber 一致，均在 Shutdown 调用线程上 Close）。
         if (loopback_observer_) {
             loopback_observer_->Teardown();
         }
+        if (receiver_) {
+            webrtc::scoped_refptr<webrtc::PeerConnectionInterface> recv = receiver_;
+            receiver_ = nullptr;
+            ClosePeerConnectionWithDeadline(recv, "loopback receiver", 8);
+        }
         loopback_observer_.reset();
 
-        if (receiver_) {
-            receiver_->Close();
-            receiver_ = nullptr;
-        }
-
         if (peer_connection_) {
-            peer_connection_->Close();
+            webrtc::scoped_refptr<webrtc::PeerConnectionInterface> sender = peer_connection_;
             peer_connection_ = nullptr;
+            ClosePeerConnectionWithDeadline(sender, "publisher", 8);
         }
-
         for (auto& kv : peer_connections_) {
             if (kv.second) {
-                kv.second->Close();
+                ClosePeerConnectionWithDeadline(kv.second, "subscriber", 8);
             }
         }
         peer_connections_.clear();
@@ -996,7 +1046,9 @@ public:
         factory_ = nullptr;
 
         if (owned_signaling_thread_) {
-            owned_signaling_thread_->Stop();
+            if (!owned_signaling_thread_->IsCurrent()) {
+                StopWebrtcThreadWithDeadline(owned_signaling_thread_.get(), 6);
+            }
             owned_signaling_thread_.reset();
         }
 
@@ -1308,8 +1360,25 @@ public:
             camera_source_->AddOrUpdateSink(frame_counter_.get(), webrtc::VideoSinkWants());
         }
 
+        bool mpp_mjpeg_decode = config_.use_rockchip_mpp_mjpeg_decode;
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+        bool allow_dual_mpp = config_.use_rockchip_dual_mpp_mjpeg_h264;
+        if (const char* ev = std::getenv("WEBRTC_DUAL_MPP_MJPEG_H264")) {
+            if (ev[0] == '1' || ev[0] == 'y' || ev[0] == 'Y' || ev[0] == 't' || ev[0] == 'T') {
+                allow_dual_mpp = true;
+            }
+        }
+        if (mpp_mjpeg_decode && config_.use_rockchip_mpp_h264 && !allow_dual_mpp) {
+            mpp_mjpeg_decode = false;
+            std::cout << "[PushStreamer] MPP MJPEG decode off while MPP H.264 encode on (use libyuv for MJPEG). "
+                         "Set USE_DUAL_MPP_MJPEG_H264=1 or WEBRTC_DUAL_MPP_MJPEG_H264=1 to enable both.\n";
+        } else if (mpp_mjpeg_decode && config_.use_rockchip_mpp_h264 && allow_dual_mpp) {
+            std::cout << "[PushStreamer] Dual MPP: MJPEG hardware decode + H.264 hardware encode (experimental).\n";
+        }
+#endif
         if (!static_cast<CameraVideoTrackSource*>(cam_holder)
-                 ->Start(unique_id.c_str(), config_.video_width, config_.video_height, config_.video_fps)) {
+                 ->Start(unique_id.c_str(), config_.video_width, config_.video_height, config_.video_fps,
+                         mpp_mjpeg_decode)) {
             std::cerr << "[PushStreamer] CameraVideoTrackSource::Start failed" << std::endl;
             if (frame_counter_ && camera_source_) {
                 camera_source_->RemoveSink(frame_counter_.get());
@@ -1622,17 +1691,35 @@ public:
     }
 
     void DoLoopbackExchange(const std::string& offer_type, const std::string& offer_sdp) {
+        if (std::getenv("WEBRTC_SKIP_LOOPBACK_RECV")) {
+            std::cout << "[PushStreamer] Loopback skipped (WEBRTC_SKIP_LOOPBACK_RECV=1)\n";
+            return;
+        }
         std::cout << "[PushStreamer] Loopback: creating receiver PC..." << std::endl;
         auto rtc_config = MakeRtcConfiguration(config_);
         loopback_observer_ = std::make_unique<LoopbackPcObserver>(
             [this](const std::string& mid, int idx, const std::string& cand) {
-                if (peer_connection_) {
+                webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc = peer_connection_;
+                if (!pc) {
+                    return;
+                }
+                webrtc::Thread* sig = pc->signaling_thread();
+                if (!sig) {
+                    return;
+                }
+                auto work = [pc, mid, idx, cand]() {
                     webrtc::SdpParseError err;
                     auto* ic = webrtc::CreateIceCandidate(mid, idx, cand, &err);
-                    if (ic) {
-                        std::unique_ptr<webrtc::IceCandidateInterface> o(ic);
-                        peer_connection_->AddIceCandidate(o.get());
+                    if (!ic) {
+                        return;
                     }
+                    std::unique_ptr<webrtc::IceCandidateInterface> o(ic);
+                    pc->AddIceCandidate(o.get());
+                };
+                if (sig->IsCurrent()) {
+                    work();
+                } else {
+                    sig->BlockingCall(work);
                 }
             });
         receiver_ = CreatePcWithObserver(loopback_observer_.get(), rtc_config);
@@ -1775,11 +1862,26 @@ public:
             return;
         }
         if (config_.test_encode_mode && receiver_) {
-            webrtc::SdpParseError err;
-            auto* ic = webrtc::CreateIceCandidate(candidate->sdp_mid(), candidate->sdp_mline_index(), sdp, &err);
-            if (ic) {
+            webrtc::scoped_refptr<webrtc::PeerConnectionInterface> recv = receiver_;
+            webrtc::Thread* sig = recv->signaling_thread();
+            if (!sig) {
+                return;
+            }
+            const std::string mid = candidate->sdp_mid();
+            const int mline_index = candidate->sdp_mline_index();
+            auto work = [recv, mid, mline_index, sdp]() {
+                webrtc::SdpParseError err;
+                auto* ic = webrtc::CreateIceCandidate(mid, mline_index, sdp, &err);
+                if (!ic) {
+                    return;
+                }
                 std::unique_ptr<webrtc::IceCandidateInterface> o(ic);
-                receiver_->AddIceCandidate(o.get());
+                recv->AddIceCandidate(o.get());
+            };
+            if (sig->IsCurrent()) {
+                work();
+            } else {
+                sig->BlockingCall(work);
             }
         } else if (on_ice_candidate_) {
             on_ice_candidate_("", candidate->sdp_mid(), candidate->sdp_mline_index(), sdp);
@@ -1936,7 +2038,7 @@ PushStreamer::~PushStreamer() {
 }
 
 bool PushStreamer::Start() {
-    if (is_streaming_) {
+    if (is_streaming_.load(std::memory_order_acquire)) {
         return true;
     }
     if (!impl_->Initialize()) {
@@ -1945,16 +2047,16 @@ bool PushStreamer::Start() {
     if (!impl_->TestCaptureOnly() && !impl_->SignalingSubscriberOfferOnly()) {
         impl_->CreateOffer();
     }
-    is_streaming_ = true;
+    is_streaming_.store(true, std::memory_order_release);
     return true;
 }
 
 void PushStreamer::Stop() {
-    if (!is_streaming_) {
+    // exchange：SIGTERM 等信号在 Shutdown 阻塞时重入 Stop 时不得第二次 Shutdown。
+    if (!is_streaming_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
     impl_->Shutdown();
-    is_streaming_ = false;
 }
 
 bool PushStreamer::SetRemoteDescription(const std::string& type, const std::string& sdp) {

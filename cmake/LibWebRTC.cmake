@@ -73,7 +73,11 @@ function(webrtc_push_target_use_libwebrtc target)
     endif()
     if(UNIX AND NOT APPLE)
         target_compile_definitions(${target} PRIVATE WEBRTC_POSIX WEBRTC_LINUX)
-        target_compile_options(${target} PRIVATE -fpermissive)
+        # 仅 C++：避免 sme_abi_stubs.c 等 .c 源报「-fpermissive 不适用于 C」
+        # -Wno-deprecated-declarations：压制第三方头里 SignalEvent 等弃用告警（非业务代码）
+        target_compile_options(${target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-fpermissive>
+            $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
     endif()
 endfunction()
 
@@ -86,6 +90,8 @@ function(webrtc_push_link_libwebrtc_static_library target)
     endif()
     if(UNIX AND NOT APPLE)
         target_compile_definitions(${target} PRIVATE WEBRTC_POSIX WEBRTC_LINUX)
-        target_compile_options(${target} PRIVATE -fpermissive)
+        target_compile_options(${target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-fpermissive>
+            $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
     endif()
 endfunction()

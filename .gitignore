@@ -1,5 +1,7 @@
 # Build
 build/
+build_mpp/
+build_mpp_test/
 
 cmake-build-*/
 *.o
@@ -19,3 +21,9 @@ config/config.json
 
 # Logs
 *.log
+
+# 本地调试/测试输出目录
+nv12_debug/
+nv12_gst_success/
+nv12_gst_test/
+nv12_test_output/

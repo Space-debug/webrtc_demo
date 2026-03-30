@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "api/video/i420_buffer.h"
+#include "api/video/nv12_buffer.h"
 #include "api/video/video_frame.h"
 #include "common_video/libyuv/include/webrtc_libyuv.h"
 #include "modules/video_capture/video_capture_factory.h"
@@ -12,6 +13,9 @@
 #include "libyuv/convert.h"
 
 #if defined(WEBRTC_LINUX) && defined(__linux__)
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+#include "webrtc/rk_mpp_mjpeg_decoder.h"
+#endif
 #include <cerrno>
 #include <fcntl.h>
 #include <linux/videodev2.h>
@@ -52,6 +56,22 @@ void CameraVideoTrackSource::StopDirectV4l2() {
     if (direct_thread_.joinable()) {
         direct_thread_.join();
     }
+    {
+        std::lock_guard<std::mutex> lk(jpeg_queue_mu_);
+        decode_worker_exit_ = true;
+    }
+    jpeg_queue_cv_.notify_all();
+    if (decode_thread_.joinable()) {
+        decode_thread_.join();
+    }
+    {
+        std::lock_guard<std::mutex> lk(jpeg_queue_mu_);
+        jpeg_queue_.clear();
+    }
+    decode_worker_exit_ = false;
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    mjpeg_mpp_.reset();
+#endif
     if (direct_fd_ >= 0) {
         enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(direct_fd_, VIDIOC_STREAMOFF, &t);
@@ -185,8 +205,16 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
         return direct_cap_w_ == w && direct_cap_h_ == h;
     };
 
-    bool fmt_ok =
-        try_sfmt_exact(mjpeg, width, height) || try_sfmt_exact(yuyv, width, height);
+    // 同分辨率：默认优先 YUYV，避免 MJPEG 软解；开启 MPP MJPEG 硬解时优先 MJPEG（多数 UVC 在 720p 等档位上
+    // MJPEG 帧率远高于 YUYV，原先先 YUYV 会锁在 10fps 且永远测不到硬解路径）。
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    const bool prefer_mjpeg_pixfmt = prefer_mpp_mjpeg_decode_;
+#else
+    const bool prefer_mjpeg_pixfmt = false;
+#endif
+    bool fmt_ok = prefer_mjpeg_pixfmt
+                      ? (try_sfmt_exact(mjpeg, width, height) || try_sfmt_exact(yuyv, width, height))
+                      : (try_sfmt_exact(yuyv, width, height) || try_sfmt_exact(mjpeg, width, height));
 
     // 设备已是目标分辨率但 S_FMT(改分辨率) 失败时，只切像素格式或直接使用当前帧格式。
     if (!fmt_ok) {
@@ -201,7 +229,8 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
                 direct_pixfmt_ = pf;
                 fmt_ok = true;
             } else {
-                fmt_ok = try_sfmt_keep_size(mjpeg) || try_sfmt_keep_size(yuyv);
+                fmt_ok = prefer_mjpeg_pixfmt ? (try_sfmt_keep_size(mjpeg) || try_sfmt_keep_size(yuyv))
+                                             : (try_sfmt_keep_size(yuyv) || try_sfmt_keep_size(mjpeg));
                 if (fmt_ok && (direct_cap_w_ != width || direct_cap_h_ != height)) {
                     fmt_ok = false;
                 }
@@ -299,11 +328,90 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
     }
 
     direct_run_ = true;
+    decode_worker_exit_ = false;
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    if (prefer_mpp_mjpeg_decode_ && direct_pixfmt_ == V4L2_PIX_FMT_MJPEG) {
+        auto dec = std::make_unique<RkMppMjpegDecoder>();
+        if (dec->Init()) {
+            mjpeg_mpp_ = std::move(dec);
+            std::cout << "[CameraV4L2] MJPEG: Rockchip MPP decode -> NV12 (硬编路径零 I420/libyuv 色度转换)\n";
+        }
+    }
+#endif
+    const bool mjpeg_async = (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG));
+    if (mjpeg_async) {
+        decode_thread_ = std::thread([this]() { DecodeWorkerThreadMain(); });
+    }
     direct_thread_ = std::thread([this]() { DirectCaptureThreadMain(); });
     std::cout << "[CameraV4L2] Direct capture " << device_path << " " << direct_cap_w_ << "x" << direct_cap_h_
               << " @" << (fps > 0 ? fps : 30) << "fps fourcc=0x" << std::hex << direct_pixfmt_ << std::dec
               << std::endl;
     return true;
+}
+
+void CameraVideoTrackSource::DecodeWorkerThreadMain() {
+    while (true) {
+        std::vector<uint8_t> job;
+        {
+            std::unique_lock<std::mutex> lk(jpeg_queue_mu_);
+            jpeg_queue_cv_.wait(lk, [this] { return decode_worker_exit_ || !jpeg_queue_.empty(); });
+            if (decode_worker_exit_ && jpeg_queue_.empty()) {
+                break;
+            }
+            if (!jpeg_queue_.empty()) {
+                job = std::move(jpeg_queue_.front());
+                jpeg_queue_.pop_front();
+            }
+        }
+        if (!job.empty()) {
+            ProcessV4l2CapturedFrame(job.data(), job.size());
+        }
+    }
+}
+
+void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t bytesused) {
+    if (!src || bytesused == 0) {
+        return;
+    }
+    const int w = direct_cap_w_;
+    const int h = direct_cap_h_;
+    bool ok = false;
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    if (mjpeg_mpp_ && direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
+        webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 = webrtc::NV12Buffer::Create(w, h);
+        if (mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get())) {
+            webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                           .set_video_frame_buffer(nv12)
+                                           .set_timestamp_us(webrtc::TimeMicros())
+                                           .set_rotation(webrtc::kVideoRotation_0)
+                                           .build();
+            OnFrame(frame);
+            return;
+        }
+    }
+#endif
+    webrtc::scoped_refptr<webrtc::I420Buffer> i420 = webrtc::I420Buffer::Create(w, h);
+    {
+        const webrtc::VideoType vtype = (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG))
+                                              ? webrtc::VideoType::kMJPEG
+                                              : webrtc::VideoType::kYUY2;
+        int conv = libyuv::ConvertToI420(src, bytesused, i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),
+                                         i420->StrideU(), i420->MutableDataV(), i420->StrideV(), 0, 0, w, h, w, h,
+                                         libyuv::kRotate0, webrtc::ConvertVideoType(vtype));
+        if (conv != 0 && direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
+            conv = libyuv::MJPGToI420(src, bytesused, i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),
+                                      i420->StrideU(), i420->MutableDataV(), i420->StrideV(), w, h, w, h);
+        }
+        ok = (conv == 0);
+    }
+    if (ok) {
+        webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                       .set_video_frame_buffer(i420)
+                                       .set_timestamp_us(webrtc::TimeMicros())
+                                       .set_rotation(webrtc::kVideoRotation_0)
+                                       .build();
+        OnFrame(frame);
+    }
 }
 
 void CameraVideoTrackSource::DirectCaptureThreadMain() {
@@ -326,31 +434,23 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
             continue;
         }
         const uint8_t* src = static_cast<const uint8_t*>(direct_mmap_[buf.index]);
-        const int w = direct_cap_w_;
-        const int h = direct_cap_h_;
-        webrtc::scoped_refptr<webrtc::I420Buffer> i420 = webrtc::I420Buffer::Create(w, h);
-        // 与 modules/video_capture/video_capture_impl.cc 一致：MJPEG 走 ConvertToI420+ConvertVideoType，
-        // 比单独 MJPGToI420 支持更多 UVC JPEG 子采样。
-        const webrtc::VideoType vtype = (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG))
-                                            ? webrtc::VideoType::kMJPEG
-                                            : webrtc::VideoType::kYUY2;
-        int conv = libyuv::ConvertToI420(src, buf.bytesused, i420->MutableDataY(), i420->StrideY(),
-                                         i420->MutableDataU(), i420->StrideU(), i420->MutableDataV(),
-                                         i420->StrideV(), 0, 0, w, h, w, h, libyuv::kRotate0,
-                                         webrtc::ConvertVideoType(vtype));
-        if (conv != 0 && direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
-            conv = libyuv::MJPGToI420(src, buf.bytesused, i420->MutableDataY(), i420->StrideY(),
-                                      i420->MutableDataU(), i420->StrideU(), i420->MutableDataV(),
-                                      i420->StrideV(), w, h, w, h);
+        if (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
+            if (buf.bytesused > 0) {
+                std::vector<uint8_t> copy(buf.bytesused);
+                memcpy(copy.data(), src, buf.bytesused);
+                {
+                    std::lock_guard<std::mutex> lk(jpeg_queue_mu_);
+                    while (jpeg_queue_.size() >= kJpegQueueMax) {
+                        jpeg_queue_.pop_front();
+                    }
+                    jpeg_queue_.push_back(std::move(copy));
+                }
+                jpeg_queue_cv_.notify_one();
+            }
+            ioctl(direct_fd_, VIDIOC_QBUF, &buf);
+            continue;
         }
-        if (conv == 0) {
-            webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
-                                           .set_video_frame_buffer(i420)
-                                           .set_timestamp_us(webrtc::TimeMicros())
-                                           .set_rotation(webrtc::kVideoRotation_0)
-                                           .build();
-            OnFrame(frame);
-        }
+        ProcessV4l2CapturedFrame(src, buf.bytesused);
         ioctl(direct_fd_, VIDIOC_QBUF, &buf);
     }
 }
@@ -369,8 +469,10 @@ void CameraVideoTrackSource::Stop() {
     device_info_.reset();
 }
 
-bool CameraVideoTrackSource::Start(const char* device_unique_id, int width, int height, int fps) {
+bool CameraVideoTrackSource::Start(const char* device_unique_id, int width, int height, int fps,
+                                   bool prefer_mpp_mjpeg_decode) {
     Stop();
+    prefer_mpp_mjpeg_decode_ = prefer_mpp_mjpeg_decode;
     if (!device_unique_id || !device_unique_id[0]) {
         return false;
     }

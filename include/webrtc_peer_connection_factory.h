@@ -11,10 +11,18 @@ class Thread;
 
 namespace webrtc_demo {
 
+/// 可选：影响视频编码工厂等（仅推流端传入有意义）。
+struct PeerConnectionFactoryMediaOptions {
+  /// 在编译启用 WEBRTC_DEMO_HAVE_ROCKCHIP_MPP 且未设置 WEBRTC_DISABLE_MPP_H264=1 时，
+  /// 为 true 则 H.264 优先使用 RK MPP 硬件编码。
+  bool prefer_rockchip_mpp_h264{false};
+};
+
 // 与 webrtc::EnableMediaWithDefaults 一致：在 EnableMedia 之前补全
 // TaskQueue、内置音/视频编解码工厂、BuiltinAudioProcessingBuilder（若未提供 APM）。
 void ConfigurePeerConnectionFactoryDependencies(
-    webrtc::PeerConnectionFactoryDependencies& deps);
+    webrtc::PeerConnectionFactoryDependencies& deps,
+    const PeerConnectionFactoryMediaOptions* media_options = nullptr);
 
 // CreateModularPeerConnectionFactory 在 signaling_thread==nullptr 时会绑定「当前线程」为信令线程；
 // CLI 主线程通常不跑 WebRTC 消息循环，会导致 PostTask/SDP 异步链永远不执行。
