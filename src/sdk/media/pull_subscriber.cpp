@@ -1,6 +1,5 @@
 #include "pull_subscriber.h"
 #include "signaling_client.h"
-#include "platform/alsa_null_fallback.h"
 #include "webrtc_peer_connection_factory.h"
 
 #include "api/jsep.h"
@@ -151,7 +150,6 @@ public:
         }
         webrtc::PeerConnectionFactoryDependencies deps;
         webrtc_demo::ConfigurePeerConnectionFactoryDependencies(deps);
-        webrtc_demo::EnableAlsaNullDeviceFallback();
         webrtc_demo::EnsureDedicatedPeerConnectionSignalingThread(deps, &owned_signaling_thread_);
         factory_ = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
         if (!factory_) {

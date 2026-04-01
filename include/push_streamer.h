@@ -17,7 +17,6 @@ struct PushStreamerConfig {
     int video_fps{30};
     int video_device_index{0};      /// 设备索引，与 --list-cameras 输出对应
     std::string video_device_path;  /// 设备路径，如 /dev/video11，优先于 index
-    bool enable_audio{false};  /// 默认纯视频；true 时仍不创建麦克风流，仅放宽 SDP 音频意向
     bool test_capture_only{false};  /// 仅测试采集，不创建 offer/连接
     bool test_encode_mode{false};   /// 本地回环验证 H264 编码（采集→编码→接收）
     /// 信令多订阅者模式：仅对加入的拉流端 CreateOfferForPeer，不在 Start 末尾发 default offer

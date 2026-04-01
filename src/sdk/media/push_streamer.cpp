@@ -3,7 +3,6 @@
 #include "api/array_view.h"
 #include "camera_utils.h"
 #include "media/camera_video_track_source.h"
-#include "platform/alsa_null_fallback.h"
 #include "webrtc_peer_connection_factory.h"
 
 #include "api/jsep.h"
@@ -236,10 +235,10 @@ private:
 
 namespace {
 
-webrtc::PeerConnectionInterface::RTCOfferAnswerOptions MakeOfferOptions(const PushStreamerConfig& cfg) {
+webrtc::PeerConnectionInterface::RTCOfferAnswerOptions MakeOfferOptions() {
     webrtc::PeerConnectionInterface::RTCOfferAnswerOptions o;
     o.num_simulcast_layers = 1;
-    o.offer_to_receive_audio = cfg.enable_audio ? webrtc::PeerConnectionInterface::RTCOfferAnswerOptions::kOfferToReceiveMediaTrue : 0;
+    o.offer_to_receive_audio = 0;
     return o;
 }
 
@@ -396,9 +395,6 @@ public:
         webrtc_demo::PeerConnectionFactoryMediaOptions media_opts;
         media_opts.prefer_rockchip_mpp_h264 = config_.use_rockchip_mpp_h264;
         webrtc_demo::ConfigurePeerConnectionFactoryDependencies(deps, &media_opts);
-        if (!config_.enable_audio) {
-            EnableAlsaNullDeviceFallback();
-        }
         webrtc_demo::EnsureDedicatedPeerConnectionSignalingThread(deps, &owned_signaling_thread_);
 
         factory_ = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
@@ -958,7 +954,7 @@ public:
         if (!pc) {
             return;
         }
-        auto opts = MakeOfferOptions(config_);
+        auto opts = MakeOfferOptions();
         auto peer_id_ptr = std::make_shared<std::string>(peer_id);
 
         auto obs = webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver>(
@@ -1164,7 +1160,7 @@ public:
     }
 
     void OnReceiverRemoteDescriptionSet() {
-        auto opts = MakeOfferOptions(config_);
+        auto opts = MakeOfferOptions();
         auto obs = webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver>(
             new webrtc::RefCountedObject<CreateSdpObserver>(
                 [this](std::unique_ptr<webrtc::SessionDescriptionInterface> desc) {

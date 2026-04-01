@@ -56,8 +56,6 @@ void PrintUsage(const char* prog) {
               << "  --width W         Video width（无 config 时默认 1280，720p）\n"
               << "  --height H        Video height（无 config 时默认 720）\n"
               << "  --fps F           Frame rate（无 config 时默认 30）\n"
-              << "  --no-audio        Video only (same as ENABLE_AUDIO=0)\n"
-              << "  --enable-audio    Allow audio in SDP (no mic capture)\n"
               << "Environment:\n"
               << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N   Min frames before Offer (0=off)\n"
               << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N   Max wait for gate (seconds)\n"
@@ -91,7 +89,6 @@ int main(int argc, char* argv[]) {
     std::optional<int> cmdline_width;
     std::optional<int> cmdline_height;
     std::optional<int> cmdline_fps;
-    std::optional<bool> cmdline_enable_audio;
     bool use_signaling = true;
     bool test_capture = false;
     bool test_encode = false;
@@ -122,10 +119,6 @@ int main(int argc, char* argv[]) {
             cmdline_height = std::atoi(argv[++arg_idx]);
         } else if (strcmp(argv[arg_idx], "--fps") == 0 && arg_idx + 1 < argc) {
             cmdline_fps = std::atoi(argv[++arg_idx]);
-        } else if (strcmp(argv[arg_idx], "--no-audio") == 0) {
-            cmdline_enable_audio = false;
-        } else if (strcmp(argv[arg_idx], "--enable-audio") == 0) {
-            cmdline_enable_audio = true;
         } else if (argv[arg_idx][0] != '-') {
             break;
         }
@@ -214,16 +207,7 @@ int main(int argc, char* argv[]) {
         config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
         config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
         config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);
-        {
-            std::string ea = cfg.GetStream(stream_id, "ENABLE_AUDIO", "");
-            if (ea.empty()) {
-                ea = "0";
-            }
-            for (auto& c : ea) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            config.enable_audio = (ea == "1" || ea == "true" || ea == "yes" || ea == "on");
-        }
     }
-    if (cmdline_enable_audio.has_value()) config.enable_audio = *cmdline_enable_audio;
     if (cmdline_signaling.has_value()) signaling_url = *cmdline_signaling;
     if (cmdline_width.has_value()) config.video_width = *cmdline_width;
     if (cmdline_height.has_value()) config.video_height = *cmdline_height;
