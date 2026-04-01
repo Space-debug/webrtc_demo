@@ -15,6 +15,7 @@ if(UNIX AND NOT APPLE)
             set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=gold")
         endif()
     endif()
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lgcc")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -63,9 +64,6 @@ if(WEBRTC_DEMO_ENABLE_ROCKCHIP_MPP AND UNIX AND NOT APPLE)
         message(STATUS "Rockchip MPP: not found (optional); H264 stays software-only on this build host")
     endif()
 endif()
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-    list(APPEND WEBRTC_SDK_SOURCES ${WEBRTC_PUSH_SDK_DIR}/webrtc/sme_abi_stubs.c)
-endif()
 
 add_library(webrtc_push_sdk STATIC ${WEBRTC_SDK_SOURCES})
 
@@ -86,6 +84,12 @@ if(WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE)
 endif()
 
 webrtc_push_link_libwebrtc_static_library(webrtc_push_sdk)
+
+# libwebrtc.a 中 rotate_sme.o 需要 __arm_tpidr2_save；须在本库之后链接存根，否则 .a 内对象不会提前被拉取。
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    add_library(sme_abi_stubs STATIC ${WEBRTC_PUSH_SDK_DIR}/webrtc/sme_abi_stubs.c)
+    target_link_libraries(webrtc_push_sdk PUBLIC sme_abi_stubs)
+endif()
 
 add_executable(webrtc_push_demo src/app/push_demo.cpp)
 target_link_libraries(webrtc_push_demo PRIVATE webrtc_push_sdk)
