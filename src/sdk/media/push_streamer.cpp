@@ -4,7 +4,6 @@
 #include "camera_utils.h"
 #include "media/camera_video_track_source.h"
 #include "platform/alsa_null_fallback.h"
-#include "webrtc_field_trials.h"
 #include "webrtc_peer_connection_factory.h"
 
 #include "api/jsep.h"
@@ -18,8 +17,6 @@
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
-#include "api/stats/rtc_stats_collector_callback.h"
-#include "api/stats/rtc_stats_report.h"
 #include "api/video/video_frame.h"
 #include "api/video/video_sink_interface.h"
 #include "modules/video_capture/video_capture_factory.h"
@@ -28,22 +25,16 @@
 #include "rtc_base/thread.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
-#include <cmath>
-#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <future>
-#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
-#include <optional>
-#include <sstream>
 #include <unistd.h>
 #include <string>
 #include <thread>
@@ -94,534 +85,6 @@ static void StopWebrtcThreadWithDeadline(webrtc::Thread* thread, int timeout_sec
     worker.join();
 }
 
-static std::optional<double> AttrToDoubleMs(const webrtc::Attribute& a) {
-    if (!a.has_value()) {
-        return std::nullopt;
-    }
-    if (a.holds_alternative<double>()) {
-        const auto& o = a.as_optional<double>();
-        if (o.has_value()) {
-            return *o * 1000.0;
-        }
-    }
-    if (a.holds_alternative<uint64_t>()) {
-        const auto& o = a.as_optional<uint64_t>();
-        if (o.has_value()) {
-            return static_cast<double>(*o);
-        }
-    }
-    if (a.holds_alternative<int64_t>()) {
-        const auto& o = a.as_optional<int64_t>();
-        if (o.has_value()) {
-            return static_cast<double>(*o);
-        }
-    }
-    return std::nullopt;
-}
-
-static std::optional<double> MediaSourceTotalCaptureTimeMs(const webrtc::Attribute& a) {
-    if (!a.has_value()) {
-        return std::nullopt;
-    }
-    if (a.holds_alternative<double>()) {
-        const auto& o = a.as_optional<double>();
-        if (o.has_value()) {
-            return *o * 1000.0;
-        }
-    }
-    if (a.holds_alternative<uint64_t>()) {
-        const auto& o = a.as_optional<uint64_t>();
-        if (o.has_value()) {
-            return static_cast<double>(*o);
-        }
-    }
-    return AttrToDoubleMs(a);
-}
-
-static std::optional<uint64_t> AttrToUint64(const webrtc::Attribute& a) {
-    if (!a.has_value()) {
-        return std::nullopt;
-    }
-    if (a.holds_alternative<uint64_t>()) {
-        const auto& o = a.as_optional<uint64_t>();
-        if (o.has_value()) {
-            return *o;
-        }
-    }
-    if (a.holds_alternative<uint32_t>()) {
-        const auto& o = a.as_optional<uint32_t>();
-        if (o.has_value()) {
-            return static_cast<uint64_t>(*o);
-        }
-    }
-    return std::nullopt;
-}
-
-static void MergeMaxOptional(std::optional<double>* slot, double candidate_ms) {
-    if (!slot->has_value() || candidate_ms > **slot) {
-        *slot = candidate_ms;
-    }
-}
-
-static void AddOptionalDouble(std::optional<double>* slot, double add_ms) {
-    if (slot->has_value()) {
-        **slot += add_ms;
-    } else {
-        *slot = add_ms;
-    }
-}
-
-static void AddOptionalU64(std::optional<uint64_t>* slot, uint64_t add) {
-    if (slot->has_value()) {
-        **slot += add;
-    } else {
-        *slot = add;
-    }
-}
-
-struct LatencyOneLineSummary {
-    std::optional<double> capture_total_ms;
-    std::optional<double> encode_total_ms;
-    std::optional<double> packet_send_delay_total_ms;
-    std::optional<double> ice_current_rtt_ms;
-    std::optional<double> remote_rtt_ms;
-    std::optional<double> remote_jitter_ms;
-    std::optional<double> avg_rtcp_interval_ms;
-    std::optional<double> remote_total_rtt_sum_ms;
-    std::optional<uint64_t> remote_rtt_measurements;
-};
-
-static void AccumulateLatencySummary(const std::string& rtype,
-                                     const std::string& name,
-                                     const webrtc::Attribute& m,
-                                     LatencyOneLineSummary* s) {
-    if (rtype == "remote-inbound-rtp" && name == "roundTripTimeMeasurements") {
-        if (auto u = AttrToUint64(m)) {
-            AddOptionalU64(&s->remote_rtt_measurements, *u);
-        }
-        return;
-    }
-    if (rtype == "media-source" && name == "totalCaptureTime") {
-        if (auto cap_ms = MediaSourceTotalCaptureTimeMs(m)) {
-            MergeMaxOptional(&s->capture_total_ms, *cap_ms);
-        }
-        return;
-    }
-    auto sec = AttrToDoubleMs(m);
-    if (!sec) {
-        return;
-    }
-    const double ms = *sec;
-    if (rtype == "outbound-rtp" && name == "totalEncodeTime") {
-        MergeMaxOptional(&s->encode_total_ms, ms);
-    } else if (rtype == "outbound-rtp" && name == "totalPacketSendDelay") {
-        MergeMaxOptional(&s->packet_send_delay_total_ms, ms);
-    } else if (rtype == "candidate-pair" && name == "currentRoundTripTime") {
-        if (ms > 0.0) {
-            MergeMaxOptional(&s->ice_current_rtt_ms, ms);
-        }
-    } else if (rtype == "remote-inbound-rtp" && name == "roundTripTime") {
-        MergeMaxOptional(&s->remote_rtt_ms, ms);
-    } else if (rtype == "remote-inbound-rtp" && name == "jitter") {
-        MergeMaxOptional(&s->remote_jitter_ms, ms);
-    } else if (rtype == "remote-inbound-rtp" && name == "totalRoundTripTime") {
-        AddOptionalDouble(&s->remote_total_rtt_sum_ms, ms);
-    } else if (name == "averageRtcpInterval") {
-        MergeMaxOptional(&s->avg_rtcp_interval_ms, ms);
-    }
-}
-
-static std::string FormatMsOptional(const std::optional<double>& v, int prec) {
-    if (!v.has_value()) {
-        return "-";
-    }
-    std::ostringstream o;
-    o << std::fixed << std::setprecision(prec) << *v;
-    return o.str();
-}
-
-enum class LatencyPollStatus { Ok, Empty, Error, Timeout };
-
-static bool GetStatsFullDumpEnabled() {
-    const char* v = std::getenv("WEBRTC_GETSTATS_DUMP");
-    return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
-}
-
-static bool GetStatsDumpJsonOnly() {
-    const char* v = std::getenv("WEBRTC_GETSTATS_DUMP_JSON_ONLY");
-    return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
-}
-
-static bool GetStatsDumpMembersExtra() {
-    const char* v = std::getenv("WEBRTC_GETSTATS_DUMP_MEMBERS");
-    return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
-}
-
-static int GetStatsDumpIntervalMs() {
-    const char* v = std::getenv("WEBRTC_GETSTATS_DUMP_INTERVAL_MS");
-    if (!v || v[0] == '\0') {
-        return 0;
-    }
-    return std::atoi(v);
-}
-
-static std::string StatsMemberValueOneLine(const webrtc::Attribute& m) {
-    return m.ToString();
-}
-
-static void MaybeDumpFullGetStatsReports(std::ostream& out,
-                                         const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report,
-                                         const char* peer_tag) {
-    if (!GetStatsFullDumpEnabled() || !report) {
-        return;
-    }
-    const int interval_ms = GetStatsDumpIntervalMs();
-    static std::mutex rate_mu;
-    static std::chrono::steady_clock::time_point last_dump{};
-    static bool have_last{false};
-    if (interval_ms > 0) {
-        const auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(rate_mu);
-        if (have_last) {
-            const auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - last_dump).count();
-            if (elapsed < interval_ms) {
-                return;
-            }
-        }
-        last_dump = now;
-        have_last = true;
-    }
-
-    const char* ptag = (peer_tag && peer_tag[0] != '\0') ? peer_tag : "(pc)";
-    const bool json_only = GetStatsDumpJsonOnly();
-    const bool members_extra = GetStatsDumpMembersExtra();
-    std::string j = report->ToJson();
-    out << "[getstats-full] peer=" << ptag << " stats_count=" << report->size() << "\n";
-    if (!j.empty()) {
-        out << j << "\n";
-    }
-    const bool dump_members = !json_only || members_extra || j.empty();
-    if (dump_members) {
-        for (const webrtc::RTCStats& st : *report) {
-            for (const webrtc::Attribute& attr : st.Attributes()) {
-                out << "  " << st.type() << " id=" << st.id() << " m[" << attr.name()
-                    << "]=" << StatsMemberValueOneLine(attr) << "\n";
-            }
-        }
-    }
-    out << std::flush;
-}
-
-struct LatencyPollResult {
-    LatencyPollStatus status{LatencyPollStatus::Ok};
-    const char* error_message{nullptr};
-    LatencyOneLineSummary sum;
-    int64_t latest_ts_us{0};
-};
-
-class StatsDeliveredCallback : public webrtc::RTCStatsCollectorCallback {
-public:
-    explicit StatsDeliveredCallback(std::function<void(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>&)> fn)
-        : fn_(std::move(fn)) {}
-
-    void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
-        if (fn_) {
-            fn_(report);
-        }
-    }
-
-private:
-    std::function<void(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>&)> fn_;
-};
-
-static LatencyPollResult PollLatencySummaryForPc(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc,
-                                                 int timeout_ms,
-                                                 const char* getstats_peer_tag) {
-    LatencyPollResult timeout_r;
-    timeout_r.status = LatencyPollStatus::Timeout;
-    if (!pc) {
-        LatencyPollResult r;
-        r.status = LatencyPollStatus::Error;
-        r.error_message = "no_pc";
-        return r;
-    }
-
-    auto done = std::make_shared<std::promise<LatencyPollResult>>();
-    std::future<LatencyPollResult> fut = done->get_future();
-
-    auto cb = webrtc::scoped_refptr<webrtc::RTCStatsCollectorCallback>(
-        new webrtc::RefCountedObject<StatsDeliveredCallback>(
-            [done, getstats_peer_tag](const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) {
-                LatencyPollResult out;
-                if (!report || report->size() == 0) {
-                    out.status = LatencyPollStatus::Empty;
-                    done->set_value(out);
-                    return;
-                }
-                MaybeDumpFullGetStatsReports(std::cout, report, getstats_peer_tag);
-                int64_t latest_ts_us = 0;
-                for (const webrtc::RTCStats& rep : *report) {
-                    int64_t tus = rep.timestamp().us();
-                    if (tus > latest_ts_us) {
-                        latest_ts_us = tus;
-                    }
-                    std::string rtype = rep.type();
-                    for (const webrtc::Attribute& mem : rep.Attributes()) {
-                        AccumulateLatencySummary(rtype, mem.name(), mem, &out.sum);
-                    }
-                }
-                out.latest_ts_us = latest_ts_us;
-                out.status = LatencyPollStatus::Ok;
-                done->set_value(out);
-            }));
-
-    pc->GetStats(cb.get());
-
-    if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
-        return timeout_r;
-    }
-    return fut.get();
-}
-
-static void DumpLatencyStatsForPc(std::ostream& out,
-                                  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc,
-                                  const std::string& peer_tag,
-                                  int timeout_ms) {
-    using clock = std::chrono::system_clock;
-    const int64_t t_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
-
-    LatencyPollResult r = PollLatencySummaryForPc(pc, timeout_ms, peer_tag.c_str());
-    if (r.status == LatencyPollStatus::Timeout) {
-        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " err=stats_timeout\n" << std::flush;
-        return;
-    }
-    if (r.status == LatencyPollStatus::Error) {
-        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
-            << " GetStats_error=" << (r.error_message ? r.error_message : "") << "\n" << std::flush;
-        return;
-    }
-    if (r.status == LatencyPollStatus::Empty) {
-        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats\n" << std::flush;
-        return;
-    }
-
-    const LatencyOneLineSummary& sum = r.sum;
-    const bool any = sum.capture_total_ms.has_value() || sum.encode_total_ms.has_value() ||
-                     sum.packet_send_delay_total_ms.has_value() || sum.ice_current_rtt_ms.has_value() ||
-                     sum.remote_rtt_ms.has_value() || sum.remote_jitter_ms.has_value() ||
-                     sum.avg_rtcp_interval_ms.has_value() || sum.remote_total_rtt_sum_ms.has_value() ||
-                     sum.remote_rtt_measurements.has_value();
-
-    std::ostringstream ts_ms;
-    ts_ms << std::fixed << std::setprecision(3) << (static_cast<double>(r.latest_ts_us) / 1000.0);
-
-    if (!any) {
-        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag
-            << " note=no_known_latency_fields stats_timestamp_ms=" << ts_ms.str()
-            << " (stats_timestamp_ms=RTC report clock; unrelated to LATENCY_STATS_WINDOW_FRAMES)\n";
-    } else {
-        out << "[stats-latency] t_ms=" << t_ms << " peer=" << peer_tag << " stats_timestamp_ms=" << ts_ms.str()
-            << " capture_total_ms=" << FormatMsOptional(sum.capture_total_ms, 2)
-            << " encode_total_ms=" << FormatMsOptional(sum.encode_total_ms, 2)
-            << " rtp_send_queue_total_ms=" << FormatMsOptional(sum.packet_send_delay_total_ms, 2)
-            << " ice_rtt_ms=" << FormatMsOptional(sum.ice_current_rtt_ms, 3)
-            << " remote_feedback_rtt_ms=" << FormatMsOptional(sum.remote_rtt_ms, 3)
-            << " remote_jitter_ms=" << FormatMsOptional(sum.remote_jitter_ms, 3)
-            << " avg_rtcp_interval_ms=" << FormatMsOptional(sum.avg_rtcp_interval_ms, 2)
-            << " remote_rtt_sum_ms=" << FormatMsOptional(sum.remote_total_rtt_sum_ms, 2)
-            << " remote_rtt_measurements=" << (sum.remote_rtt_measurements.has_value()
-                                                  ? std::to_string(*sum.remote_rtt_measurements)
-                                                  : std::string("-"))
-            << " (cumulative=session totals; ms/frame rolling in [stats-latency-avg]; missing=-)\n";
-    }
-    out << std::flush;
-}
-
-static std::optional<double> DeltaPerFrameMs(const std::optional<double>& prev,
-                                             const std::optional<double>& curr,
-                                             unsigned int df) {
-    if (df == 0 || !prev.has_value() || !curr.has_value()) {
-        return std::nullopt;
-    }
-    return (*curr - *prev) / static_cast<double>(df);
-}
-
-static std::optional<double> RttSampleMeanMsInWindow(const std::optional<double>& prev_sum_ms,
-                                                     const std::optional<double>& curr_sum_ms,
-                                                     const std::optional<uint64_t>& prev_n,
-                                                     const std::optional<uint64_t>& curr_n) {
-    if (!prev_sum_ms || !curr_sum_ms || !prev_n || !curr_n) {
-        return std::nullopt;
-    }
-    const int64_t dn = static_cast<int64_t>(*curr_n) - static_cast<int64_t>(*prev_n);
-    if (dn <= 0) {
-        return std::nullopt;
-    }
-    return (*curr_sum_ms - *prev_sum_ms) / static_cast<double>(dn);
-}
-
-static std::optional<double> EndpointMeanMs(const std::optional<double>& a, const std::optional<double>& b) {
-    if (a && b) {
-        return (*a + *b) / 2.0;
-    }
-    if (a) {
-        return *a;
-    }
-    if (b) {
-        return *b;
-    }
-    return std::nullopt;
-}
-
-static bool LatencyPipelineVerbose() {
-    const char* v = std::getenv("WEBRTC_LATENCY_PIPELINE_VERBOSE");
-    return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
-}
-
-static void PrintLatencyPipelineLegendEnglish(std::ostream& out) {
-    static std::atomic<bool> legend_printed{false};
-    if (legend_printed.exchange(true)) {
-        return;
-    }
-    out << "[latency-pipeline] legend=v1 lang=en\n";
-    out << "[latency-pipeline] scope=push_path_only end_to_end_includes_receiver_wifi_jitter_buffer_decode\n";
-    out << std::flush;
-}
-
-struct UserInterFrameRoll {
-    double mean_ms{0};
-    double std_ms{0};
-    unsigned n{0};
-    double nominal_if_ms{0};
-};
-
-static void AppendUserInterFrameStats(std::ostream& out, const UserInterFrameRoll& u) {
-    if (u.n == 0) {
-        out << " usr_if_mean_ms=- usr_if_std_ms=- usr_if_n=0 usr_if_nom_ms=- usr_if_skew_ms=-";
-        return;
-    }
-    out << " usr_if_mean_ms=" << std::fixed << std::setprecision(3) << u.mean_ms << " usr_if_std_ms=" << std::setprecision(3)
-        << u.std_ms << " usr_if_n=" << u.n;
-    if (u.nominal_if_ms > 0.0) {
-        const double skew = std::fabs(u.mean_ms - u.nominal_if_ms);
-        out << " usr_if_nom_ms=" << std::setprecision(3) << u.nominal_if_ms << " usr_if_skew_ms=" << std::setprecision(3)
-            << skew;
-    } else {
-        out << " usr_if_nom_ms=- usr_if_skew_ms=-";
-    }
-}
-
-static void EmitEnglishPipelineStages(std::ostream& out,
-                                      const std::string& peer_tag,
-                                      unsigned int fc,
-                                      unsigned int df,
-                                      double frame_spacing_ms,
-                                      const std::optional<double>& capture_ms_pf,
-                                      const std::optional<double>& encode_ms_pf,
-                                      const std::optional<double>& rtp_send_path_ms_pf,
-                                      const UserInterFrameRoll& user_if) {
-    PrintLatencyPipelineLegendEnglish(out);
-    out << "[latency-pipeline] peer=" << peer_tag << " capture_frame_index=" << fc << " stats_window_frames=" << df
-        << "\n";
-    if (user_if.n > 0) {
-        out << "[latency-pipeline] stage=UserspaceOnFrame_interval_roll_ms status=OBSERVABLE mean_ms="
-            << std::fixed << std::setprecision(4) << user_if.mean_ms << " std_ms=" << user_if.std_ms << " n="
-            << user_if.n << "\n";
-    }
-    out << "[latency-pipeline] stage=UserspaceBufferOrMmap_delivery_spacing_ms value="
-        << std::fixed << std::setprecision(3) << frame_spacing_ms << "\n";
-    out << "[latency-pipeline] stage=H264_Encode_ms_per_frame value_ms=" << FormatMsOptional(encode_ms_pf, 4) << "\n";
-    out << "[latency-pipeline] stage=RTP_SendPath_ms_per_frame value_ms=" << FormatMsOptional(rtp_send_path_ms_pf, 4)
-        << "\n";
-    if (capture_ms_pf.has_value()) {
-        out << "[latency-pipeline] stage=MediaSource_totalCaptureTime_ms_per_frame value_ms="
-            << std::fixed << std::setprecision(4) << *capture_ms_pf << "\n";
-    }
-    out << std::flush;
-}
-
-struct LatencyPeerRollState {
-    bool have_baseline{false};
-    unsigned baseline_fc{0};
-    LatencyOneLineSummary baseline;
-};
-
-static void ApplyLatencyRollStep(std::ostream& out,
-                                 const std::string& peer_tag,
-                                 const LatencyPollResult& poll,
-                                 unsigned int fc,
-                                 unsigned int window_frames,
-                                 LatencyPeerRollState* st,
-                                 double frame_spacing_ms,
-                                 const UserInterFrameRoll& user_if) {
-    using clock = std::chrono::system_clock;
-    const int64_t t_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
-
-    if (poll.status == LatencyPollStatus::Timeout) {
-        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " error=stats_timeout\n" << std::flush;
-        return;
-    }
-    if (poll.status == LatencyPollStatus::Error) {
-        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag
-            << " error=GetStats msg=" << (poll.error_message ? poll.error_message : "") << "\n" << std::flush;
-        return;
-    }
-    if (poll.status == LatencyPollStatus::Empty) {
-        out << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " note=empty_stats\n" << std::flush;
-        return;
-    }
-
-    const LatencyOneLineSummary& cur = poll.sum;
-
-    if (!st->have_baseline) {
-        st->baseline = cur;
-        st->baseline_fc = fc;
-        st->have_baseline = true;
-        return;
-    }
-
-    const unsigned int df = fc - st->baseline_fc;
-    if (df < window_frames) {
-        return;
-    }
-
-    const LatencyOneLineSummary& a = st->baseline;
-
-    std::ostringstream ts_ms;
-    ts_ms << std::fixed << std::setprecision(3) << (static_cast<double>(poll.latest_ts_us) / 1000.0);
-
-    const auto d_capture = DeltaPerFrameMs(a.capture_total_ms, cur.capture_total_ms, df);
-    const auto d_encode = DeltaPerFrameMs(a.encode_total_ms, cur.encode_total_ms, df);
-    const auto d_rtp = DeltaPerFrameMs(a.packet_send_delay_total_ms, cur.packet_send_delay_total_ms, df);
-
-    out << std::fixed << std::setprecision(3)
-        << "[stats-latency-avg] t_ms=" << t_ms << " peer=" << peer_tag << " ts_ms=" << ts_ms.str()
-        << " fc=" << fc << " win=" << df << " if_ms=" << frame_spacing_ms
-        << " cap_ms_pf=" << FormatMsOptional(d_capture, 4)
-        << " enc_ms_pf=" << FormatMsOptional(d_encode, 4)
-        << " rtp_q_ms_pf=" << FormatMsOptional(d_rtp, 4)
-        << " ice_ms=" << FormatMsOptional(EndpointMeanMs(a.ice_current_rtt_ms, cur.ice_current_rtt_ms), 3)
-        << " rem_rtt_ms=" << FormatMsOptional(EndpointMeanMs(a.remote_rtt_ms, cur.remote_rtt_ms), 3)
-        << " rem_jit_ms=" << FormatMsOptional(EndpointMeanMs(a.remote_jitter_ms, cur.remote_jitter_ms), 3)
-        << " rem_rtt_samp_ms="
-        << FormatMsOptional(RttSampleMeanMsInWindow(a.remote_total_rtt_sum_ms, cur.remote_total_rtt_sum_ms,
-                                                    a.remote_rtt_measurements, cur.remote_rtt_measurements),
-                            3);
-    AppendUserInterFrameStats(out, user_if);
-    out << "\n"
-        << std::defaultfloat
-        << std::flush;
-    if (LatencyPipelineVerbose()) {
-        EmitEnglishPipelineStages(out, peer_tag, fc, df, frame_spacing_ms, d_capture, d_encode, d_rtp, user_if);
-    }
-
-    st->baseline = cur;
-    st->baseline_fc = fc;
-}
-
 static webrtc::Priority ParseVideoNetworkPriority(const std::string& s) {
     std::string lower;
     lower.reserve(s.size());
@@ -670,22 +133,10 @@ webrtc::PeerConnectionInterface::RTCConfiguration MakeRtcConfiguration(const Pus
 
 class FrameCountingSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
 public:
-    static constexpr size_t kInterFrameRing = 128;
-
     using OnFrameCallback = webrtc_demo::OnFrameCallback;
     explicit FrameCountingSink(OnFrameCallback cb) : on_frame_(std::move(cb)) {}
 
     void OnFrame(const webrtc::VideoFrame& frame) override {
-        const auto now = std::chrono::steady_clock::now();
-        if (have_last_frame_time_) {
-            const double ms = std::chrono::duration<double, std::milli>(now - last_frame_time_).count();
-            last_inter_frame_ms_.store(ms, std::memory_order_relaxed);
-            RecordInterFrameGap(ms);
-        } else {
-            have_last_frame_time_ = true;
-        }
-        last_frame_time_ = now;
-
         unsigned int n = ++frame_count_;
         if (on_frame_) {
             on_frame_(n, frame.width(), frame.height());
@@ -694,55 +145,8 @@ public:
 
     unsigned int GetFrameCount() const { return frame_count_.load(); }
 
-    double GetLastInterFrameMs() const { return last_inter_frame_ms_.load(std::memory_order_relaxed); }
-
-    void GetRollingInterFrameStats(double* mean_ms, double* std_ms, unsigned* n_out) const {
-        std::lock_guard<std::mutex> lock(if_mu_);
-        if (if_n_ == 0) {
-            *mean_ms = 0;
-            *std_ms = 0;
-            *n_out = 0;
-            return;
-        }
-        double sum = 0;
-        for (size_t i = 0; i < if_n_; ++i) {
-            const size_t idx = (if_w_ + kInterFrameRing - 1 - i) % kInterFrameRing;
-            sum += if_ring_[idx];
-        }
-        const double m = sum / static_cast<double>(if_n_);
-        *mean_ms = m;
-        if (if_n_ < 2) {
-            *std_ms = 0;
-        } else {
-            double v = 0;
-            for (size_t i = 0; i < if_n_; ++i) {
-                const size_t idx = (if_w_ + kInterFrameRing - 1 - i) % kInterFrameRing;
-                const double d = if_ring_[idx] - m;
-                v += d * d;
-            }
-            *std_ms = std::sqrt(v / static_cast<double>(if_n_ - 1));
-        }
-        *n_out = static_cast<unsigned>(if_n_);
-    }
-
 private:
-    void RecordInterFrameGap(double ms) {
-        std::lock_guard<std::mutex> lock(if_mu_);
-        if_ring_[if_w_ % kInterFrameRing] = ms;
-        if_w_++;
-        if (if_n_ < kInterFrameRing) {
-            if_n_++;
-        }
-    }
-
     std::atomic<unsigned int> frame_count_{0};
-    std::chrono::steady_clock::time_point last_frame_time_{};
-    bool have_last_frame_time_{false};
-    std::atomic<double> last_inter_frame_ms_{0.0};
-    mutable std::mutex if_mu_;
-    std::array<double, kInterFrameRing> if_ring_{};
-    size_t if_w_{0};
-    size_t if_n_{0};
     OnFrameCallback on_frame_;
 };
 
@@ -982,7 +386,6 @@ public:
     };
 
     bool Initialize() {
-        webrtc_demo::EnsureFlexfecFieldTrials(config_.enable_flexfec, config_.flexfec_field_trials);
         std::cout << "[PushStreamer] Initializing WebRTC (native API)..." << std::endl;
         if (!webrtc::InitializeSSL()) {
             std::cerr << "[PushStreamer] InitializeSSL failed" << std::endl;
@@ -1520,7 +923,7 @@ public:
             }
         }
         // 禁止在持 mutex_ 期间 CreatePeerConnection/AddTrack：WebRTC 可能同步触发观察者回调，
-        // 与主线程里 LogLatencyStatsRollingAvg 等抢同一把 mutex 会死锁 → 不发 Offer、拉流永远 0 帧。
+        // 与主线程里其它持 mutex_ 的逻辑抢锁会死锁 → 不发 Offer、拉流永远 0 帧。
         auto observer = std::make_unique<ExtraPeerObserver>(this, peer_id);
         auto pc = CreatePcWithObserver(observer.get(), MakeRtcConfiguration(config_));
         if (!pc) {
@@ -1927,86 +1330,6 @@ public:
     bool TestCaptureOnly() const { return config_.test_capture_only; }
     bool SignalingSubscriberOfferOnly() const { return config_.signaling_subscriber_offer_only; }
 
-    void LogLatencyStatsForAllPeers(std::ostream& out) {
-        std::vector<std::pair<std::string, webrtc::scoped_refptr<webrtc::PeerConnectionInterface>>> copy;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& kv : peer_connections_) {
-                copy.emplace_back(kv.first, kv.second);
-            }
-        }
-        if (copy.empty()) {
-            webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                pc = peer_connection_;
-            }
-            if (pc) {
-                DumpLatencyStatsForPc(out, pc, "default", 5000);
-            } else {
-                using clock = std::chrono::system_clock;
-                const int64_t t_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
-                out << "[stats-latency] t_ms=" << t_ms << " peer=(none) note=no_peerconnection\n" << std::flush;
-            }
-            return;
-        }
-        for (const auto& pr : copy) {
-            DumpLatencyStatsForPc(out, pr.second, pr.first, 5000);
-        }
-    }
-
-    void LogLatencyStatsRollingAvg(std::ostream& out, unsigned int fc) {
-        const unsigned int w = static_cast<unsigned int>(
-            config_.latency_stats_window_frames < 1 ? 1 : config_.latency_stats_window_frames);
-        std::vector<std::pair<std::string, webrtc::scoped_refptr<webrtc::PeerConnectionInterface>>> copy;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& kv : peer_connections_) {
-                copy.emplace_back(kv.first, kv.second);
-            }
-        }
-        if (copy.empty()) {
-            webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                pc = peer_connection_;
-            }
-            if (pc) {
-                LatencyPollResult r = PollLatencySummaryForPc(pc, 5000, "default");
-                const double spacing = frame_counter_ ? frame_counter_->GetLastInterFrameMs() : 0.0;
-                UserInterFrameRoll uif;
-                if (frame_counter_) {
-                    frame_counter_->GetRollingInterFrameStats(&uif.mean_ms, &uif.std_ms, &uif.n);
-                }
-                if (config_.video_fps > 0) {
-                    uif.nominal_if_ms = 1000.0 / static_cast<double>(config_.video_fps);
-                }
-                std::lock_guard<std::mutex> lock(latency_roll_mu_);
-                ApplyLatencyRollStep(out, "default", r, fc, w, &latency_roll_["default"], spacing, uif);
-            } else {
-                using clock = std::chrono::system_clock;
-                const int64_t t_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
-                out << "[stats-latency-avg] t_ms=" << t_ms << " peer=(none) note=no_peerconnection\n" << std::flush;
-            }
-            return;
-        }
-        const double spacing = frame_counter_ ? frame_counter_->GetLastInterFrameMs() : 0.0;
-        UserInterFrameRoll uif;
-        if (frame_counter_) {
-            frame_counter_->GetRollingInterFrameStats(&uif.mean_ms, &uif.std_ms, &uif.n);
-        }
-        if (config_.video_fps > 0) {
-            uif.nominal_if_ms = 1000.0 / static_cast<double>(config_.video_fps);
-        }
-        for (const auto& pr : copy) {
-            LatencyPollResult r = PollLatencySummaryForPc(pr.second, 5000, pr.first.c_str());
-            std::lock_guard<std::mutex> lock(latency_roll_mu_);
-            ApplyLatencyRollStep(out, pr.first, r, fc, w, &latency_roll_[pr.first], spacing, uif);
-        }
-    }
-
 private:
     PushStreamerConfig config_;
     std::unique_ptr<webrtc::Thread> owned_signaling_thread_;
@@ -2031,8 +1354,6 @@ private:
     std::unordered_map<std::string, webrtc::scoped_refptr<webrtc::PeerConnectionInterface>> peer_connections_;
     std::unordered_map<std::string, std::unique_ptr<ExtraPeerObserver>> extra_peer_observers_;
     std::mutex mutex_;
-    std::mutex latency_roll_mu_;
-    std::unordered_map<std::string, LatencyPeerRollState> latency_roll_;
 };
 
 PushStreamer::PushStreamer(const PushStreamerConfig& config) : impl_(std::make_unique<Impl>(config)) {}
@@ -2109,14 +1430,6 @@ unsigned int PushStreamer::GetFrameCount() const {
 
 unsigned int PushStreamer::GetDecodedFrameCount() const {
     return impl_->GetDecodedFrameCount();
-}
-
-void PushStreamer::LogLatencyStatsForAllPeers(std::ostream& out) {
-    impl_->LogLatencyStatsForAllPeers(out);
-}
-
-void PushStreamer::LogLatencyStatsRollingAvg(std::ostream& out) {
-    impl_->LogLatencyStatsRollingAvg(out, GetFrameCount());
 }
 
 }  // namespace webrtc_demo

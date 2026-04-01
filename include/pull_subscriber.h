@@ -2,7 +2,6 @@
 #define WEBRTC_DEMO_PULL_SUBSCRIBER_H_
 
 #include <functional>
-#include <iosfwd>
 #include <memory>
 #include <string>
 
@@ -25,9 +24,6 @@ public:
                             const PullSubscriberConfig& recv = {});
     ~PullSubscriber();
 
-    /// 与推流端一致：在 Play() 前调用；在 LibWebRTC::Initialize 前注入 FlexFEC Field Trials
-    void SetFlexfecOptions(bool enable, const std::string& field_trials_override = {});
-
     void Play();
     void Stop();
     bool IsPlaying() const { return is_playing_; }
@@ -41,8 +37,6 @@ public:
 
     using OnErrorCallback = std::function<void(const std::string& msg)>;
     void SetOnError(OnErrorCallback cb) { on_error_ = std::move(cb); }
-
-    void DumpInboundFecReceiverStats(std::ostream& out, int timeout_ms = 5000);
 
 private:
     class Impl;

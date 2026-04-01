@@ -58,19 +58,9 @@ void PrintUsage(const char* prog) {
               << "  --fps F           Frame rate（无 config 时默认 30）\n"
               << "  --no-audio        Video only (same as ENABLE_AUDIO=0)\n"
               << "  --enable-audio    Allow audio in SDP (no mic capture)\n"
-              << "  --enable-flexfec  FlexFEC-03 (peer must match)\n"
               << "Environment:\n"
-              << "  WEBRTC_LATENCY_STATS_PROBE=0|1   Overrides LATENCY_STATS_ENABLE\n"
-              << "  WEBRTC_LATENCY_STATS_WINDOW_FRAMES=N   Rolling stats window (default 60)\n"
-              << "  WEBRTC_LATENCY_STATS_POLL_MS=N   When probe on, main-loop sleep ms (default 250, clamp 20-10000)\n"
-              << "  WEBRTC_LATENCY_PIPELINE_VERBOSE=1   Extra multi-line [latency-pipeline] after each window\n"
-              << "  WEBRTC_GETSTATS_DUMP=1   Full push GetStats: [getstats-full] + JSON + per-member m[] lines\n"
-              << "  WEBRTC_GETSTATS_DUMP_JSON_ONLY=1   JSON only (skip m[] lines if JSON non-empty)\n"
-              << "  WEBRTC_GETSTATS_DUMP_INTERVAL_MS=N   Min ms between full dumps (0=every GetStats poll)\n"
-              << "  WEBRTC_TEST_ENCODE_GETSTATS=1   During --test-encode, dump GetStats at ~3s and ~6s\n"
               << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N   Min frames before Offer (0=off)\n"
               << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N   Max wait for gate (seconds)\n"
-              << "  [stats-latency-avg] also prints usr_if_*: rolling OnFrame interval mean/std vs nominal fps\n"
               << "Arguments:\n"
               << "  stream_id         Stream ID; omitted -> STREAM_ID in config\n"
               << "  camera            Device path/index; omitted -> STREAM_<id>_CAMERA\n"
@@ -102,7 +92,6 @@ int main(int argc, char* argv[]) {
     std::optional<int> cmdline_height;
     std::optional<int> cmdline_fps;
     std::optional<bool> cmdline_enable_audio;
-    bool cmdline_enable_flexfec = false;
     bool use_signaling = true;
     bool test_capture = false;
     bool test_encode = false;
@@ -137,8 +126,6 @@ int main(int argc, char* argv[]) {
             cmdline_enable_audio = false;
         } else if (strcmp(argv[arg_idx], "--enable-audio") == 0) {
             cmdline_enable_audio = true;
-        } else if (strcmp(argv[arg_idx], "--enable-flexfec") == 0) {
-            cmdline_enable_flexfec = true;
         } else if (argv[arg_idx][0] != '-') {
             break;
         }
@@ -235,69 +222,17 @@ int main(int argc, char* argv[]) {
             for (auto& c : ea) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             config.enable_audio = (ea == "1" || ea == "true" || ea == "yes" || ea == "on");
         }
-        {
-            std::string ef = cfg.GetStream(stream_id, "ENABLE_FLEXFEC", "");
-            if (ef.empty()) {
-                ef = "0";
-            }
-            for (auto& c : ef) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            config.enable_flexfec =
-                (ef == "1" || ef == "true" || ef == "yes" || ef == "on");
-            config.flexfec_field_trials = cfg.GetStream(stream_id, "FLEXFEC_FIELD_TRIALS", "");
-        }
-        {
-            std::string ls = cfg.GetStream(stream_id, "LATENCY_STATS_ENABLE", "");
-            if (ls.empty()) {
-                ls = "0";
-            }
-            for (auto& c : ls) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            config.latency_stats_enable =
-                (ls == "1" || ls == "true" || ls == "yes" || ls == "on");
-            config.latency_stats_window_frames =
-                cfg.GetStreamInt(stream_id, "LATENCY_STATS_WINDOW_FRAMES", 60);
-            config.latency_stats_poll_ms = cfg.GetStreamInt(stream_id, "LATENCY_STATS_POLL_MS", 250);
-            if (config.latency_stats_poll_ms < 20) {
-                config.latency_stats_poll_ms = 20;
-            }
-            if (config.latency_stats_poll_ms > 10000) {
-                config.latency_stats_poll_ms = 10000;
-            }
-        }
     }
     if (cmdline_enable_audio.has_value()) config.enable_audio = *cmdline_enable_audio;
     if (cmdline_signaling.has_value()) signaling_url = *cmdline_signaling;
     if (cmdline_width.has_value()) config.video_width = *cmdline_width;
     if (cmdline_height.has_value()) config.video_height = *cmdline_height;
     if (cmdline_fps.has_value()) config.video_fps = *cmdline_fps;
-    if (const char* ef_env = std::getenv("ENABLE_FLEXFEC")) {
-        std::string s(ef_env);
-        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (s == "1" || s == "true" || s == "yes" || s == "on") {
-            config.enable_flexfec = true;
-        } else if (s == "0" || s == "false" || s == "no" || s == "off") {
-            config.enable_flexfec = false;
-        }
-    }
-    if (cmdline_enable_flexfec) {
-        config.enable_flexfec = true;
-    }
     if (const char* g = std::getenv("WEBRTC_CAPTURE_GATE_MIN_FRAMES")) {
         config.capture_gate_min_frames = std::atoi(g);
     }
     if (const char* gw = std::getenv("WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC")) {
         config.capture_gate_max_wait_sec = std::atoi(gw);
-    }
-    if (const char* lw = std::getenv("WEBRTC_LATENCY_STATS_WINDOW_FRAMES")) {
-        int v = std::atoi(lw);
-        if (v > 0) {
-            config.latency_stats_window_frames = v;
-        }
-    }
-    if (const char* lp = std::getenv("WEBRTC_LATENCY_STATS_POLL_MS")) {
-        int v = std::atoi(lp);
-        if (v >= 20 && v <= 10000) {
-            config.latency_stats_poll_ms = v;
-        }
     }
     if (stream_id.empty()) stream_id = "livestream";
 
@@ -362,7 +297,6 @@ int main(int argc, char* argv[]) {
                                               std::to_string(config.capture_gate_max_wait_sec) + "s"
                                         : std::string("off"))
               << " device=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
-              << " flexfec=" << (config.enable_flexfec ? "on" : "off")
               << std::endl;
     if (config.keyframe_interval > 0) {
         std::cout << "[Main] Note: keyframe interval not exposed in this libwebrtc binding; "
@@ -495,9 +429,6 @@ int main(int argc, char* argv[]) {
     if (test_encode) {
         std::cout << "[test-encode] Loopback 10s..." << std::endl;
         for (int i = 0; i < 10 && streamer.IsStreaming(); ++i) {
-            if (std::getenv("WEBRTC_TEST_ENCODE_GETSTATS") && (i == 3 || i == 6)) {
-                streamer.LogLatencyStatsForAllPeers(std::cout);
-            }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         unsigned int total = streamer.GetDecodedFrameCount();
@@ -507,12 +438,6 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Press Ctrl+C to stop." << std::endl;
-
-    bool latency_probe_on = config.latency_stats_enable;
-    if (const char* latency_stats_probe = std::getenv("WEBRTC_LATENCY_STATS_PROBE")) {
-        latency_probe_on =
-            (latency_stats_probe[0] != '\0' && std::strcmp(latency_stats_probe, "0") != 0);
-    }
 
     while (streamer.IsStreaming()) {
         if (subscriber_pending && subscriber_pending_mu) {
@@ -526,12 +451,7 @@ int main(int argc, char* argv[]) {
                 streamer.CreateOfferForPeer(peer_id);
             }
         }
-        if (latency_probe_on) {
-            streamer.LogLatencyStatsRollingAvg(std::cout);
-            std::this_thread::sleep_for(std::chrono::milliseconds(config.latency_stats_poll_ms));
-        } else {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!streamer.IsStreaming()) {
             break;
         }

@@ -41,7 +41,6 @@ set(WEBRTC_SDK_SOURCES
     ${WEBRTC_PUSH_SDK_DIR}/media/push_streamer.cpp
     ${WEBRTC_PUSH_SDK_DIR}/media/camera_video_track_source.cpp
     ${WEBRTC_PUSH_SDK_DIR}/media/pull_subscriber.cpp
-    ${WEBRTC_PUSH_SDK_DIR}/webrtc/field_trials.cpp
     ${WEBRTC_PUSH_SDK_DIR}/webrtc/peer_connection_factory.cpp
     ${WEBRTC_PUSH_SDK_DIR}/platform/alsa_null_fallback.cpp
     ${WEBRTC_PUSH_SDK_DIR}/webrtc/compat/sequence_checker_expectation_to_string.cpp

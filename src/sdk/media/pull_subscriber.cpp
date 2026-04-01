@@ -1,7 +1,6 @@
 #include "pull_subscriber.h"
 #include "signaling_client.h"
 #include "platform/alsa_null_fallback.h"
-#include "webrtc_field_trials.h"
 #include "webrtc_peer_connection_factory.h"
 
 #include "api/jsep.h"
@@ -14,8 +13,6 @@
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
-#include "api/stats/rtc_stats_collector_callback.h"
-#include "api/stats/rtc_stats_report.h"
 #include "api/video/video_frame.h"
 #include "api/video/video_sink_interface.h"
 #include "api/video/video_frame_buffer.h"
@@ -24,14 +21,10 @@
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
 
-#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <chrono>
-#include <cstdint>
-#include <fstream>
-#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -42,87 +35,6 @@
 namespace webrtc_demo {
 
 namespace {
-
-static bool NameContainsFec(const std::string& n) {
-    std::string lower;
-    lower.reserve(n.size());
-    for (unsigned char c : n) {
-        lower.push_back(static_cast<char>(std::tolower(c)));
-    }
-    return lower.find("fec") != std::string::npos;
-}
-
-static uint64_t StatsAttrToUint(const webrtc::Attribute& m) {
-    if (!m.has_value()) {
-        return 0;
-    }
-    if (m.holds_alternative<uint64_t>()) {
-        const auto& o = m.as_optional<uint64_t>();
-        return o.has_value() ? *o : 0;
-    }
-    if (m.holds_alternative<uint32_t>()) {
-        const auto& o = m.as_optional<uint32_t>();
-        return o.has_value() ? static_cast<uint64_t>(*o) : 0;
-    }
-    if (m.holds_alternative<int64_t>()) {
-        const auto& o = m.as_optional<int64_t>();
-        return o.has_value() && *o > 0 ? static_cast<uint64_t>(*o) : 0;
-    }
-    if (m.holds_alternative<int32_t>()) {
-        const auto& o = m.as_optional<int32_t>();
-        return o.has_value() && *o > 0 ? static_cast<uint64_t>(*o) : 0;
-    }
-    return 0;
-}
-
-static void AccumulateFecFromReport(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report,
-                                    bool* any_fec_named_counter,
-                                    uint64_t* max_value) {
-    if (!report || !any_fec_named_counter || !max_value) {
-        return;
-    }
-    for (const webrtc::RTCStats& st : *report) {
-        for (const webrtc::Attribute& mem : st.Attributes()) {
-            if (!mem.has_value()) {
-                continue;
-            }
-            std::string name = mem.name();
-            if (!NameContainsFec(name)) {
-                continue;
-            }
-            uint64_t v = StatsAttrToUint(mem);
-            *any_fec_named_counter = true;
-            if (v > *max_value) {
-                *max_value = v;
-            }
-        }
-    }
-}
-
-uint64_t JsonUintAfterKey(const std::string& j, const char* key) {
-    const std::string needle = std::string("\"") + key + "\"";
-    size_t p = j.find(needle);
-    if (p == std::string::npos) {
-        return UINT64_MAX;
-    }
-    p = j.find(':', p + needle.size());
-    if (p == std::string::npos) {
-        return UINT64_MAX;
-    }
-    ++p;
-    while (p < j.size() && std::isspace(static_cast<unsigned char>(j[p]))) {
-        ++p;
-    }
-    if (p >= j.size() || !std::isdigit(static_cast<unsigned char>(j[p]))) {
-        return UINT64_MAX;
-    }
-    uint64_t v = 0;
-    while (p < j.size() && std::isdigit(static_cast<unsigned char>(j[p]))) {
-        v = v * 10 + static_cast<uint64_t>(j[p] - '0');
-        ++p;
-    }
-    return v;
-}
 
 webrtc::PeerConnectionInterface::RTCConfiguration MakeRtcConfig() {
     webrtc::PeerConnectionInterface::RTCConfiguration rtc_config;
@@ -188,20 +100,6 @@ private:
     std::function<void(webrtc::RTCError)> fn_;
 };
 
-class StatsDeliveredCallback : public webrtc::RTCStatsCollectorCallback {
-public:
-    explicit StatsDeliveredCallback(std::function<void(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>&)> fn)
-        : fn_(std::move(fn)) {}
-    void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
-        if (fn_) {
-            fn_(report);
-        }
-    }
-
-private:
-    std::function<void(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>&)> fn_;
-};
-
 }  // namespace
 
 class VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
@@ -246,13 +144,7 @@ public:
         : signaling_(std::make_unique<webrtc_demo::SignalingClient>(url, "subscriber", stream_id)),
           recv_config_(recv) {}
 
-    void SetFlexfecOptions(bool enable, std::string override_trials) {
-        flexfec_enable_ = enable;
-        flexfec_override_ = std::move(override_trials);
-    }
-
     bool Initialize() {
-        webrtc_demo::EnsureFlexfecFieldTrials(flexfec_enable_, flexfec_override_);
         std::cout << "[PullSubscriber] Initializing WebRTC (native API)..." << std::endl;
         if (!webrtc::InitializeSSL()) {
             return false;
@@ -471,68 +363,6 @@ public:
         on_connection_state_(cs);
     }
 
-    void DumpInboundFecReceiverStats(std::ostream& out, int timeout_ms) {
-        webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            pc = peer_connection_;
-        }
-        if (!pc) {
-            out << "[fec-verify] fecPacketsReceived=NO_PEER_CONNECTION\n";
-            return;
-        }
-
-        struct Agg {
-            bool had_key{false};
-            uint64_t max_val{0};
-        };
-        auto agg = std::make_shared<Agg>();
-        auto done = std::make_shared<std::promise<void>>();
-        std::future<void> fut = done->get_future();
-
-        auto cb = webrtc::scoped_refptr<webrtc::RTCStatsCollectorCallback>(
-            new webrtc::RefCountedObject<StatsDeliveredCallback>(
-                [agg, done](const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) {
-                    const bool debug = std::getenv("P2P_FEC_STATS_DEBUG") != nullptr;
-                    std::ofstream dbg;
-                    if (debug) {
-                        dbg.open("/tmp/webrtc_fec_stats_debug.txt", std::ios::out | std::ios::trunc);
-                    }
-                    if (report) {
-                        if (debug && dbg) {
-                            dbg << report->ToJson() << "\n";
-                        }
-                        AccumulateFecFromReport(report, &agg->had_key, &agg->max_val);
-                        std::string j = report->ToJson();
-                        static const char* kJsonKeys[] = {"fecPacketsReceived", "fecBytesReceived", "fecPacketsSent",
-                                                          "fecBytesSent"};
-                        for (const char* key : kJsonKeys) {
-                            uint64_t v = JsonUintAfterKey(j, key);
-                            if (v != UINT64_MAX) {
-                                agg->had_key = true;
-                                if (v > agg->max_val) {
-                                    agg->max_val = v;
-                                }
-                            }
-                        }
-                    }
-                    done->set_value();
-                }));
-
-        pc->GetStats(cb.get());
-
-        if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
-            out << "[fec-verify] fecPacketsReceived=STATS_TIMEOUT\n";
-            return;
-        }
-
-        if (agg->had_key) {
-            out << "[fec-verify] fecPacketsReceived=" << agg->max_val << "\n";
-        } else {
-            out << "[fec-verify] fecPacketsReceived=KEY_MISSING\n";
-        }
-    }
-
     std::unique_ptr<webrtc_demo::SignalingClient> signaling_;
     PullSubscriberConfig recv_config_;
     std::unique_ptr<webrtc::Thread> owned_signaling_thread_;
@@ -543,8 +373,6 @@ public:
     std::mutex mutex_;
     OnConnectionStateCallback on_connection_state_;
     OnErrorCallback on_error_;
-    bool flexfec_enable_{false};
-    std::string flexfec_override_;
 
 private:
     void AttachVideo(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> r) {
@@ -580,14 +408,6 @@ PullSubscriber::PullSubscriber(const std::string& signaling_url,
 
 PullSubscriber::~PullSubscriber() {
     Stop();
-}
-
-void PullSubscriber::SetFlexfecOptions(bool enable, const std::string& field_trials_override) {
-    impl_->SetFlexfecOptions(enable, field_trials_override);
-}
-
-void PullSubscriber::DumpInboundFecReceiverStats(std::ostream& out, int timeout_ms) {
-    impl_->DumpInboundFecReceiverStats(out, timeout_ms);
 }
 
 void PullSubscriber::Play() {

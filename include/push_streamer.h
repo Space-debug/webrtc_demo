@@ -3,7 +3,6 @@
 
 #include <atomic>
 #include <functional>
-#include <iosfwd>
 #include <memory>
 #include <string>
 #include <vector>
@@ -70,17 +69,6 @@ struct PushStreamerConfig {
     /// MPP MJPEG→NV12 路径下 NV12 环形缓冲个数（须 ≥ 下游同时持有的帧数）；范围 4～16。
     int nv12_pool_slots{6};
 
-    /// FlexFEC-03：在 LibWebRTC::Initialize 前注入 WEBRTC_FIELD_TRIALS；拉流端也需开启
-    bool enable_flexfec{false};
-    /// 非空则作为完整 trials 串覆盖默认；通常留空即可
-    std::string flexfec_field_trials;
-
-    /// 周期性 GetStats：与采集帧计数对齐，对累计类指标做相邻两次采样的差分，再除以间隔帧数得到 ms/帧（近似窗内平均）
-    bool latency_stats_enable{false};
-    /// 至少间隔多少采集帧才输出一行「窗内平均」（默认 60）
-    int latency_stats_window_frames{60};
-    /// LATENCY_STATS 开启时主循环睡眠间隔（ms），降低 GetStats 频率以省 CPU（建议 200～500）
-    int latency_stats_poll_ms{250};
 };
 
 /// SDP 回调：用于将 SDP 发送到信令服务器
@@ -145,12 +133,6 @@ public:
 
     /// 是否正在推流
     bool IsStreaming() const { return is_streaming_.load(std::memory_order_acquire); }
-
-    /// GetStats one-line latency summary per active PeerConnection (English logs).
-    void LogLatencyStatsForAllPeers(std::ostream& out);
-
-    /// Rolling window delta/GetStats (see LATENCY_STATS_*). English [stats-latency-avg] and [latency-pipeline].
-    void LogLatencyStatsRollingAvg(std::ostream& out);
 
 private:
     class Impl;
