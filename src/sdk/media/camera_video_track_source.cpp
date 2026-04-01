@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <iostream>
+#include <cstdlib>
 #endif
 
 namespace webrtc_demo {
@@ -69,6 +70,9 @@ void CameraVideoTrackSource::StopDirectV4l2() {
         jpeg_queue_.clear();
     }
     decode_worker_exit_ = false;
+    nv12_pool_.clear();
+    nv12_pool_w_ = nv12_pool_h_ = 0;
+    nv12_ring_next_ = 0;
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
     mjpeg_mpp_.reset();
 #endif
@@ -89,6 +93,74 @@ void CameraVideoTrackSource::StopDirectV4l2() {
     }
     direct_cap_w_ = direct_cap_h_ = 0;
     direct_pixfmt_ = 0;
+}
+
+void CameraVideoTrackSource::ApplyMjpegPipelineOptions(const V4l2MjpegPipelineOptions* p) {
+    V4l2MjpegPipelineOptions def;
+    const V4l2MjpegPipelineOptions& o = p ? *p : def;
+    mjpeg_queue_latest_only_ = o.mjpeg_queue_latest_only;
+    int qmax = o.mjpeg_queue_max;
+    if (qmax < 1) {
+        qmax = 1;
+    }
+    if (qmax > 32) {
+        qmax = 32;
+    }
+    mjpeg_queue_max_ = static_cast<size_t>(qmax);
+    int slots = o.nv12_pool_slots;
+    if (slots < 4) {
+        slots = 4;
+    }
+    if (slots > 16) {
+        slots = 16;
+    }
+    nv12_pool_slots_ = slots;
+
+    if (const char* e = std::getenv("WEBRTC_MJPEG_QUEUE_LATEST_ONLY")) {
+        const char c = e[0];
+        if (c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T') {
+            mjpeg_queue_latest_only_ = true;
+        }
+        if (c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F') {
+            mjpeg_queue_latest_only_ = false;
+        }
+    }
+    if (const char* e = std::getenv("WEBRTC_MJPEG_QUEUE_MAX")) {
+        const int v = std::atoi(e);
+        if (v >= 1 && v <= 32) {
+            mjpeg_queue_max_ = static_cast<size_t>(v);
+        }
+    }
+    if (const char* e = std::getenv("WEBRTC_NV12_POOL_SLOTS")) {
+        const int v = std::atoi(e);
+        if (v >= 4 && v <= 16) {
+            nv12_pool_slots_ = v;
+        }
+    }
+}
+
+void CameraVideoTrackSource::EnsureNv12Pool(int w, int h) {
+    const int slots = nv12_pool_slots_;
+    if (w <= 0 || h <= 0 || slots < 4) {
+        return;
+    }
+    if (nv12_pool_.size() == static_cast<size_t>(slots) && nv12_pool_w_ == w && nv12_pool_h_ == h) {
+        return;
+    }
+    nv12_pool_.clear();
+    nv12_pool_.reserve(static_cast<size_t>(slots));
+    for (int i = 0; i < slots; ++i) {
+        webrtc::scoped_refptr<webrtc::NV12Buffer> b = webrtc::NV12Buffer::Create(w, h);
+        if (!b) {
+            nv12_pool_.clear();
+            nv12_pool_w_ = nv12_pool_h_ = 0;
+            return;
+        }
+        nv12_pool_.push_back(std::move(b));
+    }
+    nv12_pool_w_ = w;
+    nv12_pool_h_ = h;
+    nv12_ring_next_ = 0;
 }
 
 bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width, int height, int fps) {
@@ -378,15 +450,31 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t
     bool ok = false;
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
     if (mjpeg_mpp_ && direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
-        webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 = webrtc::NV12Buffer::Create(w, h);
-        if (mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get())) {
-            webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
-                                           .set_video_frame_buffer(nv12)
-                                           .set_timestamp_us(webrtc::TimeMicros())
-                                           .set_rotation(webrtc::kVideoRotation_0)
-                                           .build();
-            OnFrame(frame);
-            return;
+        EnsureNv12Pool(w, h);
+        if (!nv12_pool_.empty()) {
+            webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 =
+                nv12_pool_[nv12_ring_next_ % nv12_pool_.size()];
+            ++nv12_ring_next_;
+            if (mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get())) {
+                webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                               .set_video_frame_buffer(nv12)
+                                               .set_timestamp_us(webrtc::TimeMicros())
+                                               .set_rotation(webrtc::kVideoRotation_0)
+                                               .build();
+                OnFrame(frame);
+                return;
+            }
+        } else {
+            webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 = webrtc::NV12Buffer::Create(w, h);
+            if (nv12 && mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get())) {
+                webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                               .set_video_frame_buffer(nv12)
+                                               .set_timestamp_us(webrtc::TimeMicros())
+                                               .set_rotation(webrtc::kVideoRotation_0)
+                                               .build();
+                OnFrame(frame);
+                return;
+            }
         }
     }
 #endif
@@ -440,8 +528,12 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
                 memcpy(copy.data(), src, buf.bytesused);
                 {
                     std::lock_guard<std::mutex> lk(jpeg_queue_mu_);
-                    while (jpeg_queue_.size() >= kJpegQueueMax) {
-                        jpeg_queue_.pop_front();
+                    if (mjpeg_queue_latest_only_) {
+                        jpeg_queue_.clear();
+                    } else {
+                        while (jpeg_queue_.size() >= mjpeg_queue_max_) {
+                            jpeg_queue_.pop_front();
+                        }
                     }
                     jpeg_queue_.push_back(std::move(copy));
                 }
@@ -470,9 +562,13 @@ void CameraVideoTrackSource::Stop() {
 }
 
 bool CameraVideoTrackSource::Start(const char* device_unique_id, int width, int height, int fps,
-                                   bool prefer_mpp_mjpeg_decode) {
+                                   bool prefer_mpp_mjpeg_decode,
+                                   const V4l2MjpegPipelineOptions* mjpeg_pipeline) {
     Stop();
     prefer_mpp_mjpeg_decode_ = prefer_mpp_mjpeg_decode;
+#if defined(WEBRTC_LINUX) && defined(__linux__)
+    ApplyMjpegPipelineOptions(mjpeg_pipeline);
+#endif
     if (!device_unique_id || !device_unique_id[0]) {
         return false;
     }

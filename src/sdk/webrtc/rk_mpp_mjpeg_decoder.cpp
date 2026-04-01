@@ -96,13 +96,6 @@ void RkMppMjpegDecoder::Close() {
     output_buf_size_ = 0;
 }
 
-bool RkMppMjpegDecoder::EnsureJpegCopyCapacity(size_t len) {
-    if (jpeg_copy_.size() < len) {
-        jpeg_copy_.resize(len);
-    }
-    return true;
-}
-
 size_t RkMppMjpegDecoder::ComputeJpegOutputBufSize(int width, int height) {
     if (width <= 0 || height <= 0) {
         return 0;
@@ -191,7 +184,10 @@ bool RkMppMjpegDecoder::Init() {
     return true;
 }
 
-bool RkMppMjpegDecoder::BuildMppPacketFromJpeg(size_t jpeg_len, void** out_packet) {
+bool RkMppMjpegDecoder::BuildMppPacketFromJpeg(const uint8_t* jpeg, size_t jpeg_len, void** out_packet) {
+    if (!jpeg || jpeg_len == 0) {
+        return false;
+    }
     MppBufferGroup ig = reinterpret_cast<MppBufferGroup>(input_group_);
     MppBuffer mbuf = nullptr;
     if (mpp_buffer_get(ig, &mbuf, jpeg_len) != MPP_OK || !mbuf) {
@@ -200,7 +196,12 @@ bool RkMppMjpegDecoder::BuildMppPacketFromJpeg(size_t jpeg_len, void** out_packe
         }
         return false;
     }
-    std::memcpy(mpp_buffer_get_ptr(mbuf), jpeg_copy_.data(), jpeg_len);
+    void* dst = mpp_buffer_get_ptr(mbuf);
+    if (!dst) {
+        mpp_buffer_put(mbuf);
+        return false;
+    }
+    std::memcpy(dst, jpeg, jpeg_len);
     mpp_buffer_set_index(mbuf, kMppBufferGroupIndex);
 
     MppPacket packet = nullptr;
@@ -339,10 +340,6 @@ bool RkMppMjpegDecoder::DecodeJpegToI420(const uint8_t* jpeg,
     if (output_buf_size_ == 0) {
         return false;
     }
-    if (!EnsureJpegCopyCapacity(jpeg_len)) {
-        return false;
-    }
-    std::memcpy(jpeg_copy_.data(), jpeg, jpeg_len);
 
     bool decoded = false;
     constexpr int kMaxSubmit = 8;
@@ -350,7 +347,7 @@ bool RkMppMjpegDecoder::DecodeJpegToI420(const uint8_t* jpeg,
 
     for (int submit = 0; submit < kMaxSubmit && !decoded; ++submit) {
         MppPacket packet = nullptr;
-        if (!BuildMppPacketFromJpeg(jpeg_len, reinterpret_cast<void**>(&packet))) {
+        if (!BuildMppPacketFromJpeg(jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
             return false;
         }
         if (!SendMppPacket(packet)) {
@@ -412,9 +409,9 @@ bool RkMppMjpegDecoder::DecodeJpegToI420(const uint8_t* jpeg,
 
             const RK_U32 fmt = mpp_frame_get_fmt(frame);
             const int hs = static_cast<int>(mpp_frame_get_hor_stride(frame));
-            const int vs = static_cast<int>(mpp_frame_get_ver_stride(frame));
+            const int ver_stride = static_cast<int>(mpp_frame_get_ver_stride(frame));
             const uint8_t* src_y = yuv;
-            const uint8_t* src_uv = yuv + static_cast<size_t>(hs) * static_cast<size_t>(vs);
+            const uint8_t* src_uv = yuv + static_cast<size_t>(hs) * static_cast<size_t>(ver_stride);
 
             int conv = 0;
             if (fmt == MPP_FMT_YUV420SP) {
@@ -477,10 +474,6 @@ bool RkMppMjpegDecoder::DecodeJpegToNV12(const uint8_t* jpeg,
     if (output_buf_size_ == 0) {
         return false;
     }
-    if (!EnsureJpegCopyCapacity(jpeg_len)) {
-        return false;
-    }
-    std::memcpy(jpeg_copy_.data(), jpeg, jpeg_len);
 
     bool decoded = false;
     constexpr int kMaxSubmit = 8;
@@ -488,7 +481,7 @@ bool RkMppMjpegDecoder::DecodeJpegToNV12(const uint8_t* jpeg,
 
     for (int submit = 0; submit < kMaxSubmit && !decoded; ++submit) {
         MppPacket packet = nullptr;
-        if (!BuildMppPacketFromJpeg(jpeg_len, reinterpret_cast<void**>(&packet))) {
+        if (!BuildMppPacketFromJpeg(jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
             return false;
         }
         if (!SendMppPacket(packet)) {

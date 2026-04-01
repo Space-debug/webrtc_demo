@@ -211,6 +211,19 @@ int main(int argc, char* argv[]) {
             cfg.GetStreamInt(stream_id, "USE_ROCKCHIP_MPP_MJPEG_DECODE", 1) != 0;
         config.use_rockchip_dual_mpp_mjpeg_h264 =
             cfg.GetStreamInt(stream_id, "USE_DUAL_MPP_MJPEG_H264", 0) != 0;
+        {
+            std::string mql = cfg.GetStream(stream_id, "MJPEG_QUEUE_LATEST_ONLY", "");
+            if (mql.empty()) {
+                mql = "0";
+            }
+            for (auto& c : mql) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            config.mjpeg_queue_latest_only =
+                (mql == "1" || mql == "true" || mql == "yes" || mql == "on");
+        }
+        config.mjpeg_queue_max = cfg.GetStreamInt(stream_id, "MJPEG_QUEUE_MAX", 8);
+        config.nv12_pool_slots = cfg.GetStreamInt(stream_id, "NV12_POOL_SLOTS", 6);
         config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
         config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
         config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);

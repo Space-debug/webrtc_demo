@@ -20,7 +20,18 @@
 #include "media/base/adapted_video_track_source.h"
 #include "modules/video_capture/video_capture.h"
 
+#if defined(WEBRTC_LINUX) && defined(__linux__)
+#include "api/video/nv12_buffer.h"
+#endif
+
 namespace webrtc_demo {
+
+/// Linux 直采 MJPEG 时的队列与 NV12 池参数（传入 nullptr 则用默认值）。
+struct V4l2MjpegPipelineOptions {
+    bool mjpeg_queue_latest_only = false;
+    int mjpeg_queue_max = 8;
+    int nv12_pool_slots = 6;
+};
 #if defined(WEBRTC_LINUX) && defined(__linux__) && defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
 class RkMppMjpegDecoder;
 #endif
@@ -37,8 +48,10 @@ public:
 
     /// Start V4L2 capture on device unique id (from DeviceInfo)。
     /// prefer_mpp_mjpeg_decode：Linux 且编译启用 MPP 时，MJPEG 直采可尝试硬件解码（见 USE_ROCKCHIP_MPP_MJPEG_DECODE）。
+    /// mjpeg_pipeline：仅 Linux 直采 MJPEG 使用；nullptr 为默认队列与 NV12 池尺寸。
     bool Start(const char* device_unique_id, int width, int height, int fps,
-               bool prefer_mpp_mjpeg_decode = true);
+               bool prefer_mpp_mjpeg_decode = true,
+               const V4l2MjpegPipelineOptions* mjpeg_pipeline = nullptr);
 
     /// Linux 直采路径在 Start 成功后可用；与 config WIDTH/HEIGHT 对比可判断是否要改配置以减少缩放。
     bool GetNegotiatedCaptureSize(int* width, int* height) const;
@@ -70,6 +83,8 @@ private:
     /// MJPEG：拷贝压缩帧后尽快 QBUF；在此线程里解码并 OnFrame，避免采集线程被 MPP/软解拖死。
     void DecodeWorkerThreadMain();
     void ProcessV4l2CapturedFrame(const uint8_t* src, size_t bytesused);
+    void ApplyMjpegPipelineOptions(const V4l2MjpegPipelineOptions* mjpeg_pipeline);
+    void EnsureNv12Pool(int w, int h);
 
     std::thread direct_thread_;
     std::thread decode_thread_;
@@ -77,7 +92,13 @@ private:
     std::condition_variable jpeg_queue_cv_;
     std::deque<std::vector<uint8_t>> jpeg_queue_;
     bool decode_worker_exit_{false};
-    static constexpr size_t kJpegQueueMax = 8;
+    bool mjpeg_queue_latest_only_{false};
+    size_t mjpeg_queue_max_{8};
+    int nv12_pool_slots_{6};
+    std::vector<webrtc::scoped_refptr<webrtc::NV12Buffer>> nv12_pool_;
+    int nv12_pool_w_{0};
+    int nv12_pool_h_{0};
+    size_t nv12_ring_next_{0};
     std::atomic<bool> direct_run_{false};
     int direct_fd_{-1};
     int direct_cap_w_{0};

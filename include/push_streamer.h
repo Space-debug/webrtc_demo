@@ -63,6 +63,13 @@ struct PushStreamerConfig {
     /// 默认 false：部分旧 BSP 同进程双 MPP 曾不稳定；RK 新 BSP + 当前 GStreamer 风格 MJPEG 解码可尝试设为 1。
     bool use_rockchip_dual_mpp_mjpeg_h264{false};
 
+    /// Linux 直采 MJPEG：队列仅保留「最新一帧」压缩数据，降低解码排队延迟（运动场景可能丢帧）。
+    bool mjpeg_queue_latest_only{false};
+    /// MJPEG 压缩帧队列深度上限（latest_only 关闭时满则丢最旧）；范围 1～32。
+    int mjpeg_queue_max{8};
+    /// MPP MJPEG→NV12 路径下 NV12 环形缓冲个数（须 ≥ 下游同时持有的帧数）；范围 4～16。
+    int nv12_pool_slots{6};
+
     /// FlexFEC-03：在 LibWebRTC::Initialize 前注入 WEBRTC_FIELD_TRIALS；拉流端也需开启
     bool enable_flexfec{false};
     /// 非空则作为完整 trials 串覆盖默认；通常留空即可

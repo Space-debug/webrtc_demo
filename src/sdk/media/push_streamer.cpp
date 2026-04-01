@@ -1376,9 +1376,13 @@ public:
             std::cout << "[PushStreamer] Dual MPP: MJPEG hardware decode + H.264 hardware encode (experimental).\n";
         }
 #endif
+        V4l2MjpegPipelineOptions mjpeg_pipe;
+        mjpeg_pipe.mjpeg_queue_latest_only = config_.mjpeg_queue_latest_only;
+        mjpeg_pipe.mjpeg_queue_max = config_.mjpeg_queue_max;
+        mjpeg_pipe.nv12_pool_slots = config_.nv12_pool_slots;
         if (!static_cast<CameraVideoTrackSource*>(cam_holder)
                  ->Start(unique_id.c_str(), config_.video_width, config_.video_height, config_.video_fps,
-                         mpp_mjpeg_decode)) {
+                         mpp_mjpeg_decode, &mjpeg_pipe)) {
             std::cerr << "[PushStreamer] CameraVideoTrackSource::Start failed" << std::endl;
             if (frame_counter_ && camera_source_) {
                 camera_source_->RemoveSink(frame_counter_.get());

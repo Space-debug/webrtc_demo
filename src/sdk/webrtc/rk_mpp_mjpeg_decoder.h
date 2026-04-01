@@ -3,7 +3,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 
 namespace webrtc {
 class I420Buffer;
@@ -42,13 +41,13 @@ class RkMppMjpegDecoder {
                         webrtc::NV12Buffer* out_nv12);
 
  private:
-  bool EnsureJpegCopyCapacity(size_t len);
   static size_t ComputeJpegOutputBufSize(int width, int height);
-
-  bool BuildMppPacketFromJpeg(size_t jpeg_len, void** out_packet);
   bool SendMppPacket(void* packet);
   void* PollMppFrame(int timeout_ms);
   bool HandleInfoChangeFrame(void* frame);
+
+  /// JPEG 比特流直接拷入 Mpp 输入 buffer（省去中间 staging 向量的一次 memcpy）。
+  bool BuildMppPacketFromJpeg(const uint8_t* jpeg, size_t jpeg_len, void** out_packet);
 
   void* ctx_{nullptr};
   void* mpi_{nullptr};
@@ -59,7 +58,6 @@ class RkMppMjpegDecoder {
   /// 与 GstMppJpegDec::input_group 一致：JPEG 码流拷贝进 MppBuffer 再封包
   void* input_group_{nullptr};
 
-  std::vector<uint8_t> jpeg_copy_;
   int last_expect_w_{0};
   int last_expect_h_{0};
   size_t output_buf_size_{0};
