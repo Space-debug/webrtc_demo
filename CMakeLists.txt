@@ -54,6 +54,7 @@ if(WEBRTC_DEMO_ENABLE_ROCKCHIP_MPP AND UNIX AND NOT APPLE)
         PATHS /usr/lib/aarch64-linux-gnu /usr/lib/arm-linux-gnueabihf /usr/lib)
     if(WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE AND WEBRTC_DEMO_ROCKCHIP_MPP_LIB)
         list(APPEND WEBRTC_SDK_SOURCES
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/mpp_native_dec_frame_buffer.cpp
             ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_h264_encoder.cpp
             ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_mjpeg_decoder.cpp
             ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_video_encoder_factory.cpp)

@@ -779,6 +779,8 @@ public:
         mjpeg_pipe.mjpeg_queue_latest_only = config_.mjpeg_queue_latest_only;
         mjpeg_pipe.mjpeg_queue_max = config_.mjpeg_queue_max;
         mjpeg_pipe.nv12_pool_slots = config_.nv12_pool_slots;
+        mjpeg_pipe.v4l2_buffer_count = config_.v4l2_buffer_count;
+        mjpeg_pipe.v4l2_poll_timeout_ms = config_.v4l2_poll_timeout_ms;
         if (!static_cast<CameraVideoTrackSource*>(cam_holder)
                  ->Start(unique_id.c_str(), config_.video_width, config_.video_height, config_.video_fps,
                          mpp_mjpeg_decode, &mjpeg_pipe)) {

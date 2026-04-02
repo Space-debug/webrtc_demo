@@ -31,6 +31,10 @@ struct V4l2MjpegPipelineOptions {
     bool mjpeg_queue_latest_only = false;
     int mjpeg_queue_max = 8;
     int nv12_pool_slots = 6;
+    /// V4L2 MMAP 缓冲个数；低延迟可设 2（需解码跟得上采集）。范围 2～32。
+    int v4l2_buffer_count = 2;
+    /// poll 超时毫秒；有数据即返回，仅影响无数据时的唤醒间隔。
+    int v4l2_poll_timeout_ms = 50;
 };
 #if defined(WEBRTC_LINUX) && defined(__linux__) && defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
 class RkMppMjpegDecoder;
@@ -85,16 +89,24 @@ private:
     void ProcessV4l2CapturedFrame(const uint8_t* src, size_t bytesused);
     void ApplyMjpegPipelineOptions(const V4l2MjpegPipelineOptions* mjpeg_pipeline);
     void EnsureNv12Pool(int w, int h);
+    void QBufV4l2Index(unsigned int index);
+    /// MJPEG：仅传 mmap 索引，解码后再 QBUF，避免压缩 JPEG 再 memcpy 一整份到队列。
+    struct MjpegPendingBuf {
+        unsigned int index{0};
+        size_t bytesused{0};
+    };
 
     std::thread direct_thread_;
     std::thread decode_thread_;
     std::mutex jpeg_queue_mu_;
     std::condition_variable jpeg_queue_cv_;
-    std::deque<std::vector<uint8_t>> jpeg_queue_;
+    std::deque<MjpegPendingBuf> jpeg_queue_;
     bool decode_worker_exit_{false};
     bool mjpeg_queue_latest_only_{false};
     size_t mjpeg_queue_max_{8};
     int nv12_pool_slots_{6};
+    int v4l2_buffer_count_{2};
+    int v4l2_poll_timeout_ms_{50};
     std::vector<webrtc::scoped_refptr<webrtc::NV12Buffer>> nv12_pool_;
     int nv12_pool_w_{0};
     int nv12_pool_h_{0};

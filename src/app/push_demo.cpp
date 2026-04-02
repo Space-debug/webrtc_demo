@@ -59,6 +59,7 @@ void PrintUsage(const char* prog) {
               << "Environment:\n"
               << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N   Min frames before Offer (0=off)\n"
               << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N   Max wait for gate (seconds)\n"
+              << "  WEBRTC_MJPEG_TO_H264_TRACE=1   Log MJPEG process start → H264 ready (us), every 30 frames (MPP enc)\n"
               << "Arguments:\n"
               << "  stream_id         Stream ID; omitted -> STREAM_ID in config\n"
               << "  camera            Device path/index; omitted -> STREAM_<id>_CAMERA\n"
@@ -204,6 +205,8 @@ int main(int argc, char* argv[]) {
         }
         config.mjpeg_queue_max = cfg.GetStreamInt(stream_id, "MJPEG_QUEUE_MAX", 8);
         config.nv12_pool_slots = cfg.GetStreamInt(stream_id, "NV12_POOL_SLOTS", 6);
+        config.v4l2_buffer_count = cfg.GetStreamInt(stream_id, "V4L2_BUFFER_COUNT", 2);
+        config.v4l2_poll_timeout_ms = cfg.GetStreamInt(stream_id, "V4L2_POLL_TIMEOUT_MS", 50);
         config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
         config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
         config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);
@@ -260,6 +263,18 @@ int main(int argc, char* argv[]) {
         }
         if (config.capture_gate_max_wait_sec < 1) {
             config.capture_gate_max_wait_sec = 1;
+        }
+        if (config.v4l2_buffer_count < 2) {
+            config.v4l2_buffer_count = 2;
+        }
+        if (config.v4l2_buffer_count > 32) {
+            config.v4l2_buffer_count = 32;
+        }
+        if (config.v4l2_poll_timeout_ms < 1) {
+            config.v4l2_poll_timeout_ms = 1;
+        }
+        if (config.v4l2_poll_timeout_ms > 2000) {
+            config.v4l2_poll_timeout_ms = 2000;
         }
         if (config.bitrate_mode == "cbr") {
             config.min_bitrate_kbps = config.target_bitrate_kbps;

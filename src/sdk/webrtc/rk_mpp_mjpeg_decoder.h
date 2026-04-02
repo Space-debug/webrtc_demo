@@ -4,12 +4,16 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "api/scoped_refptr.h"
+
 namespace webrtc {
 class I420Buffer;
 class NV12Buffer;
 }
 
 namespace webrtc_demo {
+
+class MppNativeDecFrameBuffer;
 
 /// Rockchip MPP MJPEG 硬件解码；可输出 I420（经 libyuv）或紧凑 NV12（直拷 Y/UV，供 MPP 硬编零 libyuv 色度转换）。
 /// 实现路径对齐 GStreamer gstmppjpegdec.c + gstmppdec.c：
@@ -39,6 +43,13 @@ class RkMppMjpegDecoder {
                         int expect_w,
                         int expect_h,
                         webrtc::NV12Buffer* out_nv12);
+
+  /// 解码输出保留为 MppFrame（kNative），供 MPP H264 零拷贝编码；失败时 out 不赋值。
+  bool DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
+                                  size_t jpeg_len,
+                                  int expect_w,
+                                  int expect_h,
+                                  webrtc::scoped_refptr<MppNativeDecFrameBuffer>* out);
 
  private:
   static size_t ComputeJpegOutputBufSize(int width, int height);

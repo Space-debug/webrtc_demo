@@ -2,6 +2,8 @@
 
 #include "webrtc/rk_mpp_mjpeg_decoder.h"
 
+#include "webrtc/mpp_native_dec_frame_buffer.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -565,6 +567,124 @@ bool RkMppMjpegDecoder::DecodeJpegToNV12(const uint8_t* jpeg,
 
     if (!decoded && MjpegDecTraceEnabled()) {
         std::cerr << "[RkMppMjpeg] DecodeJpegToNV12 failed after resubmit loop\n";
+    }
+    return decoded;
+}
+
+bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
+                                                  size_t jpeg_len,
+                                                  int expect_w,
+                                                  int expect_h,
+                                                  webrtc::scoped_refptr<MppNativeDecFrameBuffer>* out) {
+    if (!out) {
+        return false;
+    }
+    *out = nullptr;
+    if (!ctx_ || !mpi_ || !jpeg || jpeg_len == 0) {
+        return false;
+    }
+    if (expect_w <= 0 || expect_h <= 0) {
+        return false;
+    }
+    if (expect_w != last_expect_w_ || expect_h != last_expect_h_) {
+        last_expect_w_ = expect_w;
+        last_expect_h_ = expect_h;
+        output_buf_size_ = ComputeJpegOutputBufSize(expect_w, expect_h);
+    }
+    if (output_buf_size_ == 0) {
+        return false;
+    }
+
+    bool decoded = false;
+    constexpr int kMaxSubmit = 8;
+    constexpr int kMaxPollPerSubmit = 500;
+
+    for (int submit = 0; submit < kMaxSubmit && !decoded; ++submit) {
+        MppPacket packet = nullptr;
+        if (!BuildMppPacketFromJpeg(jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
+            return false;
+        }
+        if (!SendMppPacket(packet)) {
+            mpp_packet_deinit(&packet);
+            if (MjpegDecTraceEnabled()) {
+                std::cerr << "[RkMppMjpeg] NativeDec: SendMppPacket failed submit=" << submit << "\n";
+            }
+            return false;
+        }
+
+        bool need_resubmit = false;
+        for (int poll_i = 0; poll_i < kMaxPollPerSubmit; ++poll_i) {
+            MppFrame frame = static_cast<MppFrame>(PollMppFrame(30));
+            if (!frame) {
+                usleep(2000);
+                continue;
+            }
+            if (mpp_frame_get_info_change(frame)) {
+                if (!HandleInfoChangeFrame(frame)) {
+                    mpp_frame_deinit(&frame);
+                    return false;
+                }
+                mpp_frame_deinit(&frame);
+                need_resubmit = true;
+                break;
+            }
+
+            const RK_U32 err = mpp_frame_get_errinfo(frame);
+            const RK_U32 discard = mpp_frame_get_discard(frame);
+            if (err || discard) {
+                if (MjpegDecTraceEnabled()) {
+                    std::cerr << "[RkMppMjpeg] NativeDec: errinfo=" << err << " discard=" << discard << "\n";
+                }
+                mpp_frame_deinit(&frame);
+                return false;
+            }
+
+            const int fw = static_cast<int>(mpp_frame_get_width(frame));
+            const int fh = static_cast<int>(mpp_frame_get_height(frame));
+            if (fw != expect_w || fh != expect_h) {
+                if (MjpegDecTraceEnabled()) {
+                    std::cerr << "[RkMppMjpeg] NativeDec: size mismatch decoded " << fw << "x" << fh << " expect "
+                              << expect_w << "x" << expect_h << "\n";
+                }
+                mpp_frame_deinit(&frame);
+                return false;
+            }
+
+            MppBuffer mbuf = mpp_frame_get_buffer(frame);
+            if (!mbuf) {
+                mpp_frame_deinit(&frame);
+                return false;
+            }
+            if (!mpp_buffer_get_ptr(mbuf)) {
+                mpp_frame_deinit(&frame);
+                return false;
+            }
+
+            const RK_U32 fmt = mpp_frame_get_fmt(frame);
+            const int hs = static_cast<int>(mpp_frame_get_hor_stride(frame));
+            const int ver_stride = static_cast<int>(mpp_frame_get_ver_stride(frame));
+
+            webrtc::scoped_refptr<MppNativeDecFrameBuffer> wrapped =
+                MppNativeDecFrameBuffer::CreateFromMppFrame(frame, fw, fh, hs, ver_stride, fmt);
+            if (!wrapped) {
+                mpp_frame_deinit(&frame);
+                return false;
+            }
+            *out = wrapped;
+            decoded = true;
+            break;
+        }
+
+        if (!decoded && !need_resubmit) {
+            if (MjpegDecTraceEnabled()) {
+                std::cerr << "[RkMppMjpeg] NativeDec: decode timeout submit=" << submit << "\n";
+            }
+            return false;
+        }
+    }
+
+    if (!decoded && MjpegDecTraceEnabled()) {
+        std::cerr << "[RkMppMjpeg] DecodeJpegToNativeDecFrame failed after resubmit loop\n";
     }
     return decoded;
 }

@@ -63,8 +63,12 @@ struct PushStreamerConfig {
 
     /// Linux 直采 MJPEG：队列仅保留「最新一帧」压缩数据，降低解码排队延迟（运动场景可能丢帧）。
     bool mjpeg_queue_latest_only{false};
-    /// MJPEG 压缩帧队列深度上限（latest_only 关闭时满则丢最旧）；范围 1～32。
+    /// MJPEG 压缩帧队列深度上限（latest_only 关闭时满则丢最旧）；范围 1～32；会受 V4L2 缓冲数限制。
     int mjpeg_queue_max{8};
+    /// V4L2 MMAP 缓冲个数，低延迟常用 2；须 ≥2。
+    int v4l2_buffer_count{2};
+    /// poll 超时(ms)，有数据即返回。
+    int v4l2_poll_timeout_ms{50};
     /// MPP MJPEG→NV12 路径下 NV12 环形缓冲个数（须 ≥ 下游同时持有的帧数）；范围 4～16。
     int nv12_pool_slots{6};
 

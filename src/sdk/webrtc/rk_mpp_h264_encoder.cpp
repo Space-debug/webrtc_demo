@@ -4,6 +4,8 @@
 
 #include "webrtc/rk_mpp_h264_encoder.h"
 
+#include "webrtc/mpp_native_dec_frame_buffer.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -35,6 +37,7 @@
 #include "mpp_meta.h"
 #include "mpp_packet.h"
 #include "rk_mpi.h"
+#include "rk_type.h"
 #include "rk_venc_cfg.h"
 #include "rk_venc_rc.h"
 
@@ -179,28 +182,37 @@ static std::vector<uint8_t> RawSingleNalToAnnexB(const uint8_t* p, size_t len) {
     return out;
 }
 
-/// 将 WebRTC NV12（独立 stride）拷入 MPP 帧缓冲（hor_stride×ver_stride，与 I420ToNV12 布局一致）。
+/// 半平面 NV12/NV21 源（共用 chroma stride）拷入 MPP 帧缓冲。
+static void CopySemiPlanarToMppBuffer(const uint8_t* src_y,
+                                      const uint8_t* src_uv,
+                                      int src_stride_y,
+                                      int src_stride_uv,
+                                      uint8_t* dst_base,
+                                      int hor_stride,
+                                      int ver_stride,
+                                      int width,
+                                      int height) {
+    uint8_t* dst_y = dst_base;
+    uint8_t* dst_uv = dst_base + static_cast<size_t>(hor_stride) * static_cast<size_t>(ver_stride);
+    for (int y = 0; y < height; ++y) {
+        memcpy(dst_y + static_cast<size_t>(y) * static_cast<size_t>(hor_stride),
+               src_y + static_cast<size_t>(y) * static_cast<size_t>(src_stride_y), static_cast<size_t>(width));
+    }
+    const int chroma_rows = height / 2;
+    for (int y = 0; y < chroma_rows; ++y) {
+        memcpy(dst_uv + static_cast<size_t>(y) * static_cast<size_t>(hor_stride),
+               src_uv + static_cast<size_t>(y) * static_cast<size_t>(src_stride_uv), static_cast<size_t>(width));
+    }
+}
+
 static void CopyNv12ToMppBuffer(const webrtc::NV12BufferInterface* nv12,
                                 uint8_t* dst_base,
                                 int hor_stride,
                                 int ver_stride,
                                 int width,
                                 int height) {
-    const uint8_t* src_y = nv12->DataY();
-    const uint8_t* src_uv = nv12->DataUV();
-    const int sy = nv12->StrideY();
-    const int suv = nv12->StrideUV();
-    uint8_t* dst_y = dst_base;
-    uint8_t* dst_uv = dst_base + static_cast<size_t>(hor_stride) * static_cast<size_t>(ver_stride);
-    for (int y = 0; y < height; ++y) {
-        memcpy(dst_y + static_cast<size_t>(y) * static_cast<size_t>(hor_stride),
-               src_y + static_cast<size_t>(y) * static_cast<size_t>(sy), static_cast<size_t>(width));
-    }
-    const int chroma_rows = height / 2;
-    for (int y = 0; y < chroma_rows; ++y) {
-        memcpy(dst_uv + static_cast<size_t>(y) * static_cast<size_t>(hor_stride),
-               src_uv + static_cast<size_t>(y) * static_cast<size_t>(suv), static_cast<size_t>(width));
-    }
+    CopySemiPlanarToMppBuffer(nv12->DataY(), nv12->DataUV(), nv12->StrideY(), nv12->StrideUV(), dst_base, hor_stride,
+                              ver_stride, width, height);
 }
 
 static int H264ProfileIdForMpp(const webrtc::VideoCodec* c) {
@@ -497,13 +509,14 @@ void RkMppH264Encoder::SetRates(const webrtc::VideoEncoder::RateControlParameter
 
 webrtc::VideoEncoder::EncoderInfo RkMppH264Encoder::GetEncoderInfo() const {
     webrtc::VideoEncoder::EncoderInfo info;
-    info.supports_native_handle = false;
+    info.supports_native_handle = true;
     info.implementation_name = "rockchip_mpp_h264";
     info.has_trusted_rate_controller = false;
     info.is_hardware_accelerated = true;
     info.supports_simulcast = false;
-    // 空列表时栈默认只喂 I420；声明 NV12 可避免采集 NV12 时在编码前被转成 I420。
-    info.preferred_pixel_formats = {webrtc::VideoFrameBuffer::Type::kNV12,
+    // kNative：MPP MJPEG 解码帧直通硬编；NV12/I420 仍为平面路径。
+    info.preferred_pixel_formats = {webrtc::VideoFrameBuffer::Type::kNative,
+                                    webrtc::VideoFrameBuffer::Type::kNV12,
                                     webrtc::VideoFrameBuffer::Type::kI420};
     return info;
 }
@@ -523,7 +536,60 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     }
 
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> vfb = frame.video_frame_buffer();
-    if (vfb->type() == webrtc::VideoFrameBuffer::Type::kNV12) {
+    MppBuffer input_mpp_buf = reinterpret_cast<MppBuffer>(frm_buf_);
+
+    if (vfb->type() == webrtc::VideoFrameBuffer::Type::kNative) {
+        MppNativeDecFrameBuffer* native = MppNativeDecFrameBuffer::TryGet(vfb);
+        if (native) {
+            MppBuffer ext = reinterpret_cast<MppBuffer>(native->mpp_buffer_handle());
+            if (!ext) {
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            const auto* src_base = static_cast<const uint8_t*>(mpp_buffer_get_ptr(ext));
+            if (!src_base) {
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            const RK_U32 fmt = static_cast<RK_U32>(native->mpp_fmt());
+            const int nhs = native->hor_stride();
+            const int nvs = native->ver_stride();
+            const uint8_t* src_y = src_base;
+            const uint8_t* src_uv = src_base + static_cast<size_t>(nhs) * static_cast<size_t>(nvs);
+            const bool dims_ok = (native->width() == width_ && native->height() == height_);
+            const bool stride_ok = (nhs == hor_stride_ && nvs == ver_stride_);
+            const bool nv12_mpp = (fmt == MPP_FMT_YUV420SP);
+            if (dims_ok && stride_ok && nv12_mpp) {
+                input_mpp_buf = ext;
+            } else if (dims_ok && (nv12_mpp || fmt == MPP_FMT_YUV420SP_VU)) {
+                if (fmt == MPP_FMT_YUV420SP) {
+                    CopySemiPlanarToMppBuffer(src_y, src_uv, nhs, nhs, dst, hor_stride_, ver_stride_, width_, height_);
+                } else {
+                    uint8_t* dst_uv = dst + static_cast<size_t>(hor_stride_) * static_cast<size_t>(ver_stride_);
+                    if (libyuv::NV21ToNV12(src_y, nhs, src_uv, nhs, dst, hor_stride_, dst_uv, hor_stride_, width_,
+                                           height_) != 0) {
+                        return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+                    }
+                }
+            } else {
+                RTC_LOG(LS_WARNING) << "[RkMppH264] native dec frame mismatch expect " << width_ << "x" << height_
+                                    << " stride " << hor_stride_ << "x" << ver_stride_ << " fmt " << fmt << " got "
+                                    << native->width() << "x" << native->height() << " stride " << nhs << "x" << nvs;
+                return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+            }
+        } else {
+            webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = vfb->ToI420();
+            if (!i420) {
+                return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+            }
+            if (i420->width() != width_ || i420->height() != height_) {
+                RTC_LOG(LS_WARNING) << "[RkMppH264] frame size mismatch expect " << width_ << "x" << height_
+                                    << " got " << i420->width() << "x" << i420->height();
+                return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+            }
+            uint8_t* dst_uv = dst + static_cast<size_t>(hor_stride_) * static_cast<size_t>(ver_stride_);
+            libyuv::I420ToNV12(i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(), i420->DataV(),
+                               i420->StrideV(), dst, hor_stride_, dst_uv, hor_stride_, width_, height_);
+        }
+    } else if (vfb->type() == webrtc::VideoFrameBuffer::Type::kNV12) {
         const webrtc::NV12BufferInterface* nv12 = vfb->GetNV12();
         if (nv12->width() != width_ || nv12->height() != height_) {
             RTC_LOG(LS_WARNING) << "[RkMppH264] NV12 frame size mismatch expect " << width_ << "x" << height_
@@ -568,7 +634,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     mpp_frame_set_hor_stride(mframe, static_cast<RK_U32>(hor_stride_));
     mpp_frame_set_ver_stride(mframe, static_cast<RK_U32>(ver_stride_));
     mpp_frame_set_fmt(mframe, MPP_FMT_YUV420SP);
-    mpp_frame_set_buffer(mframe, reinterpret_cast<MppBuffer>(frm_buf_));
+    mpp_frame_set_buffer(mframe, input_mpp_buf);
     mpp_frame_set_pts(mframe, static_cast<RK_S64>(frame.timestamp_us()));
 
     MppPacket packet = nullptr;
@@ -588,6 +654,30 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
 
     const int64_t encode_before_us = webrtc::TimeMicros();
     MPP_RET ret = mpi->encode_put_frame(ctx, mframe);
+    if (ret != MPP_OK && input_mpp_buf != reinterpret_cast<MppBuffer>(frm_buf_)) {
+        MppNativeDecFrameBuffer* native_fb = MppNativeDecFrameBuffer::TryGet(vfb);
+        if (native_fb) {
+            MppBuffer ext = reinterpret_cast<MppBuffer>(native_fb->mpp_buffer_handle());
+            const auto* src_base = ext ? static_cast<const uint8_t*>(mpp_buffer_get_ptr(ext)) : nullptr;
+            if (src_base) {
+                const RK_U32 fmt = static_cast<RK_U32>(native_fb->mpp_fmt());
+                const int nhs = native_fb->hor_stride();
+                const int nvs = native_fb->ver_stride();
+                const uint8_t* src_y = src_base;
+                const uint8_t* src_uv = src_base + static_cast<size_t>(nhs) * static_cast<size_t>(nvs);
+                RTC_LOG(LS_WARNING) << "[RkMppH264] zero-copy encode_put_frame failed ret=" << ret
+                                    << ", retry with memcpy to encoder buffer";
+                if (fmt == MPP_FMT_YUV420SP) {
+                    CopySemiPlanarToMppBuffer(src_y, src_uv, nhs, nhs, dst, hor_stride_, ver_stride_, width_, height_);
+                } else if (fmt == MPP_FMT_YUV420SP_VU) {
+                    uint8_t* dst_uv = dst + static_cast<size_t>(hor_stride_) * static_cast<size_t>(ver_stride_);
+                    libyuv::NV21ToNV12(src_y, nhs, src_uv, nhs, dst, hor_stride_, dst_uv, hor_stride_, width_, height_);
+                }
+                mpp_frame_set_buffer(mframe, reinterpret_cast<MppBuffer>(frm_buf_));
+                ret = mpi->encode_put_frame(ctx, mframe);
+            }
+        }
+    }
     mpp_frame_deinit(&mframe);
     if (ret != MPP_OK) {
         mpp_packet_deinit(&packet);
@@ -697,6 +787,18 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                 mpp_packet_deinit(&out_pkt);
                 mpp_packet_deinit(&packet);
                 return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            if (const char* ev = std::getenv("WEBRTC_MJPEG_TO_H264_TRACE")) {
+                if (ev[0] != '0') {
+                    static std::atomic<unsigned> g_pipe_n{0};
+                    const unsigned pn = ++g_pipe_n;
+                    if (pn % 30u == 0u) {
+                        const int64_t delta_us = encode_finish_us - frame.timestamp_us();
+                        std::cout << "[Pipe MJPEG→H264] frame#" << pn
+                                  << " v4l2_mjpeg_process_start_to_h264_ready_us=" << delta_us << " ("
+                                  << (static_cast<double>(delta_us) / 1000.0) << " ms)" << std::endl;
+                    }
+                }
             }
         }
         mpp_packet_deinit(&out_pkt);
