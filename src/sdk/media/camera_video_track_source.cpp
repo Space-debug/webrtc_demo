@@ -26,9 +26,25 @@
 
 #include <iostream>
 #include <cstdlib>
+#include <atomic>
 #endif
 
 namespace webrtc_demo {
+
+#if defined(WEBRTC_LINUX) && defined(__linux__)
+namespace {
+void LogMjpegDecodeTiming(const char* tag, int64_t before_us, int64_t after_us) {
+    static std::atomic<unsigned> g_n{0};
+    const unsigned n = ++g_n;
+    if ((n % 30) != 0) {
+        return;
+    }
+    const double ms = static_cast<double>(after_us - before_us) / 1000.0;
+    std::cout << "[MJPEG decode " << tag << "] frame#" << n << " before_us=" << before_us
+              << " after_us=" << after_us << " duration_ms=" << ms << std::endl;
+}
+}  // namespace
+#endif
 
 CameraVideoTrackSource::CameraVideoTrackSource() : webrtc::AdaptedVideoTrackSource() {}
 
@@ -455,7 +471,11 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t
             webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 =
                 nv12_pool_[nv12_ring_next_ % nv12_pool_.size()];
             ++nv12_ring_next_;
-            if (mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get())) {
+            const int64_t decode_before_us = webrtc::TimeMicros();
+            const bool dec_ok = mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get());
+            const int64_t decode_after_us = webrtc::TimeMicros();
+            if (dec_ok) {
+                LogMjpegDecodeTiming("mpp-nv12-pool", decode_before_us, decode_after_us);
                 webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
                                                .set_video_frame_buffer(nv12)
                                                .set_timestamp_us(webrtc::TimeMicros())
@@ -466,7 +486,12 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t
             }
         } else {
             webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 = webrtc::NV12Buffer::Create(w, h);
-            if (nv12 && mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get())) {
+            const int64_t decode_before_us = webrtc::TimeMicros();
+            const bool dec_ok =
+                nv12 && mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get());
+            const int64_t decode_after_us = webrtc::TimeMicros();
+            if (dec_ok) {
+                LogMjpegDecodeTiming("mpp-nv12-alloc", decode_before_us, decode_after_us);
                 webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
                                                .set_video_frame_buffer(nv12)
                                                .set_timestamp_us(webrtc::TimeMicros())
@@ -479,6 +504,12 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t
     }
 #endif
     webrtc::scoped_refptr<webrtc::I420Buffer> i420 = webrtc::I420Buffer::Create(w, h);
+    const bool log_libyuv_mjpeg =
+        (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG));
+    int64_t decode_before_us = 0;
+    if (log_libyuv_mjpeg) {
+        decode_before_us = webrtc::TimeMicros();
+    }
     {
         const webrtc::VideoType vtype = (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG))
                                               ? webrtc::VideoType::kMJPEG
@@ -491,6 +522,9 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t
                                       i420->StrideU(), i420->MutableDataV(), i420->StrideV(), w, h, w, h);
         }
         ok = (conv == 0);
+    }
+    if (ok && log_libyuv_mjpeg) {
+        LogMjpegDecodeTiming("libyuv-i420", decode_before_us, webrtc::TimeMicros());
     }
     if (ok) {
         webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()

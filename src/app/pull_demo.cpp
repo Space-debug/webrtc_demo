@@ -177,6 +177,8 @@ static void PrintPlayerUsage(const char* prog) {
               << "  --fps-tol R        Relative tol; pass band [F*(1-R), F*(1+R)] (default 0.12)\n"
               << "  --fps-min-sec T    Strict: min span first-to-last frame in s (default 10)\n"
               << "  --fps-min-frames M Strict: min frames (default 150, >= --frames)\n"
+              << "  --video-stats-interval-sec S  Periodically log inbound video stats (goog_timing_frame_info\n"
+              << "                               etc.). S=0 disables. Default: headless 2, windowed 0.\n"
               << "  -h, --help         This help\n"
               << std::endl;
 }
@@ -196,6 +198,7 @@ int main(int argc, char* argv[]) {
     double fps_rel_tol = 0.12;
     double fps_min_measure_sec = 10.0;
     unsigned fps_min_frames = 150;
+    double video_stats_interval_sec = -1.0;
 
     int i = 1;
     while (i < argc && argv[i][0] == '-') {
@@ -239,6 +242,12 @@ int main(int argc, char* argv[]) {
             fps_min_frames = static_cast<unsigned>(std::atoi(argv[i + 1]));
             if (fps_min_frames < 2) fps_min_frames = 2;
             i += 2;
+        } else if (strcmp(argv[i], "--video-stats-interval-sec") == 0 && i + 1 < argc) {
+            video_stats_interval_sec = std::atof(argv[i + 1]);
+            if (video_stats_interval_sec < 0.0) {
+                video_stats_interval_sec = 0.0;
+            }
+            i += 2;
         } else {
             ++i;
         }
@@ -270,9 +279,15 @@ int main(int argc, char* argv[]) {
         std::cerr << "[Headless] --strict-fps requires --frames >= 1\n";
         return 1;
     }
+    if (video_stats_interval_sec < 0.0) {
+        video_stats_interval_sec = headless ? 2.0 : 0.0;
+    }
 
     std::cout << "=== webrtc_pull_demo" << (headless ? " (headless)" : " (SDL2)") << " ===" << std::endl;
     std::cout << "Signaling: " << url << " stream: " << stream_id << std::endl;
+    if (video_stats_interval_sec > 0.0) {
+        std::cout << "[Stats] Inbound video stats every " << video_stats_interval_sec << " s (GetStats)\n";
+    }
     if (!headless) {
         std::cout << "Press Esc or close window to exit" << std::endl;
     }
@@ -328,10 +343,27 @@ int main(int argc, char* argv[]) {
 
     player.Play();
 
+    const double video_stats_sec = video_stats_interval_sec;
+    auto next_inbound_stats = std::chrono::steady_clock::now();
+    auto pump_inbound_video_stats = [&player, video_stats_sec, &next_inbound_stats]() {
+        if (video_stats_sec <= 0.0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_inbound_stats) {
+            return;
+        }
+        next_inbound_stats =
+            now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                      std::chrono::duration<double>(video_stats_sec));
+        player.RequestInboundVideoStatsLog();
+    };
+
     if (headless) {
         if (need_frames == 0) {
             std::cout << "[Headless] Running until publisher disconnect or Ctrl+C..." << std::endl;
             while (player.IsPlaying()) {
+                pump_inbound_video_stats();
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
             g_player = nullptr;
@@ -388,6 +420,7 @@ int main(int argc, char* argv[]) {
                 g_player = nullptr;
                 return 0;
             }
+            pump_inbound_video_stats();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (player.IsPlaying()) {
@@ -415,6 +448,7 @@ int main(int argc, char* argv[]) {
         }
     } else {
         while (player.IsPlaying() && display->PollAndRender()) {
+            pump_inbound_video_stats();
             std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps UI 刷新
         }
 

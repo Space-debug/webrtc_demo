@@ -38,6 +38,10 @@ public:
     using OnErrorCallback = std::function<void(const std::string& msg)>;
     void SetOnError(OnErrorCallback cb) { on_error_ = std::move(cb); }
 
+    /// 异步请求入站视频 RTP 统计（含 video-timing 对应的 goog_timing_frame_info，若对端协商并发送该扩展）。
+    /// 在 PeerConnection 信令线程触发 GetStats；结果在 WebRTC 内部线程回调中打印到 stdout。
+    void RequestInboundVideoStatsLog();
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

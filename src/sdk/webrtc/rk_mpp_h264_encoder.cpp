@@ -4,14 +4,17 @@
 
 #include "webrtc/rk_mpp_h264_encoder.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <vector>
 
 #include "api/array_view.h"
 #include "api/video/video_codec_constants.h"
 #include "modules/video_coding/codecs/interface/common_constants.h"
 #include "api/video/nv12_buffer.h"
+#include "api/video/video_timing.h"
 #include "api/video/video_frame_buffer.h"
 #include "api/video_codecs/video_codec.h"
 #include "common_video/h264/h264_common.h"
@@ -19,6 +22,7 @@
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
 
 #include "mpp_buffer.h"
@@ -170,6 +174,18 @@ static int H264ProfileIdForMpp(const webrtc::VideoCodec* c) {
     (void)c;
     // SDP 侧 profile 已协商；编码器侧用 Main 作为稳妥默认（与 streams.conf H264_PROFILE 常见值一致）。
     return 77;  // MPP H.264 main profile id
+}
+
+// 与 camera_video_track_source MJPEG 解码日志一致：TimeMicros 前后戳 + duration_ms；第 1～5 帧及每 30 帧打印。
+static void LogMppH264EncodeTiming(int64_t before_us, int64_t after_us) {
+    static std::atomic<unsigned> g_n{0};
+    const unsigned n = ++g_n;
+    if ((n % 30) != 0) {
+        return;
+    }
+    const double ms = static_cast<double>(after_us - before_us) / 1000.0;
+    std::cout << "[H264 encode mpp] frame#" << n << " before_us=" << before_us << " after_us=" << after_us
+              << " duration_ms=" << ms << std::endl;
 }
 
 }  // namespace
@@ -537,6 +553,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         }
     }
 
+    const int64_t encode_before_us = webrtc::TimeMicros();
     MPP_RET ret = mpi->encode_put_frame(ctx, mframe);
     mpp_frame_deinit(&mframe);
     if (ret != MPP_OK) {
@@ -600,6 +617,11 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             encoded.SetRtpTimestamp(frame.rtp_timestamp());
             encoded.SetColorSpace(frame.color_space());
             encoded.capture_time_ms_ = frame.render_time_ms();
+            // 与 VideoFrame::timestamp_us（同 webrtc::TimeMicros）对齐，供 video-timing 扩展算 delta。
+            const int64_t encode_finish_us = webrtc::TimeMicros();
+            encoded.SetEncodeTime(encode_before_us / webrtc::kNumMicrosecsPerMillisec,
+                                  encode_finish_us / webrtc::kNumMicrosecsPerMillisec);
+            encoded.video_timing_mutable()->flags = webrtc::VideoSendTiming::kNotTriggered;
 
             RK_S32 intra = 0;
             if (mpp_packet_has_meta(out_pkt) &&
@@ -642,6 +664,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         }
     } while (!frame_output_done);
 
+    LogMppH264EncodeTiming(encode_before_us, webrtc::TimeMicros());
     mpp_packet_deinit(&packet);
     return WEBRTC_VIDEO_CODEC_OK;
 }
