@@ -5,9 +5,13 @@
 #include "webrtc/rk_mpp_h264_encoder.h"
 
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include "api/array_view.h"
@@ -37,6 +41,35 @@
 namespace webrtc_demo {
 
 namespace {
+
+// 本地墙钟时间，毫秒精度，形如 2026-04-01 14:30:05.123
+std::string CurrentLocalDateTimeYmdHmsMs() {
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    using std::chrono::system_clock;
+
+    const auto now = system_clock::now();
+    const std::time_t t = system_clock::to_time_t(now);
+    const long long ms =
+        duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000LL;
+    std::tm tm_storage {};
+#if defined(_WIN32)
+    if (localtime_s(&tm_storage, &t) != 0) {
+        return "1970-01-01 00:00:00.000";
+    }
+#else
+    if (!localtime_r(&t, &tm_storage)) {
+        return "1970-01-01 00:00:00.000";
+    }
+#endif
+    char buf[32];
+    if (std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_storage) == 0) {
+        return "1970-01-01 00:00:00.000";
+    }
+    char out[48];
+    std::snprintf(out, sizeof(out), "%s.%03lld", buf, ms >= 0 ? ms : ms + 1000LL);
+    return std::string(out);
+}
 
 #define MPP_ALIGN(x, a) (((x) + ((a)-1)) & ~((a)-1))
 
@@ -622,6 +655,19 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             encoded.SetEncodeTime(encode_before_us / webrtc::kNumMicrosecsPerMillisec,
                                   encode_finish_us / webrtc::kNumMicrosecsPerMillisec);
             encoded.video_timing_mutable()->flags = webrtc::VideoSendTiming::kNotTriggered;
+
+            const uint32_t rtp_ts = frame.rtp_timestamp();
+            const uint32_t rtp_over_3000 = rtp_ts / 3000u;
+            if (rtp_over_3000 % 120u == 0u) {
+                const int64_t encode_duration_ms =
+                    (encode_finish_us - encode_before_us) / webrtc::kNumMicrosecsPerMillisec;
+                std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: encode_before_ms="
+                          << (encode_before_us / webrtc::kNumMicrosecsPerMillisec)
+                          << ", encode_duration_ms=" << encode_duration_ms
+                          << ", encode_finish_ms=" << (encode_finish_us / webrtc::kNumMicrosecsPerMillisec)
+                          << ", render_time_ms=" << frame.render_time_ms() << ", rtp_timestamp=" << rtp_ts
+                          << ", rtp_timestamp/3000=" << rtp_over_3000 << std::endl;
+            }
 
             RK_S32 intra = 0;
             if (mpp_packet_has_meta(out_pkt) &&
