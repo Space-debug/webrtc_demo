@@ -31,25 +31,33 @@ class RkMppMjpegDecoder {
   bool Init();
   void Close();
 
+  /// dma_buf_fd>=0：EXT_DMA（WEBRTC_MJPEG_V4L2_DMABUF）或 RGA（WEBRTC_MJPEG_RGA_TO_MPP）；capacity 一般取 QUERYBUF.length。
+  /// 建议始终传入 jpeg（mmap）：RGA 失败时 memcpy 回退；EXT_DMA 成功时可忽略指针。
   bool DecodeJpegToI420(const uint8_t* jpeg,
                         size_t jpeg_len,
                         int expect_w,
                         int expect_h,
-                        webrtc::I420Buffer* out_i420);
+                        webrtc::I420Buffer* out_i420,
+                        int dma_buf_fd = -1,
+                        size_t dma_buf_capacity = 0);
 
   /// 解码为 NV12（与 MPP 输出一致时仅 memcpy；NV21 时 libyuv::NV21ToNV12）。
   bool DecodeJpegToNV12(const uint8_t* jpeg,
                         size_t jpeg_len,
                         int expect_w,
                         int expect_h,
-                        webrtc::NV12Buffer* out_nv12);
+                        webrtc::NV12Buffer* out_nv12,
+                        int dma_buf_fd = -1,
+                        size_t dma_buf_capacity = 0);
 
   /// 解码输出保留为 MppFrame（kNative），供 MPP H264 零拷贝编码；失败时 out 不赋值。
   bool DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
                                   size_t jpeg_len,
                                   int expect_w,
                                   int expect_h,
-                                  webrtc::scoped_refptr<MppNativeDecFrameBuffer>* out);
+                                  webrtc::scoped_refptr<MppNativeDecFrameBuffer>* out,
+                                  int dma_buf_fd = -1,
+                                  size_t dma_buf_capacity = 0);
 
  private:
   static size_t ComputeJpegOutputBufSize(int width, int height);
@@ -57,8 +65,12 @@ class RkMppMjpegDecoder {
   void* PollMppFrame(int timeout_ms);
   bool HandleInfoChangeFrame(void* frame);
 
-  /// JPEG 比特流直接拷入 Mpp 输入 buffer（省去中间 staging 向量的一次 memcpy）。
-  bool BuildMppPacketFromJpeg(const uint8_t* jpeg, size_t jpeg_len, void** out_packet);
+  /// EXT_DMA / RGA / memcpy 由内部与环境变量决定；RGA 失败会 memcpy（需 jpeg 指针）。
+  bool BuildMppInputPacket(int dma_buf_fd,
+                           size_t dma_buf_capacity,
+                           const uint8_t* jpeg,
+                           size_t jpeg_len,
+                           void** out_packet);
 
   void* ctx_{nullptr};
   void* mpi_{nullptr};

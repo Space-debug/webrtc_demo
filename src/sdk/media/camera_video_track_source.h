@@ -86,7 +86,8 @@ private:
     void DirectCaptureThreadMain();
     /// MJPEG：拷贝压缩帧后尽快 QBUF；在此线程里解码并 OnFrame，避免采集线程被 MPP/软解拖死。
     void DecodeWorkerThreadMain();
-    void ProcessV4l2CapturedFrame(const uint8_t* src, size_t bytesused);
+    /// buf_index：V4L2 buffer 下标，用于 DMABUF 导入 MPP（与 mmap 同源）；YUYV/MJPEG 均传入。
+    void ProcessV4l2CapturedFrame(unsigned int buf_index, const uint8_t* src, size_t bytesused);
     void ApplyMjpegPipelineOptions(const V4l2MjpegPipelineOptions* mjpeg_pipeline);
     void EnsureNv12Pool(int w, int h);
     void QBufV4l2Index(unsigned int index);
@@ -118,6 +119,8 @@ private:
     uint32_t direct_pixfmt_{0};
     std::vector<void*> direct_mmap_;
     std::vector<size_t> direct_mmap_len_;
+    /// VIDIOC_EXPBUF 得到的 dma-buf fd，与 mmap 同一块物理内存；-1 表示未导出或失败。
+    std::vector<int> direct_expbuf_fd_;
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
     std::unique_ptr<RkMppMjpegDecoder> mjpeg_mpp_;
 #endif

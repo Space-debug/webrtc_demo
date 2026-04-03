@@ -5,10 +5,14 @@
 #include "webrtc/mpp_native_dec_frame_buffer.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <unistd.h>
+
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 
 #include "api/video/i420_buffer.h"
 #include "api/video/nv12_buffer.h"
@@ -33,6 +37,112 @@ namespace {
 static bool MjpegDecTraceEnabled() {
     static const char* k = std::getenv("WEBRTC_MJPEG_DEC_TRACE");
     return k && k[0] != '0';
+}
+
+#if defined(WEBRTC_DEMO_HAVE_LIBRGA)
+#include <rga/im2d.h>
+#include <rga/rga.h>
+
+static bool MjpegRgaCopyEnabled() {
+    const char* e = std::getenv("WEBRTC_MJPEG_RGA_TO_MPP");
+    if (!e || e[0] == '\0') {
+        return false;
+    }
+    return e[0] != '0';
+}
+
+/// 将 JPEG 比特流按 RK_FORMAT_YCbCr_400（1 byte/pixel）铺满矩形，用 RGA imcopy 从采集 dma-buf 拷入 MPP 输入 dma-buf。
+static bool RgaCopyDmaBufJpeg(int src_fd,
+                              size_t src_cap,
+                              int dst_fd,
+                              size_t dst_cap,
+                              size_t jpeg_len) {
+    if (src_fd < 0 || dst_fd < 0 || jpeg_len == 0) {
+        return false;
+    }
+    const size_t cap = std::min(src_cap, dst_cap);
+    if (jpeg_len > cap) {
+        return false;
+    }
+    static const int kWidths[] = {8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16};
+    int w = 0;
+    int h = 0;
+    bool ok_layout = false;
+    for (int cand_w : kWidths) {
+        size_t hh = (jpeg_len + static_cast<size_t>(cand_w) - 1u) / static_cast<size_t>(cand_w);
+        if (hh > 65536u) {
+            continue;
+        }
+        if ((hh & 1u) != 0u) {
+            ++hh;
+        }
+        size_t total = static_cast<size_t>(cand_w) * hh;
+        while (total > cap && hh > 2u) {
+            hh -= 2u;
+            total = static_cast<size_t>(cand_w) * hh;
+        }
+        if (total < jpeg_len) {
+            continue;
+        }
+        w = cand_w;
+        h = static_cast<int>(hh);
+        ok_layout = true;
+        break;
+    }
+    if (!ok_layout || w <= 0 || h <= 0) {
+        return false;
+    }
+
+    {
+        struct dma_buf_sync sync {};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        if (ioctl(src_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && MjpegDecTraceEnabled()) {
+            std::cerr << "[RkMppMjpeg] RGA src DMA_BUF_SYNC(READ) errno=" << errno << "\n";
+        }
+    }
+    {
+        struct dma_buf_sync sync {};
+        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
+        if (ioctl(dst_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && MjpegDecTraceEnabled()) {
+            std::cerr << "[RkMppMjpeg] RGA dst DMA_BUF_SYNC(WRITE) errno=" << errno << "\n";
+        }
+    }
+
+    rga_buffer_t src = wrapbuffer_fd(src_fd, w, h, RK_FORMAT_YCbCr_400);
+    rga_buffer_t dst = wrapbuffer_fd(dst_fd, w, h, RK_FORMAT_YCbCr_400);
+    const IM_STATUS st = imcopy(src, dst, 1);
+
+    {
+        struct dma_buf_sync sync {};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+        if (ioctl(dst_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && MjpegDecTraceEnabled()) {
+            std::cerr << "[RkMppMjpeg] RGA dst DMA_BUF_SYNC(END WRITE) errno=" << errno << "\n";
+        }
+    }
+    {
+        struct dma_buf_sync sync {};
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        if (ioctl(src_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && MjpegDecTraceEnabled()) {
+            std::cerr << "[RkMppMjpeg] RGA src DMA_BUF_SYNC(END READ) errno=" << errno << "\n";
+        }
+    }
+
+    if (st != IM_STATUS_SUCCESS && st != IM_STATUS_NOERROR) {
+        if (MjpegDecTraceEnabled()) {
+            std::cerr << "[RkMppMjpeg] imcopy failed status=" << static_cast<int>(st) << " (" << imStrError_t(st) << ")\n";
+        }
+        return false;
+    }
+    return true;
+}
+#endif  // WEBRTC_DEMO_HAVE_LIBRGA
+
+static bool PreferMjpegV4l2DmabufImport() {
+    const char* e = std::getenv("WEBRTC_MJPEG_V4L2_DMABUF");
+    if (!e || e[0] == '\0') {
+        return false;
+    }
+    return e[0] != '0';
 }
 
 static constexpr int kMppBufferGroupIndex = 1;
@@ -186,24 +296,85 @@ bool RkMppMjpegDecoder::Init() {
     return true;
 }
 
-bool RkMppMjpegDecoder::BuildMppPacketFromJpeg(const uint8_t* jpeg, size_t jpeg_len, void** out_packet) {
-    if (!jpeg || jpeg_len == 0) {
+bool RkMppMjpegDecoder::BuildMppInputPacket(int dma_buf_fd,
+                                            size_t dma_buf_capacity,
+                                            const uint8_t* jpeg,
+                                            size_t jpeg_len,
+                                            void** out_packet) {
+    if (!out_packet || jpeg_len == 0) {
         return false;
     }
-    MppBufferGroup ig = reinterpret_cast<MppBufferGroup>(input_group_);
     MppBuffer mbuf = nullptr;
-    if (mpp_buffer_get(ig, &mbuf, jpeg_len) != MPP_OK || !mbuf) {
-        if (MjpegDecTraceEnabled()) {
-            std::cerr << "[RkMppMjpeg] mpp_buffer_get input jpeg failed len=" << jpeg_len << "\n";
+    const bool want_ext_import =
+        (dma_buf_fd >= 0 && dma_buf_capacity >= jpeg_len && PreferMjpegV4l2DmabufImport());
+#if defined(WEBRTC_DEMO_HAVE_LIBRGA)
+    const bool want_rga =
+        (dma_buf_fd >= 0 && dma_buf_capacity >= jpeg_len && MjpegRgaCopyEnabled() && !want_ext_import);
+#else
+    const bool want_rga = false;
+#endif
+
+    if (want_ext_import) {
+        // UVC 写入后让其它设备（MPP）一致可见；部分 BSP 上省略会 import 后首帧崩溃。
+        {
+            struct dma_buf_sync sync {};
+            sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+            if (ioctl(dma_buf_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+                if (MjpegDecTraceEnabled()) {
+                    std::cerr << "[RkMppMjpeg] DMA_BUF_IOCTL_SYNC failed errno=" << errno << "\n";
+                }
+            }
         }
-        return false;
+        MppBufferInfo info{};
+        info.type = MPP_BUFFER_TYPE_EXT_DMA;
+        info.size = dma_buf_capacity;
+        info.fd = dma_buf_fd;
+        info.ptr = nullptr;
+        info.hnd = nullptr;
+        info.index = 0;
+        if (mpp_buffer_import(&mbuf, &info) != MPP_OK || !mbuf) {
+            if (MjpegDecTraceEnabled()) {
+                std::cerr << "[RkMppMjpeg] mpp_buffer_import EXT_DMA failed fd=" << dma_buf_fd << " cap=" << dma_buf_capacity
+                          << "\n";
+            }
+            return false;
+        }
+    } else {
+        if (!jpeg && !want_rga) {
+            return false;
+        }
+        MppBufferGroup ig = reinterpret_cast<MppBufferGroup>(input_group_);
+        if (mpp_buffer_get(ig, &mbuf, jpeg_len) != MPP_OK || !mbuf) {
+            if (MjpegDecTraceEnabled()) {
+                std::cerr << "[RkMppMjpeg] mpp_buffer_get input jpeg failed len=" << jpeg_len << "\n";
+            }
+            return false;
+        }
+        void* dst = mpp_buffer_get_ptr(mbuf);
+        if (!dst) {
+            mpp_buffer_put(mbuf);
+            return false;
+        }
+        bool filled = false;
+#if defined(WEBRTC_DEMO_HAVE_LIBRGA)
+        if (want_rga) {
+            const int dst_fd = mpp_buffer_get_fd(mbuf);
+            const size_t dst_cap = mpp_buffer_get_size(mbuf);
+            if (dst_fd >= 0 && RgaCopyDmaBufJpeg(dma_buf_fd, dma_buf_capacity, dst_fd, dst_cap, jpeg_len)) {
+                filled = true;
+            } else if (MjpegDecTraceEnabled()) {
+                std::cerr << "[RkMppMjpeg] RGA copy failed, falling back to memcpy\n";
+            }
+        }
+#endif
+        if (!filled) {
+            if (!jpeg) {
+                mpp_buffer_put(mbuf);
+                return false;
+            }
+            std::memcpy(dst, jpeg, jpeg_len);
+        }
     }
-    void* dst = mpp_buffer_get_ptr(mbuf);
-    if (!dst) {
-        mpp_buffer_put(mbuf);
-        return false;
-    }
-    std::memcpy(dst, jpeg, jpeg_len);
     mpp_buffer_set_index(mbuf, kMppBufferGroupIndex);
 
     MppPacket packet = nullptr;
@@ -327,8 +498,13 @@ bool RkMppMjpegDecoder::DecodeJpegToI420(const uint8_t* jpeg,
                                          size_t jpeg_len,
                                          int expect_w,
                                          int expect_h,
-                                         webrtc::I420Buffer* out_i420) {
-    if (!ctx_ || !mpi_ || !jpeg || jpeg_len == 0 || !out_i420) {
+                                         webrtc::I420Buffer* out_i420,
+                                         int dma_buf_fd,
+                                         size_t dma_buf_capacity) {
+    if (!ctx_ || !mpi_ || jpeg_len == 0 || !out_i420) {
+        return false;
+    }
+    if (dma_buf_fd < 0 && !jpeg) {
         return false;
     }
     if (expect_w <= 0 || expect_h <= 0) {
@@ -349,7 +525,7 @@ bool RkMppMjpegDecoder::DecodeJpegToI420(const uint8_t* jpeg,
 
     for (int submit = 0; submit < kMaxSubmit && !decoded; ++submit) {
         MppPacket packet = nullptr;
-        if (!BuildMppPacketFromJpeg(jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
+        if (!BuildMppInputPacket(dma_buf_fd, dma_buf_capacity, jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
             return false;
         }
         if (!SendMppPacket(packet)) {
@@ -458,8 +634,13 @@ bool RkMppMjpegDecoder::DecodeJpegToNV12(const uint8_t* jpeg,
                                          size_t jpeg_len,
                                          int expect_w,
                                          int expect_h,
-                                         webrtc::NV12Buffer* out_nv12) {
-    if (!ctx_ || !mpi_ || !jpeg || jpeg_len == 0 || !out_nv12) {
+                                         webrtc::NV12Buffer* out_nv12,
+                                         int dma_buf_fd,
+                                         size_t dma_buf_capacity) {
+    if (!ctx_ || !mpi_ || jpeg_len == 0 || !out_nv12) {
+        return false;
+    }
+    if (dma_buf_fd < 0 && !jpeg) {
         return false;
     }
     if (expect_w <= 0 || expect_h <= 0) {
@@ -483,7 +664,7 @@ bool RkMppMjpegDecoder::DecodeJpegToNV12(const uint8_t* jpeg,
 
     for (int submit = 0; submit < kMaxSubmit && !decoded; ++submit) {
         MppPacket packet = nullptr;
-        if (!BuildMppPacketFromJpeg(jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
+        if (!BuildMppInputPacket(dma_buf_fd, dma_buf_capacity, jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
             return false;
         }
         if (!SendMppPacket(packet)) {
@@ -575,12 +756,17 @@ bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
                                                   size_t jpeg_len,
                                                   int expect_w,
                                                   int expect_h,
-                                                  webrtc::scoped_refptr<MppNativeDecFrameBuffer>* out) {
+                                                  webrtc::scoped_refptr<MppNativeDecFrameBuffer>* out,
+                                                  int dma_buf_fd,
+                                                  size_t dma_buf_capacity) {
     if (!out) {
         return false;
     }
     *out = nullptr;
-    if (!ctx_ || !mpi_ || !jpeg || jpeg_len == 0) {
+    if (!ctx_ || !mpi_ || jpeg_len == 0) {
+        return false;
+    }
+    if (dma_buf_fd < 0 && !jpeg) {
         return false;
     }
     if (expect_w <= 0 || expect_h <= 0) {
@@ -601,7 +787,7 @@ bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
 
     for (int submit = 0; submit < kMaxSubmit && !decoded; ++submit) {
         MppPacket packet = nullptr;
-        if (!BuildMppPacketFromJpeg(jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
+        if (!BuildMppInputPacket(dma_buf_fd, dma_buf_capacity, jpeg, jpeg_len, reinterpret_cast<void**>(&packet))) {
             return false;
         }
         if (!SendMppPacket(packet)) {

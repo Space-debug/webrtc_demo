@@ -60,6 +60,8 @@ void PrintUsage(const char* prog) {
               << "  WEBRTC_CAPTURE_GATE_MIN_FRAMES=N   Min frames before Offer (0=off)\n"
               << "  WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC=N   Max wait for gate (seconds)\n"
               << "  WEBRTC_MJPEG_TO_H264_TRACE=1   Log MJPEG process start → H264 ready (us), every 30 frames (MPP enc)\n"
+              << "  WEBRTC_MJPEG_V4L2_DMABUF=1     Enable VIDIOC_EXPBUF → MPP EXT_DMA import (default off; BSP 需自测)\n"
+              << "  WEBRTC_MJPEG_RGA_TO_MPP=1      RGA dma-buf → MPP input (needs librga + EXPBUF; safer than EXT_DMA)\n"
               << "Arguments:\n"
               << "  stream_id         Stream ID; omitted -> STREAM_ID in config\n"
               << "  camera            Device path/index; omitted -> STREAM_<id>_CAMERA\n"

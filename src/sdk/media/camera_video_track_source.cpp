@@ -55,6 +55,28 @@ static bool PreferMjpegNativeZeroCopyToEnc() {
     }
     return e[0] != '0';
 }
+
+/// 默认关闭：部分设备/BSP 上 EXT_DMA 导入 MPP MJPEG 仍会崩溃，需显式 WEBRTC_MJPEG_V4L2_DMABUF=1 再测。
+static bool PreferMjpegV4l2DmabufToMpp() {
+    const char* e = std::getenv("WEBRTC_MJPEG_V4L2_DMABUF");
+    if (!e || e[0] == '\0') {
+        return false;
+    }
+    return e[0] != '0';
+}
+
+/// RGA imcopy：V4L2 dma-buf → MPP 输入 DRM buffer，避免 CPU memcpy；需编译链上 librga（WEBRTC_MJPEG_RGA_TO_MPP=1）。
+static bool PreferMjpegRgaToMpp() {
+#if !defined(WEBRTC_DEMO_HAVE_LIBRGA)
+    return false;
+#else
+    const char* e = std::getenv("WEBRTC_MJPEG_RGA_TO_MPP");
+    if (!e || e[0] == '\0') {
+        return false;
+    }
+    return e[0] != '0';
+#endif
+}
 #endif
 #endif
 
@@ -119,6 +141,12 @@ void CameraVideoTrackSource::StopDirectV4l2() {
             munmap(direct_mmap_[i], direct_mmap_len_[i]);
         }
     }
+    for (int fd : direct_expbuf_fd_) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    direct_expbuf_fd_.clear();
     direct_mmap_.clear();
     direct_mmap_len_.clear();
     if (direct_fd_ >= 0) {
@@ -448,6 +476,7 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
     const unsigned int nbuf = rb.count;
     direct_mmap_.resize(nbuf, nullptr);
     direct_mmap_len_.resize(nbuf, 0);
+    direct_expbuf_fd_.assign(nbuf, -1);
     for (unsigned int i = 0; i < nbuf; ++i) {
         struct v4l2_buffer buf {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -469,6 +498,37 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
             return false;
         }
     }
+
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    if (PreferMjpegV4l2DmabufToMpp() || PreferMjpegRgaToMpp()) {
+        unsigned exp_ok = 0;
+        for (unsigned int i = 0; i < nbuf; ++i) {
+            struct v4l2_exportbuffer exp {};
+            exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            exp.index = i;
+            exp.plane = 0;
+            exp.flags = O_CLOEXEC;
+            if (ioctl(direct_fd_, VIDIOC_EXPBUF, &exp) == 0 && exp.fd >= 0) {
+                direct_expbuf_fd_[i] = exp.fd;
+                ++exp_ok;
+            }
+        }
+        if (exp_ok == nbuf) {
+            if (PreferMjpegV4l2DmabufToMpp()) {
+                std::cout << "[CameraV4L2] VIDIOC_EXPBUF: " << nbuf
+                          << " dma-buf fd(s) → MPP JPEG EXT_DMA import\n";
+            } else {
+                std::cout << "[CameraV4L2] VIDIOC_EXPBUF: " << nbuf
+                          << " dma-buf fd(s) → RGA copy to MPP input (WEBRTC_MJPEG_RGA_TO_MPP)\n";
+            }
+        } else if (exp_ok > 0) {
+            std::cout << "[CameraV4L2] VIDIOC_EXPBUF: " << exp_ok << "/" << nbuf
+                      << " (per-buffer dma or memcpy)\n";
+        } else {
+            std::cout << "[CameraV4L2] VIDIOC_EXPBUF unsupported; MPP JPEG uses memcpy from mmap\n";
+        }
+    }
+#endif
 
     enum v4l2_buf_type typ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(direct_fd_, VIDIOC_STREAMON, &typ) < 0) {
@@ -533,13 +593,13 @@ void CameraVideoTrackSource::DecodeWorkerThreadMain() {
         if (!shutdown_skip_decode && job.index < direct_mmap_.size() && direct_mmap_[job.index] &&
             job.bytesused > 0) {
             const uint8_t* src = static_cast<const uint8_t*>(direct_mmap_[job.index]);
-            ProcessV4l2CapturedFrame(src, job.bytesused);
+            ProcessV4l2CapturedFrame(job.index, src, job.bytesused);
         }
         QBufV4l2Index(job.index);
     }
 }
 
-void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t bytesused) {
+void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index, const uint8_t* src, size_t bytesused) {
     if (!src || bytesused == 0) {
         return;
     }
@@ -547,13 +607,26 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t
     const int64_t pipeline_t0_us = webrtc::TimeMicros();
     const int w = direct_cap_w_;
     const int h = direct_cap_h_;
+    int dma_fd = -1;
+    size_t dma_cap = 0;
+    if (buf_index < direct_expbuf_fd_.size() && buf_index < direct_mmap_len_.size()) {
+        dma_fd = direct_expbuf_fd_[buf_index];
+        dma_cap = direct_mmap_len_[buf_index];
+    }
     bool ok = false;
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    const bool mpp_jpeg_dma = (dma_fd >= 0 && dma_cap >= bytesused &&
+                               (PreferMjpegV4l2DmabufToMpp() || PreferMjpegRgaToMpp()));
+    const int dma_arg_fd = mpp_jpeg_dma ? dma_fd : -1;
+    const size_t dma_arg_cap = mpp_jpeg_dma ? dma_cap : 0;
     if (mjpeg_mpp_ && direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
         if (PreferMjpegNativeZeroCopyToEnc()) {
             webrtc::scoped_refptr<MppNativeDecFrameBuffer> native;
             const int64_t decode_before_us = webrtc::TimeMicros();
-            if (mjpeg_mpp_->DecodeJpegToNativeDecFrame(src, bytesused, w, h, &native) && native) {
+            // 始终传 mmap 指针：RGA 失败时会 memcpy 回退；EXT_DMA 成功时解码器忽略指针。
+            const bool dec_native =
+                mjpeg_mpp_->DecodeJpegToNativeDecFrame(src, bytesused, w, h, &native, dma_arg_fd, dma_arg_cap);
+            if (dec_native && native) {
                 const int64_t decode_after_us = webrtc::TimeMicros();
                 LogMjpegDecodeTiming("mpp-native-dec", decode_before_us, decode_after_us);
                 webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
@@ -571,7 +644,8 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t
                 nv12_pool_[nv12_ring_next_ % nv12_pool_.size()];
             ++nv12_ring_next_;
             const int64_t decode_before_us = webrtc::TimeMicros();
-            const bool dec_ok = mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get());
+            const bool dec_ok =
+                mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get(), dma_arg_fd, dma_arg_cap);
             const int64_t decode_after_us = webrtc::TimeMicros();
             if (dec_ok) {
                 LogMjpegDecodeTiming("mpp-nv12-pool", decode_before_us, decode_after_us);
@@ -587,7 +661,7 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(const uint8_t* src, size_t
             webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 = webrtc::NV12Buffer::Create(w, h);
             const int64_t decode_before_us = webrtc::TimeMicros();
             const bool dec_ok =
-                nv12 && mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get());
+                nv12 && mjpeg_mpp_->DecodeJpegToNV12(src, bytesused, w, h, nv12.get(), dma_arg_fd, dma_arg_cap);
             const int64_t decode_after_us = webrtc::TimeMicros();
             if (dec_ok) {
                 LogMjpegDecodeTiming("mpp-nv12-alloc", decode_before_us, decode_after_us);
@@ -685,7 +759,7 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
             jpeg_queue_cv_.notify_one();
             continue;
         }
-        ProcessV4l2CapturedFrame(src, buf.bytesused);
+        ProcessV4l2CapturedFrame(buf.index, src, buf.bytesused);
         ioctl(direct_fd_, VIDIOC_QBUF, &buf);
     }
 }
