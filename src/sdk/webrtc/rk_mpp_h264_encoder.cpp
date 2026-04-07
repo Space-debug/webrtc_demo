@@ -224,18 +224,6 @@ static int H264ProfileIdForMpp(const webrtc::VideoCodec* c) {
     return 77;  // MPP H.264 main profile id
 }
 
-// 与 camera_video_track_source MJPEG 解码日志一致：TimeMicros 前后戳 + duration_ms；第 1～5 帧及每 30 帧打印。
-static void LogMppH264EncodeTiming(int64_t before_us, int64_t after_us) {
-    static std::atomic<unsigned> g_n{0};
-    const unsigned n = ++g_n;
-    if ((n % 30) != 0) {
-        return;
-    }
-    const double ms = static_cast<double>(after_us - before_us) / 1000.0;
-    std::cout << "[H264 encode mpp] frame#" << n << " before_us=" << before_us << " after_us=" << after_us
-              << " duration_ms=" << ms << std::endl;
-}
-
 }  // namespace
 
 RkMppH264Encoder::RkMppH264Encoder(const webrtc::Environment& env, webrtc::H264EncoderSettings settings)
@@ -760,17 +748,30 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                                   encode_finish_us / webrtc::kNumMicrosecsPerMillisec);
             encoded.video_timing_mutable()->flags = webrtc::VideoSendTiming::kNotTriggered;
 
-            const uint32_t rtp_ts = frame.rtp_timestamp();
-            const uint32_t rtp_over_3000 = rtp_ts / 3000u;
             if (next_video_frame_tracking_id_ % 120u == 0u) {
-                const int64_t encode_duration_ms =
-                    (encode_finish_us - encode_before_us) / webrtc::kNumMicrosecsPerMillisec;
-                    std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: current_video_frame_tracking_id_="
-                    << next_video_frame_tracking_id_
-                    << ", encode_duration_ms=" << encode_duration_ms
-                    << ", encode_finish_ms=" << (encode_finish_us / webrtc::kNumMicrosecsPerMillisec)
-                    << ", render_time_ms=" << frame.render_time_ms() << ", rtp_timestamp=" << rtp_ts
-                    << ", rtp_timestamp/3000=" << rtp_over_3000 << std::endl;
+                int64_t mjpeg_input_to_encode_done_us = encode_finish_us - frame.timestamp_us();
+                int64_t usb_to_frame_timestamp_us = -1;
+                int64_t decode_queue_wait_us = -1;
+                if (MppNativeDecFrameBuffer* native_fb = MppNativeDecFrameBuffer::TryGet(vfb)) {
+                    const int64_t mjpeg_input_us = native_fb->mjpeg_input_timestamp_us();
+                    if (mjpeg_input_us > 0) {
+                        mjpeg_input_to_encode_done_us = encode_finish_us - mjpeg_input_us;
+                    }
+                    const int64_t v4l2_timestamp_us = native_fb->v4l2_timestamp_us();
+                    if (v4l2_timestamp_us > 0) {
+                        usb_to_frame_timestamp_us = frame.timestamp_us() - v4l2_timestamp_us;
+                    }
+                    decode_queue_wait_us = native_fb->decode_queue_wait_us();
+                }
+                std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: current_video_frame_tracking_id_="
+                          << next_video_frame_tracking_id_
+                          << ", mjpeg_input_to_encode_done_us=" << mjpeg_input_to_encode_done_us
+                          << " (" << (static_cast<double>(mjpeg_input_to_encode_done_us) / 1000.0) << " ms)"
+                          << ", usb_to_frame_timestamp_us=" << usb_to_frame_timestamp_us
+                          << " (" << (static_cast<double>(usb_to_frame_timestamp_us) / 1000.0) << " ms)"
+                          << ", decode_queue_wait_us=" << decode_queue_wait_us
+                          << " (" << (static_cast<double>(decode_queue_wait_us) / 1000.0) << " ms)"
+                          << std::endl;
             }
             if (const char* lt = std::getenv("WEBRTC_LATENCY_TRACE"); lt && lt[0] == '1') {
                 static std::atomic<unsigned> enc_lat_n{0};
@@ -836,7 +837,6 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         }
     } while (!frame_output_done);
 
-    LogMppH264EncodeTiming(encode_before_us, webrtc::TimeMicros());
     mpp_packet_deinit(&packet);
     return WEBRTC_VIDEO_CODEC_OK;
 }

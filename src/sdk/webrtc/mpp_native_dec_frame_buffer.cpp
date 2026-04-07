@@ -54,13 +54,21 @@ webrtc::scoped_refptr<MppNativeDecFrameBuffer> MppNativeDecFrameBuffer::CreateFr
                                                                                            int height,
                                                                                            int hor_stride,
                                                                                            int ver_stride,
-                                                                                           uint32_t mpp_fmt) {
+                                                                                           uint32_t mpp_fmt,
+                                                                                           int64_t mjpeg_input_timestamp_us,
+                                                                                           int64_t dq_time_us,
+                                                                                           int64_t v4l2_timestamp_us,
+                                                                                           int64_t poll_wait_us,
+                                                                                           int64_t dqbuf_ioctl_us,
+                                                                                           int64_t decode_queue_wait_us) {
     if (!mpp_frame) {
         return nullptr;
     }
     return webrtc::scoped_refptr<MppNativeDecFrameBuffer>(
         new webrtc::RefCountedObject<MppNativeDecFrameBuffer>(mpp_frame, width, height, hor_stride, ver_stride,
-                                                              mpp_fmt));
+                                                              mpp_fmt, mjpeg_input_timestamp_us, dq_time_us,
+                                                              v4l2_timestamp_us, poll_wait_us, dqbuf_ioctl_us,
+                                                              decode_queue_wait_us));
 }
 
 MppNativeDecFrameBuffer* MppNativeDecFrameBuffer::TryGet(const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& buffer) {
@@ -75,13 +83,25 @@ MppNativeDecFrameBuffer::MppNativeDecFrameBuffer(void* mpp_frame,
                                                  int height,
                                                  int hor_stride,
                                                  int ver_stride,
-                                                 uint32_t mpp_fmt)
+                                                 uint32_t mpp_fmt,
+                                                 int64_t mjpeg_input_timestamp_us,
+                                                 int64_t dq_time_us,
+                                                 int64_t v4l2_timestamp_us,
+                                                 int64_t poll_wait_us,
+                                                 int64_t dqbuf_ioctl_us,
+                                                 int64_t decode_queue_wait_us)
     : frame_(mpp_frame),
       width_(width),
       height_(height),
       hor_stride_(hor_stride),
       ver_stride_(ver_stride),
-      mpp_fmt_(mpp_fmt) {}
+      mpp_fmt_(mpp_fmt),
+      mjpeg_input_timestamp_us_(mjpeg_input_timestamp_us),
+      dq_time_us_(dq_time_us),
+      v4l2_timestamp_us_(v4l2_timestamp_us),
+      poll_wait_us_(poll_wait_us),
+      dqbuf_ioctl_us_(dqbuf_ioctl_us),
+      decode_queue_wait_us_(decode_queue_wait_us) {}
 
 MppNativeDecFrameBuffer::~MppNativeDecFrameBuffer() {
     if (frame_) {

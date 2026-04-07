@@ -19,7 +19,13 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
                                                                            int height,
                                                                            int hor_stride,
                                                                            int ver_stride,
-                                                                           uint32_t mpp_fmt);
+                                                                           uint32_t mpp_fmt,
+                                                                           int64_t mjpeg_input_timestamp_us,
+                                                                           int64_t dq_time_us,
+                                                                           int64_t v4l2_timestamp_us,
+                                                                           int64_t poll_wait_us,
+                                                                           int64_t dqbuf_ioctl_us,
+                                                                           int64_t decode_queue_wait_us);
 
   static MppNativeDecFrameBuffer* TryGet(const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& buffer);
 
@@ -34,12 +40,29 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
   int hor_stride() const { return hor_stride_; }
   int ver_stride() const { return ver_stride_; }
   uint32_t mpp_fmt() const { return mpp_fmt_; }
+  int64_t mjpeg_input_timestamp_us() const { return mjpeg_input_timestamp_us_; }
+  int64_t dq_time_us() const { return dq_time_us_; }
+  int64_t v4l2_timestamp_us() const { return v4l2_timestamp_us_; }
+  int64_t poll_wait_us() const { return poll_wait_us_; }
+  int64_t dqbuf_ioctl_us() const { return dqbuf_ioctl_us_; }
+  int64_t decode_queue_wait_us() const { return decode_queue_wait_us_; }
   void* mpp_frame() const { return frame_; }
   /// 与 mpp_frame_get_buffer 一致，供编码器绑定输入帧。
   void* mpp_buffer_handle() const;
 
   // 供 RefCountedObject 包装；外部请用 CreateFromMppFrame。
-  MppNativeDecFrameBuffer(void* mpp_frame, int width, int height, int hor_stride, int ver_stride, uint32_t mpp_fmt);
+  MppNativeDecFrameBuffer(void* mpp_frame,
+                          int width,
+                          int height,
+                          int hor_stride,
+                          int ver_stride,
+                          uint32_t mpp_fmt,
+                          int64_t mjpeg_input_timestamp_us,
+                          int64_t dq_time_us,
+                          int64_t v4l2_timestamp_us,
+                          int64_t poll_wait_us,
+                          int64_t dqbuf_ioctl_us,
+                          int64_t decode_queue_wait_us);
 
  protected:
   ~MppNativeDecFrameBuffer() override;
@@ -51,6 +74,12 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
   int hor_stride_;
   int ver_stride_;
   uint32_t mpp_fmt_;
+  int64_t mjpeg_input_timestamp_us_;
+  int64_t dq_time_us_;
+  int64_t v4l2_timestamp_us_;
+  int64_t poll_wait_us_;
+  int64_t dqbuf_ioctl_us_;
+  int64_t decode_queue_wait_us_;
 };
 
 }  // namespace webrtc_demo

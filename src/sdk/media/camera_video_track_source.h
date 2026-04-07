@@ -93,7 +93,14 @@ private:
     /// MJPEG：拷贝压缩帧后尽快 QBUF；在此线程里解码并 OnFrame，避免采集线程被 MPP/软解拖死。
     void DecodeWorkerThreadMain();
     /// buf_index：V4L2 buffer 下标，用于 DMABUF 导入 MPP（与 mmap 同源）；YUYV/MJPEG 均传入。
-    void ProcessV4l2CapturedFrame(unsigned int buf_index, const uint8_t* src, size_t bytesused);
+    void ProcessV4l2CapturedFrame(unsigned int buf_index,
+                                  const uint8_t* src,
+                                  size_t bytesused,
+                                  int64_t dq_time_us = 0,
+                                  int64_t v4l2_timestamp_us = 0,
+                                  int64_t poll_wait_us = 0,
+                                  int64_t dqbuf_ioctl_us = 0,
+                                  int64_t decode_queue_wait_us = 0);
     void ApplyMjpegPipelineOptions(const V4l2MjpegPipelineOptions* mjpeg_pipeline);
     void EnsureNv12Pool(int w, int h);
     void QBufV4l2Index(unsigned int index);
@@ -101,6 +108,11 @@ private:
     struct MjpegPendingBuf {
         unsigned int index{0};
         size_t bytesused{0};
+        int64_t dq_time_us{0};
+        int64_t v4l2_timestamp_us{0};
+        int64_t poll_wait_us{0};
+        int64_t dqbuf_ioctl_us{0};
+        int64_t enqueue_time_us{0};
     };
 
     std::thread direct_thread_;

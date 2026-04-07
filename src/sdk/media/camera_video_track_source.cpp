@@ -56,6 +56,7 @@ void LogMjpegDecodeTiming(const char* tag, int64_t before_us, int64_t after_us) 
     std::cout << "[MJPEG decode " << tag << "] frame#" << n << " before_us=" << before_us
               << " after_us=" << after_us << " duration_ms=" << ms << std::endl;
 }
+
 }  // namespace
 
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
@@ -558,7 +559,7 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
             dec->SetPipelineV4l2ExtDmabuf(v4l2_ext_dma_config_);
             dec->SetPipelineRgaToMpp(mjpeg_rga_config_);
             mjpeg_mpp_ = std::move(dec);
-            std::cout << "[CameraV4L2] MJPEG: Rockchip MPP decode -> NV12 (硬编路径零 I420/libyuv 色度转换)\n";
+            std::cout << "[CameraV4L2] MJPEG: Rockchip MPP decode -> NV12 (zero I420/libyuv chroma conversion in HW encode path)\n";
         }
     }
 #endif
@@ -605,13 +606,23 @@ void CameraVideoTrackSource::DecodeWorkerThreadMain() {
         if (!shutdown_skip_decode && job.index < direct_mmap_.size() && direct_mmap_[job.index] &&
             job.bytesused > 0) {
             const uint8_t* src = static_cast<const uint8_t*>(direct_mmap_[job.index]);
-            ProcessV4l2CapturedFrame(job.index, src, job.bytesused);
+            const int64_t decode_queue_wait_us =
+                (job.enqueue_time_us > 0) ? (webrtc::TimeMicros() - job.enqueue_time_us) : 0;
+            ProcessV4l2CapturedFrame(job.index, src, job.bytesused, job.dq_time_us, job.v4l2_timestamp_us,
+                                     job.poll_wait_us, job.dqbuf_ioctl_us, decode_queue_wait_us);
         }
         QBufV4l2Index(job.index);
     }
 }
 
-void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index, const uint8_t* src, size_t bytesused) {
+void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index,
+                                                      const uint8_t* src,
+                                                      size_t bytesused,
+                                                      int64_t dq_time_us,
+                                                      int64_t v4l2_timestamp_us,
+                                                      int64_t poll_wait_us,
+                                                      int64_t dqbuf_ioctl_us,
+                                                      int64_t decode_queue_wait_us) {
     if (!src || bytesused == 0) {
         return;
     }
@@ -634,13 +645,12 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index, co
     if (mjpeg_mpp_ && direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
         if (PreferMjpegNativeZeroCopyToEnc()) {
             webrtc::scoped_refptr<MppNativeDecFrameBuffer> native;
-            const int64_t decode_before_us = webrtc::TimeMicros();
             // 始终传 mmap 指针：RGA 失败时会 memcpy 回退；EXT_DMA 成功时解码器忽略指针。
             const bool dec_native =
-                mjpeg_mpp_->DecodeJpegToNativeDecFrame(src, bytesused, w, h, &native, dma_arg_fd, dma_arg_cap);
+                mjpeg_mpp_->DecodeJpegToNativeDecFrame(src, bytesused, w, h, &native, dma_arg_fd, dma_arg_cap,
+                                                       dq_time_us, v4l2_timestamp_us, poll_wait_us, dqbuf_ioctl_us,
+                                                       decode_queue_wait_us);
             if (dec_native && native) {
-                const int64_t decode_after_us = webrtc::TimeMicros();
-                LogMjpegDecodeTiming("mpp-native-dec", decode_before_us, decode_after_us);
                 webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
                                                .set_video_frame_buffer(native)
                                                .set_timestamp_us(pipeline_t0_us)
@@ -729,6 +739,8 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
         pfd.events = POLLIN;
         const auto poll_t0 = std::chrono::steady_clock::now();
         int pr = poll(&pfd, 1, v4l2_poll_timeout_ms_);
+        const int64_t poll_wait_us = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - poll_t0).count());
         if (LatencyTraceEnabled() && pr > 0) {
             const auto poll_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - poll_t0)
                                      .count();
@@ -743,9 +755,14 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
         struct v4l2_buffer buf {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
+        const int64_t dq_ioctl_t0_us = webrtc::TimeMicros();
         if (ioctl(direct_fd_, VIDIOC_DQBUF, &buf) < 0) {
             continue;
         }
+        const int64_t dq_time_us = webrtc::TimeMicros();
+        const int64_t dqbuf_ioctl_us = dq_time_us - dq_ioctl_t0_us;
+        const int64_t v4l2_timestamp_us =
+            static_cast<int64_t>(buf.timestamp.tv_sec) * webrtc::kNumMicrosecsPerSec + buf.timestamp.tv_usec;
         if (buf.index >= direct_mmap_.size() || !direct_mmap_[buf.index]) {
             ioctl(direct_fd_, VIDIOC_QBUF, &buf);
             continue;
@@ -759,7 +776,8 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
             if (mjpeg_decode_inline_) {
                 static std::atomic<unsigned> inline_counter{0};
                 const int64_t t0_us = webrtc::TimeMicros();
-                ProcessV4l2CapturedFrame(buf.index, src, buf.bytesused);
+                ProcessV4l2CapturedFrame(buf.index, src, buf.bytesused, dq_time_us, v4l2_timestamp_us, poll_wait_us,
+                                         dqbuf_ioctl_us, 0);
                 if (LatencyTraceEnabled()) {
                     const unsigned n = ++inline_counter;
                     if ((n % 30u) == 0u) {
@@ -790,12 +808,15 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
                         lk.lock();
                     }
                 }
-                jpeg_queue_.push_back(MjpegPendingBuf{buf.index, buf.bytesused});
+                jpeg_queue_.push_back(
+                    MjpegPendingBuf{buf.index, buf.bytesused, dq_time_us, v4l2_timestamp_us, poll_wait_us,
+                                   dqbuf_ioctl_us, webrtc::TimeMicros()});
             }
             jpeg_queue_cv_.notify_one();
             continue;
         }
-        ProcessV4l2CapturedFrame(buf.index, src, buf.bytesused);
+        ProcessV4l2CapturedFrame(buf.index, src, buf.bytesused, dq_time_us, v4l2_timestamp_us, poll_wait_us,
+                                 dqbuf_ioctl_us, 0);
         ioctl(direct_fd_, VIDIOC_QBUF, &buf);
     }
 }

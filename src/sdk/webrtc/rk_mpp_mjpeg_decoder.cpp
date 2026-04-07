@@ -19,6 +19,7 @@
 
 #include "api/video/i420_buffer.h"
 #include "api/video/nv12_buffer.h"
+#include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
 #include "third_party/libyuv/include/libyuv/planar_functions.h"
 
@@ -724,7 +725,6 @@ bool RkMppMjpegDecoder::DecodeJpegToI420(const uint8_t* jpeg,
     if (output_buf_size_ == 0) {
         return false;
     }
-
     bool decoded = false;
     constexpr int kMaxSubmit = 8;
     constexpr int kMaxPollPerSubmit = 500;
@@ -863,7 +863,6 @@ bool RkMppMjpegDecoder::DecodeJpegToNV12(const uint8_t* jpeg,
     if (output_buf_size_ == 0) {
         return false;
     }
-
     bool decoded = false;
     constexpr int kMaxSubmit = 8;
     constexpr int kMaxPollPerSubmit = 500;
@@ -964,7 +963,12 @@ bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
                                                   int expect_h,
                                                   webrtc::scoped_refptr<MppNativeDecFrameBuffer>* out,
                                                   int dma_buf_fd,
-                                                  size_t dma_buf_capacity) {
+                                                  size_t dma_buf_capacity,
+                                                  int64_t dq_time_us,
+                                                  int64_t v4l2_timestamp_us,
+                                                  int64_t poll_wait_us,
+                                                  int64_t dqbuf_ioctl_us,
+                                                  int64_t decode_queue_wait_us) {
     if (!out) {
         return false;
     }
@@ -987,6 +991,7 @@ bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
         return false;
     }
 
+    const int64_t mjpeg_input_us = webrtc::TimeMicros();
     bool decoded = false;
     constexpr int kMaxSubmit = 8;
     constexpr int kMaxPollPerSubmit = 500;
@@ -1057,7 +1062,9 @@ bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
             const int ver_stride = static_cast<int>(mpp_frame_get_ver_stride(frame));
 
             webrtc::scoped_refptr<MppNativeDecFrameBuffer> wrapped =
-                MppNativeDecFrameBuffer::CreateFromMppFrame(frame, fw, fh, hs, ver_stride, fmt);
+                MppNativeDecFrameBuffer::CreateFromMppFrame(frame, fw, fh, hs, ver_stride, fmt, mjpeg_input_us,
+                                                            dq_time_us, v4l2_timestamp_us, poll_wait_us,
+                                                            dqbuf_ioctl_us, decode_queue_wait_us);
             if (!wrapped) {
                 mpp_frame_deinit(&frame);
                 return false;

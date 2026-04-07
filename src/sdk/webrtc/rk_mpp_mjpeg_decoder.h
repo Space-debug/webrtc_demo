@@ -62,7 +62,12 @@ class RkMppMjpegDecoder {
                                   int expect_h,
                                   webrtc::scoped_refptr<MppNativeDecFrameBuffer>* out,
                                   int dma_buf_fd = -1,
-                                  size_t dma_buf_capacity = 0);
+                                  size_t dma_buf_capacity = 0,
+                                  int64_t dq_time_us = 0,
+                                  int64_t v4l2_timestamp_us = 0,
+                                  int64_t poll_wait_us = 0,
+                                  int64_t dqbuf_ioctl_us = 0,
+                                  int64_t decode_queue_wait_us = 0);
 
  private:
   static size_t ComputeJpegOutputBufSize(int width, int height);
