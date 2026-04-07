@@ -25,6 +25,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <deque>
 #include <iostream>
 #include <cstdlib>
@@ -35,6 +36,16 @@ namespace webrtc_demo {
 
 #if defined(WEBRTC_LINUX) && defined(__linux__)
 namespace {
+bool LatencyTraceEnabled() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    const char* e = std::getenv("WEBRTC_LATENCY_TRACE");
+    cached = (e && e[0] == '1') ? 1 : 0;
+    return cached != 0;
+}
+
 void LogMjpegDecodeTiming(const char* tag, int64_t before_us, int64_t after_us) {
     static std::atomic<unsigned> g_n{0};
     const unsigned n = ++g_n;
@@ -56,29 +67,8 @@ static bool PreferMjpegNativeZeroCopyToEnc() {
     return e[0] != '0';
 }
 
-/// 默认关闭：部分设备/BSP 上 EXT_DMA 导入 MPP MJPEG 仍会崩溃，需显式 WEBRTC_MJPEG_V4L2_DMABUF=1 再测。
-static bool PreferMjpegV4l2DmabufToMpp() {
-    const char* e = std::getenv("WEBRTC_MJPEG_V4L2_DMABUF");
-    if (!e || e[0] == '\0') {
-        return false;
-    }
-    return e[0] != '0';
-}
-
-/// RGA imcopy：V4L2 dma-buf → MPP 输入 DRM buffer，避免 CPU memcpy；需编译链上 librga（WEBRTC_MJPEG_RGA_TO_MPP=1）。
-static bool PreferMjpegRgaToMpp() {
-#if !defined(WEBRTC_DEMO_HAVE_LIBRGA)
-    return false;
-#else
-    const char* e = std::getenv("WEBRTC_MJPEG_RGA_TO_MPP");
-    if (!e || e[0] == '\0') {
-        return false;
-    }
-    return e[0] != '0';
-#endif
-}
-#endif
-#endif
+#endif  // WEBRTC_DEMO_HAVE_ROCKCHIP_MPP
+#endif  // WEBRTC_LINUX && __linux__
 
 CameraVideoTrackSource::CameraVideoTrackSource() : webrtc::AdaptedVideoTrackSource() {}
 
@@ -195,6 +185,21 @@ void CameraVideoTrackSource::ApplyMjpegPipelineOptions(const V4l2MjpegPipelineOp
         pto = 2000;
     }
     v4l2_poll_timeout_ms_ = pto;
+
+    mjpeg_decode_inline_ = o.mjpeg_decode_inline;
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    v4l2_ext_dma_config_ = o.mjpeg_v4l2_ext_dma;
+    mjpeg_rga_config_ = o.mjpeg_rga_to_mpp;
+#endif
+    if (const char* e = std::getenv("WEBRTC_MJPEG_DECODE_INLINE")) {
+        const char c = e[0];
+        if (c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T') {
+            mjpeg_decode_inline_ = true;
+        }
+        if (c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F') {
+            mjpeg_decode_inline_ = false;
+        }
+    }
 
     if (const char* e = std::getenv("WEBRTC_MJPEG_QUEUE_LATEST_ONLY")) {
         const char c = e[0];
@@ -500,7 +505,7 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
     }
 
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
-    if (PreferMjpegV4l2DmabufToMpp() || PreferMjpegRgaToMpp()) {
+    if (WantV4l2ExtDmabufToMpp() || WantMjpegRgaToMpp()) {
         unsigned exp_ok = 0;
         for (unsigned int i = 0; i < nbuf; ++i) {
             struct v4l2_exportbuffer exp {};
@@ -514,7 +519,7 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
             }
         }
         if (exp_ok == nbuf) {
-            if (PreferMjpegV4l2DmabufToMpp()) {
+            if (WantV4l2ExtDmabufToMpp()) {
                 std::cout << "[CameraV4L2] VIDIOC_EXPBUF: " << nbuf
                           << " dma-buf fd(s) → MPP JPEG EXT_DMA import\n";
             } else {
@@ -550,12 +555,15 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
     if (prefer_mpp_mjpeg_decode_ && direct_pixfmt_ == V4L2_PIX_FMT_MJPEG) {
         auto dec = std::make_unique<RkMppMjpegDecoder>();
         if (dec->Init()) {
+            dec->SetPipelineV4l2ExtDmabuf(v4l2_ext_dma_config_);
+            dec->SetPipelineRgaToMpp(mjpeg_rga_config_);
             mjpeg_mpp_ = std::move(dec);
             std::cout << "[CameraV4L2] MJPEG: Rockchip MPP decode -> NV12 (硬编路径零 I420/libyuv 色度转换)\n";
         }
     }
 #endif
-    const bool mjpeg_async = (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG));
+    const bool mjpeg_async =
+        (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) && !mjpeg_decode_inline_;
     if (mjpeg_async) {
         decode_thread_ = std::thread([this]() { DecodeWorkerThreadMain(); });
     }
@@ -564,7 +572,11 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
               << " @" << (fps > 0 ? fps : 30) << "fps fourcc=0x" << std::hex << direct_pixfmt_ << std::dec
               << " mmap_bufs=" << nbuf << " poll_timeout_ms=" << v4l2_poll_timeout_ms_;
     if (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
-        std::cout << " mjpeg_deferred_qbuf=1";
+        if (mjpeg_decode_inline_) {
+            std::cout << " mjpeg_inline_decode=1";
+        } else {
+            std::cout << " mjpeg_deferred_qbuf=1";
+        }
     }
     std::cout << std::endl;
     return true;
@@ -615,8 +627,8 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index, co
     }
     bool ok = false;
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
-    const bool mpp_jpeg_dma = (dma_fd >= 0 && dma_cap >= bytesused &&
-                               (PreferMjpegV4l2DmabufToMpp() || PreferMjpegRgaToMpp()));
+    const bool mpp_jpeg_dma =
+        (dma_fd >= 0 && dma_cap >= bytesused && (WantV4l2ExtDmabufToMpp() || WantMjpegRgaToMpp()));
     const int dma_arg_fd = mpp_jpeg_dma ? dma_fd : -1;
     const size_t dma_arg_cap = mpp_jpeg_dma ? dma_cap : 0;
     if (mjpeg_mpp_ && direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
@@ -710,11 +722,21 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index, co
 }
 
 void CameraVideoTrackSource::DirectCaptureThreadMain() {
+    std::atomic<unsigned> poll_log_counter{0};
     while (direct_run_.load(std::memory_order_relaxed)) {
         struct pollfd pfd {};
         pfd.fd = direct_fd_;
         pfd.events = POLLIN;
+        const auto poll_t0 = std::chrono::steady_clock::now();
         int pr = poll(&pfd, 1, v4l2_poll_timeout_ms_);
+        if (LatencyTraceEnabled() && pr > 0) {
+            const auto poll_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - poll_t0)
+                                     .count();
+            const unsigned n = ++poll_log_counter;
+            if ((n % 90u) == 0u && poll_ms > 3.0) {
+                std::cout << "[Latency] V4L2 poll→readable wait_ms=" << poll_ms << " (frame#" << n << ")\n";
+            }
+        }
         if (pr <= 0) {
             continue;
         }
@@ -731,6 +753,20 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
         const uint8_t* src = static_cast<const uint8_t*>(direct_mmap_[buf.index]);
         if (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
             if (buf.bytesused == 0) {
+                ioctl(direct_fd_, VIDIOC_QBUF, &buf);
+                continue;
+            }
+            if (mjpeg_decode_inline_) {
+                static std::atomic<unsigned> inline_counter{0};
+                const int64_t t0_us = webrtc::TimeMicros();
+                ProcessV4l2CapturedFrame(buf.index, src, buf.bytesused);
+                if (LatencyTraceEnabled()) {
+                    const unsigned n = ++inline_counter;
+                    if ((n % 30u) == 0u) {
+                        const double ms = static_cast<double>(webrtc::TimeMicros() - t0_us) / 1000.0;
+                        std::cout << "[Latency] MJPEG inline decode+OnFrame ms=" << ms << " (sample#" << n << ")\n";
+                    }
+                }
                 ioctl(direct_fd_, VIDIOC_QBUF, &buf);
                 continue;
             }
@@ -838,5 +874,26 @@ void CameraVideoTrackSource::OnFrame(const webrtc::VideoFrame& frame) {
     captured_frames_.fetch_add(1, std::memory_order_relaxed);
     AdaptedVideoTrackSource::OnFrame(frame);
 }
+
+#if defined(WEBRTC_LINUX) && defined(__linux__) && defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+bool CameraVideoTrackSource::WantV4l2ExtDmabufToMpp() const {
+    if (const char* e = std::getenv("WEBRTC_MJPEG_V4L2_DMABUF")) {
+        return e[0] != '0';
+    }
+    return v4l2_ext_dma_config_;
+}
+
+bool CameraVideoTrackSource::WantMjpegRgaToMpp() const {
+#if defined(WEBRTC_DEMO_HAVE_LIBRGA)
+    if (const char* e = std::getenv("WEBRTC_MJPEG_RGA_TO_MPP")) {
+        return e[0] != '0';
+    }
+    return mjpeg_rga_config_;
+#else
+    (void)mjpeg_rga_config_;
+    return false;
+#endif
+}
+#endif
 
 }  // namespace webrtc_demo

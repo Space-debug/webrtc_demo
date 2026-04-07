@@ -35,6 +35,12 @@ struct V4l2MjpegPipelineOptions {
     int v4l2_buffer_count = 2;
     /// poll 超时毫秒；有数据即返回，仅影响无数据时的唤醒间隔。
     int v4l2_poll_timeout_ms = 50;
+    /// 为 true 时不使用解码工作线程，MJPEG 在采集线程内解码（低延迟，采集易受解码耗时影响）。
+    bool mjpeg_decode_inline = false;
+    /// 为 true 时默认启用 V4L2 MJPEG → MPP EXT_DMA（环境变量 WEBRTC_MJPEG_V4L2_DMABUF 未设置时生效；设置了则以环境为准）。
+    bool mjpeg_v4l2_ext_dma = false;
+    /// 为 true 时默认启用 RGA 拷贝路径（环境变量 WEBRTC_MJPEG_RGA_TO_MPP 未设置时生效）。
+    bool mjpeg_rga_to_mpp = false;
 };
 #if defined(WEBRTC_LINUX) && defined(__linux__) && defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
 class RkMppMjpegDecoder;
@@ -112,6 +118,13 @@ private:
     int nv12_pool_w_{0};
     int nv12_pool_h_{0};
     size_t nv12_ring_next_{0};
+    bool mjpeg_decode_inline_{false};
+#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    bool v4l2_ext_dma_config_{false};
+    bool mjpeg_rga_config_{false};
+    bool WantV4l2ExtDmabufToMpp() const;
+    bool WantMjpegRgaToMpp() const;
+#endif
     std::atomic<bool> direct_run_{false};
     int direct_fd_{-1};
     int direct_cap_w_{0};

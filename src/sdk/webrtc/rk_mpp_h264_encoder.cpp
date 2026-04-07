@@ -111,12 +111,13 @@ static bool AnnexBHasIdrNalu(const uint8_t* p, size_t len) {
 }
 
 // MPP stream_type=1 时为 4 字节大端长度 + NAL 负载；WebRTC RTP 分包需要 Annex B 起始码。
-static std::vector<uint8_t> AvcLengthPrefixedToAnnexB(const uint8_t* p, size_t len) {
-    std::vector<uint8_t> out;
-    if (len < 4) {
-        return out;
+// 写入 *out 并返回是否解析成功（复用调用方 vector，避免每帧堆分配）。
+static bool FillAvcLengthPrefixedToAnnexB(const uint8_t* p, size_t len, std::vector<uint8_t>* out) {
+    if (!out || len < 4) {
+        return false;
     }
-    out.reserve(len + (len / 64) * 4 + 16);
+    out->clear();
+    out->reserve(len + (len / 64) * 4 + 16);
     size_t o = 0;
     while (o + 4 <= len) {
         uint32_t nsize = (static_cast<uint32_t>(p[o]) << 24) |
@@ -124,62 +125,64 @@ static std::vector<uint8_t> AvcLengthPrefixedToAnnexB(const uint8_t* p, size_t l
                          (static_cast<uint32_t>(p[o + 2]) << 8) | static_cast<uint32_t>(p[o + 3]);
         o += 4;
         if (nsize == 0 || o + nsize > len) {
-            out.clear();
-            return out;
+            out->clear();
+            return false;
         }
-        out.push_back(0);
-        out.push_back(0);
-        out.push_back(0);
-        out.push_back(1);
-        out.insert(out.end(), p + o, p + o + nsize);
+        out->push_back(0);
+        out->push_back(0);
+        out->push_back(0);
+        out->push_back(1);
+        out->insert(out->end(), p + o, p + o + nsize);
         o += nsize;
     }
     if (o != len) {
-        out.clear();
+        out->clear();
+        return false;
     }
-    return out;
+    return !out->empty();
 }
 
-static std::vector<uint8_t> AvcLengthPrefixed16ToAnnexB(const uint8_t* p, size_t len) {
-    std::vector<uint8_t> out;
-    if (len < 2) {
-        return out;
+static bool FillAvcLengthPrefixed16ToAnnexB(const uint8_t* p, size_t len, std::vector<uint8_t>* out) {
+    if (!out || len < 2) {
+        return false;
     }
-    out.reserve(len + (len / 32) * 4 + 16);
+    out->clear();
+    out->reserve(len + (len / 32) * 4 + 16);
     size_t o = 0;
     while (o + 2 <= len) {
         uint16_t nsize = (static_cast<uint16_t>(p[o]) << 8) | static_cast<uint16_t>(p[o + 1]);
         o += 2;
         if (nsize == 0 || o + nsize > len) {
-            out.clear();
-            return out;
+            out->clear();
+            return false;
         }
-        out.push_back(0);
-        out.push_back(0);
-        out.push_back(0);
-        out.push_back(1);
-        out.insert(out.end(), p + o, p + o + nsize);
+        out->push_back(0);
+        out->push_back(0);
+        out->push_back(0);
+        out->push_back(1);
+        out->insert(out->end(), p + o, p + o + nsize);
         o += nsize;
     }
     if (o != len) {
-        out.clear();
+        out->clear();
+        return false;
     }
-    return out;
+    return !out->empty();
 }
 
 // 单 NAL 单元裸流（无长度、无起始码）
-static std::vector<uint8_t> RawSingleNalToAnnexB(const uint8_t* p, size_t len) {
-    std::vector<uint8_t> out;
-    if (len < 1 || (p[0] & 0x80) != 0) {
-        return out;
+static bool FillRawSingleNalToAnnexB(const uint8_t* p, size_t len, std::vector<uint8_t>* out) {
+    if (!out || len < 1 || (p[0] & 0x80) != 0) {
+        return false;
     }
-    out.reserve(4 + len);
-    out.push_back(0);
-    out.push_back(0);
-    out.push_back(0);
-    out.push_back(1);
-    out.insert(out.end(), p, p + len);
-    return out;
+    out->clear();
+    out->reserve(4 + len);
+    out->push_back(0);
+    out->push_back(0);
+    out->push_back(0);
+    out->push_back(1);
+    out->insert(out->end(), p, p + len);
+    return true;
 }
 
 /// 半平面 NV12/NV21 源（共用 chroma stride）拷入 MPP 帧缓冲。
@@ -273,6 +276,7 @@ void RkMppH264Encoder::DestroyMpp() {
         mpp_ctx_ = nullptr;
         mpi_ = nullptr;
     }
+    annex_scratch_.clear();
 }
 
 bool RkMppH264Encoder::ApplyRcToCfg() {
@@ -346,7 +350,16 @@ int RkMppH264Encoder::InitEncode(const webrtc::VideoCodec* inst,
     if (ki <= 0) {
         ki = static_cast<int>(fps_) * 2;
     }
+    if (const char* eg = std::getenv("WEBRTC_MPP_ENC_GOP")) {
+        const long v = std::strtol(eg, nullptr, 10);
+        if (v >= 1 && v <= 600) {
+            ki = static_cast<int>(v);
+        }
+    }
     gop_ = ki;
+    if (const char* lt = std::getenv("WEBRTC_LATENCY_TRACE"); lt && lt[0] == '1') {
+        std::cout << "[Latency] MPP H264 GOP frames=" << gop_ << " fps=" << fps_ << "\n";
+    }
     mpp_rc_mode_ = MPP_ENC_RC_MODE_VBR;
 
     MppCtx ctx = nullptr;
@@ -716,22 +729,22 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                 buf = webrtc::EncodedImageBuffer::Create(len);
                 memcpy(buf->data(), raw, len);
             } else {
-                std::vector<uint8_t> annex = AvcLengthPrefixedToAnnexB(raw, len);
-                if (annex.empty()) {
-                    annex = AvcLengthPrefixed16ToAnnexB(raw, len);
+                bool annex_ok = FillAvcLengthPrefixedToAnnexB(raw, len, &annex_scratch_);
+                if (!annex_ok) {
+                    annex_ok = FillAvcLengthPrefixed16ToAnnexB(raw, len, &annex_scratch_);
                 }
-                if (annex.empty()) {
-                    annex = RawSingleNalToAnnexB(raw, len);
+                if (!annex_ok) {
+                    annex_ok = FillRawSingleNalToAnnexB(raw, len, &annex_scratch_);
                 }
-                if (annex.empty()) {
+                if (!annex_ok) {
                     mpp_packet_deinit(&out_pkt);
                     mpp_packet_deinit(&packet);
                     RTC_LOG(LS_WARNING) << "[RkMppH264] unparseable bitstream, request SW fallback; len="
                                         << len;
                     return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
                 }
-                buf = webrtc::EncodedImageBuffer::Create(annex.size());
-                memcpy(buf->data(), annex.data(), annex.size());
+                buf = webrtc::EncodedImageBuffer::Create(annex_scratch_.size());
+                memcpy(buf->data(), annex_scratch_.data(), annex_scratch_.size());
             }
             webrtc::EncodedImage encoded;
             encoded.SetEncodedData(buf);
@@ -757,6 +770,14 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                           << ", encode_finish_ms=" << (encode_finish_us / webrtc::kNumMicrosecsPerMillisec)
                           << ", render_time_ms=" << frame.render_time_ms() << ", rtp_timestamp=" << rtp_ts
                           << ", rtp_timestamp/3000=" << rtp_over_3000 << std::endl;
+            }
+            if (const char* lt = std::getenv("WEBRTC_LATENCY_TRACE"); lt && lt[0] == '1') {
+                static std::atomic<unsigned> enc_lat_n{0};
+                const unsigned n = ++enc_lat_n;
+                if ((n % 30u) == 0u) {
+                    const double ms = static_cast<double>(encode_finish_us - encode_before_us) / 1000.0;
+                    std::cout << "[Latency] MPP H264 encode put+get ms=" << ms << " sample#" << n << std::endl;
+                }
             }
 
             RK_S32 intra = 0;

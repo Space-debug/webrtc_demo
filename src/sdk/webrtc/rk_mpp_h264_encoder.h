@@ -2,6 +2,7 @@
 #define WEBRTC_DEMO_RK_MPP_H264_ENCODER_H_
 
 #include <memory>
+#include <vector>
 
 #include "api/environment/environment.h"
 #include "api/video_codecs/video_encoder.h"
@@ -59,6 +60,8 @@ class RkMppH264Encoder final : public webrtc::VideoEncoder {
   int mpp_rc_mode_{0};  // MppEncRcMode
 
   bool initialized_{false};
+  /// Annex-B 转换复用缓冲，避免每帧 std::vector 堆分配（容量随帧增长后保持稳定）。
+  std::vector<uint8_t> annex_scratch_;
 };
 
 }  // namespace webrtc_demo

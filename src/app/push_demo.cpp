@@ -62,6 +62,13 @@ void PrintUsage(const char* prog) {
               << "  WEBRTC_MJPEG_TO_H264_TRACE=1   Log MJPEG process start → H264 ready (us), every 30 frames (MPP enc)\n"
               << "  WEBRTC_MJPEG_V4L2_DMABUF=1     Enable VIDIOC_EXPBUF → MPP EXT_DMA import (default off; BSP 需自测)\n"
               << "  WEBRTC_MJPEG_RGA_TO_MPP=1      RGA dma-buf → MPP input (needs librga + EXPBUF; safer than EXT_DMA)\n"
+              << "  WEBRTC_MJPEG_RGA_MAX_ASPECT=N  RGA 假 Y400 布局最大长宽比（默认 64；RGA 失败可试 8~16）\n"
+              << "  WEBRTC_LATENCY_TRACE=1          打印各段耗时（capture gate / V4L2 / MJPEG / MPP / 编码等）\n"
+              << "  WEBRTC_CAPTURE_WARMUP_SEC=N     覆盖配置：摄像头预热秒数\n"
+              << "  WEBRTC_MJPEG_DECODE_INLINE=1    MJPEG 在采集线程解码（省约 1 帧延迟；采集易被解码拖慢）\n"
+              << "  WEBRTC_MJPEG_DEC_LOW_LATENCY=1  MPP MJPEG 解码 poll/休眠更激进\n"
+              << "  WEBRTC_MJPEG_RGA_DISABLE_AFTER_FAIL=1  首帧 RGA 失败后本会话不再尝试 RGA\n"
+              << "  WEBRTC_MPP_ENC_GOP=N            覆盖 H264 GOP 帧数（1~600，低延迟可试 30~60）\n"
               << "Arguments:\n"
               << "  stream_id         Stream ID; omitted -> STREAM_ID in config\n"
               << "  camera            Device path/index; omitted -> STREAM_<id>_CAMERA\n"
@@ -212,6 +219,33 @@ int main(int argc, char* argv[]) {
         config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
         config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
         config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);
+        {
+            std::string inl = cfg.GetStream(stream_id, "MJPEG_DECODE_INLINE", "");
+            for (auto& c : inl) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            config.mjpeg_decode_inline =
+                (inl == "1" || inl == "true" || inl == "yes" || inl == "on");
+        }
+        {
+            std::string v = cfg.GetStream(stream_id, "MJPEG_V4L2_DMABUF", "");
+            for (auto& c : v) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (!v.empty()) {
+                config.mjpeg_v4l2_ext_dma =
+                    (v == "1" || v == "true" || v == "yes" || v == "on");
+            }
+        }
+        {
+            std::string v = cfg.GetStream(stream_id, "MJPEG_RGA_TO_MPP", "");
+            for (auto& c : v) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (!v.empty()) {
+                config.mjpeg_rga_to_mpp = (v == "1" || v == "true" || v == "yes" || v == "on");
+            }
+        }
     }
     if (cmdline_signaling.has_value()) signaling_url = *cmdline_signaling;
     if (cmdline_width.has_value()) config.video_width = *cmdline_width;
@@ -222,6 +256,18 @@ int main(int argc, char* argv[]) {
     }
     if (const char* gw = std::getenv("WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC")) {
         config.capture_gate_max_wait_sec = std::atoi(gw);
+    }
+    if (const char* wu = std::getenv("WEBRTC_CAPTURE_WARMUP_SEC")) {
+        config.capture_warmup_sec = std::atoi(wu);
+    }
+    if (const char* il = std::getenv("WEBRTC_MJPEG_DECODE_INLINE")) {
+        const char c = il[0];
+        if (c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T') {
+            config.mjpeg_decode_inline = true;
+        }
+        if (c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F') {
+            config.mjpeg_decode_inline = false;
+        }
     }
     if (stream_id.empty()) stream_id = "livestream";
 
@@ -297,6 +343,9 @@ int main(int argc, char* argv[]) {
                                         ? std::to_string(config.capture_gate_min_frames) + "frames<=" +
                                               std::to_string(config.capture_gate_max_wait_sec) + "s"
                                         : std::string("off"))
+              << " mjpeg_inline_decode=" << (config.mjpeg_decode_inline ? "on" : "off")
+              << " mjpeg_ext_dma_cfg=" << (config.mjpeg_v4l2_ext_dma ? "on" : "off")
+              << " mjpeg_rga_cfg=" << (config.mjpeg_rga_to_mpp ? "on" : "off")
               << " device=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
               << std::endl;
     if (config.keyframe_interval > 0) {

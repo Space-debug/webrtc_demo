@@ -5,10 +5,13 @@
 #include "webrtc/mpp_native_dec_frame_buffer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <iostream>
+#include <limits>
 #include <unistd.h>
 
 #include <linux/dma-buf.h>
@@ -30,6 +33,11 @@
 
 #define MPP_ALIGN(x, a) (((x) + ((a)-1)) & ~((a)-1))
 
+#if defined(WEBRTC_DEMO_HAVE_LIBRGA)
+#include <rga/im2d.hpp>
+#include <rga/rga.h>
+#endif
+
 namespace webrtc_demo {
 
 namespace {
@@ -39,19 +47,155 @@ static bool MjpegDecTraceEnabled() {
     return k && k[0] != '0';
 }
 
-#if defined(WEBRTC_DEMO_HAVE_LIBRGA)
-#include <rga/im2d.h>
-#include <rga/rga.h>
-
-static bool MjpegRgaCopyEnabled() {
-    const char* e = std::getenv("WEBRTC_MJPEG_RGA_TO_MPP");
-    if (!e || e[0] == '\0') {
-        return false;
+static bool LatencyTraceEnabled() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
     }
-    return e[0] != '0';
+    const char* e = std::getenv("WEBRTC_LATENCY_TRACE");
+    cached = (e && e[0] == '1') ? 1 : 0;
+    return cached != 0;
 }
 
-/// 将 JPEG 比特流按 RK_FORMAT_YCbCr_400（1 byte/pixel）铺满矩形，用 RGA imcopy 从采集 dma-buf 拷入 MPP 输入 dma-buf。
+static bool MjpegDecLowLatency() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    const char* e = std::getenv("WEBRTC_MJPEG_DEC_LOW_LATENCY");
+    cached = (e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
+    return cached != 0;
+}
+
+static int MjpegPollOutputTimeoutMs() {
+    return MjpegDecLowLatency() ? 8 : 30;
+}
+
+static int MjpegPollSleepUs() {
+    return MjpegDecLowLatency() ? 200 : 2000;
+}
+
+#if defined(WEBRTC_DEMO_HAVE_LIBRGA)
+
+static bool RgaDisableAfterFailEnabled() {
+    const char* e = std::getenv("WEBRTC_MJPEG_RGA_DISABLE_AFTER_FAIL");
+    return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+}
+
+/// 读取 RGA 布局用的最大长宽比（宽/高 与 高/宽 均不超过此值）。可用环境变量收紧，例如 16。
+static int RgaY400MaxAspectRatio() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char* e = std::getenv("WEBRTC_MJPEG_RGA_MAX_ASPECT");
+    if (e && e[0] != '\0') {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v >= 2 && v <= 256) {
+            cached = static_cast<int>(v);
+            return cached;
+        }
+    }
+    cached = 64;
+    return cached;
+}
+
+/// 为 RK_FORMAT_YCbCr_400 选择 RGA imcopy 用的 w×h（每像素 1 字节），满足 need<=w*h<=cap。
+///
+/// 注意：这里的 w、h **不是** MJPEG 解码后的图像宽高，也不是相机 1280×720。JPEG 仍是压缩码流；
+/// 只是把 **jpeg_len 个字节** 当成一块线性数据，**人为折成** 二维「假灰度图」以满足 RGA 的矩形拷贝接口。
+/// 在 need 固定时，可选 (w,h) 很多。旧实现从最大 w 开始取第一个可行解，容易得到 **4096×64** 类极端条带，
+/// 在部分 BSP 上 RGA_BLIT 恒为 EINVAL；因此在全体可行解中选 **长宽比最接近 1** 的一对（必要时仍受 WEBRTC_MJPEG_RGA_MAX_ASPECT 约束）。
+static bool RgaPickY400Rect(size_t cap, size_t need, int* out_w, int* out_h) {
+    if (need == 0 || need > cap || !out_w || !out_h) {
+        return false;
+    }
+    constexpr int kMinW = 64;
+    constexpr int kMinH = 16;
+    constexpr int kMaxW = 4096;
+    constexpr int kMaxH = 8192;
+    constexpr int kAlignW = 16;
+    const int kMaxAspectRatio = RgaY400MaxAspectRatio();
+
+    const int w_hi =
+        std::min(kMaxW, static_cast<int>(std::min(cap / static_cast<size_t>(kMinH), static_cast<size_t>(kMaxW))));
+
+    int best_w = 0;
+    int best_h = 0;
+    size_t best_total = SIZE_MAX;
+
+    for (int w = kMinW; w <= w_hi; w += kAlignW) {
+        const size_t wz = static_cast<size_t>(w);
+        size_t h = (need + wz - 1u) / wz;
+        const size_t h_min_for_landscape =
+            (wz + static_cast<size_t>(kMaxAspectRatio) - 1u) / static_cast<size_t>(kMaxAspectRatio);
+        h = std::max({h, h_min_for_landscape, static_cast<size_t>(kMinH)});
+        if ((h & 1u) != 0u) {
+            ++h;
+        }
+        if (h > static_cast<size_t>(kMaxH)) {
+            continue;
+        }
+        if (h > wz * static_cast<size_t>(kMaxAspectRatio)) {
+            continue;
+        }
+        size_t total = wz * h;
+        if (total < need) {
+            h = (need + wz - 1u) / wz;
+            h = std::max({h, h_min_for_landscape, static_cast<size_t>(kMinH)});
+            if ((h & 1u) != 0u) {
+                ++h;
+            }
+            if (h > static_cast<size_t>(kMaxH) || h > wz * static_cast<size_t>(kMaxAspectRatio)) {
+                continue;
+            }
+            total = wz * h;
+        }
+        if (total < need || total > cap) {
+            continue;
+        }
+        const int hi = static_cast<int>(h);
+        const int tmn = std::min(w, hi);
+        const int tmx = std::max(w, hi);
+        const int bmn = std::min(best_w, best_h);
+        const int bmx = std::max(best_w, best_h);
+        // 最小化长宽比 tmx/tmn：tmx/tmn < bmx/bmn 当且仅当 tmx*bmn < bmx*tmn（正整数）。
+        const auto lhs = static_cast<unsigned long long>(tmx) * static_cast<unsigned long long>(bmn);
+        const auto rhs = static_cast<unsigned long long>(bmx) * static_cast<unsigned long long>(tmn);
+        if (best_w == 0 || lhs < rhs || (lhs == rhs && total < best_total)) {
+            best_w = w;
+            best_h = hi;
+            best_total = total;
+        }
+    }
+
+    if (best_w == 0) {
+        return false;
+    }
+    *out_w = best_w;
+    *out_h = best_h;
+    return true;
+}
+
+/// 在「无 cap 上限」时铺满 need 所需的最小 w×h 字节数（用于判断 V4L2 dma 是否够大、MPP input 分配尺寸）。
+static size_t RgaY400SmallestTotalBytes(size_t need) {
+    int w = 0;
+    int h = 0;
+    if (!RgaPickY400Rect(std::numeric_limits<size_t>::max(), need, &w, &h)) {
+        return need;
+    }
+    return static_cast<size_t>(w) * static_cast<size_t>(h);
+}
+
+/// UVC vb2 dma-buf → MPP DRM dma-buf 的 RGA 拷贝。
+///
+/// 失败常见根因（与「MJPEG 画面宽高」无关）：
+/// 1) **未按真实 buffer 字节长度向 RGA 注册 fd**：`wrapbuffer_fd` 只传 w/h/format，部分内核/RGA 路径无法从 vb2/DRM gem 推出正确可访问长度，
+///    官方示例更推荐 **importbuffer_fd(fd, size_bytes)**（见 librga im2d.hpp）再 **wrapbuffer_handle**。
+/// 2) **地址空间**：部分 BSP 要求 RGA 可见 **4G 以下 DMA**（dmesg 可能出现 RGA_MMU / >4G）；若仍失败需在分配侧用 dma32 / CMA heap（超出本函数范围）。
+/// 3) **跨设备 heap**：UVC 与 MPP 非同一分配器时，个别内核仍拒绝对拷；只能 memcpy 或中间 dma-heap 垫层。
+///
+/// 策略：优先 **import + wrapbuffer_handle**；失败再回退 **wrapbuffer_fd**（兼容旧行为）。
 static bool RgaCopyDmaBufJpeg(int src_fd,
                               size_t src_cap,
                               int dst_fd,
@@ -64,32 +208,12 @@ static bool RgaCopyDmaBufJpeg(int src_fd,
     if (jpeg_len > cap) {
         return false;
     }
-    static const int kWidths[] = {8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16};
     int w = 0;
     int h = 0;
-    bool ok_layout = false;
-    for (int cand_w : kWidths) {
-        size_t hh = (jpeg_len + static_cast<size_t>(cand_w) - 1u) / static_cast<size_t>(cand_w);
-        if (hh > 65536u) {
-            continue;
+    if (!RgaPickY400Rect(cap, jpeg_len, &w, &h)) {
+        if (MjpegDecTraceEnabled()) {
+            std::cerr << "[RkMppMjpeg] RGA layout failed need=" << jpeg_len << " cap=" << cap << "\n";
         }
-        if ((hh & 1u) != 0u) {
-            ++hh;
-        }
-        size_t total = static_cast<size_t>(cand_w) * hh;
-        while (total > cap && hh > 2u) {
-            hh -= 2u;
-            total = static_cast<size_t>(cand_w) * hh;
-        }
-        if (total < jpeg_len) {
-            continue;
-        }
-        w = cand_w;
-        h = static_cast<int>(hh);
-        ok_layout = true;
-        break;
-    }
-    if (!ok_layout || w <= 0 || h <= 0) {
         return false;
     }
 
@@ -108,24 +232,58 @@ static bool RgaCopyDmaBufJpeg(int src_fd,
         }
     }
 
-    rga_buffer_t src = wrapbuffer_fd(src_fd, w, h, RK_FORMAT_YCbCr_400);
-    rga_buffer_t dst = wrapbuffer_fd(dst_fd, w, h, RK_FORMAT_YCbCr_400);
-    const IM_STATUS st = imcopy(src, dst, 1);
+    const int src_import_sz =
+        static_cast<int>(std::min(src_cap, static_cast<size_t>(std::numeric_limits<int>::max())));
+    const int dst_import_sz =
+        static_cast<int>(std::min(dst_cap, static_cast<size_t>(std::numeric_limits<int>::max())));
 
-    {
-        struct dma_buf_sync sync {};
-        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
-        if (ioctl(dst_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && MjpegDecTraceEnabled()) {
-            std::cerr << "[RkMppMjpeg] RGA dst DMA_BUF_SYNC(END WRITE) errno=" << errno << "\n";
+    auto do_end_sync = [&]() {
+        {
+            struct dma_buf_sync sync {};
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+            if (ioctl(dst_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && MjpegDecTraceEnabled()) {
+                std::cerr << "[RkMppMjpeg] RGA dst DMA_BUF_SYNC(END WRITE) errno=" << errno << "\n";
+            }
         }
-    }
-    {
-        struct dma_buf_sync sync {};
-        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-        if (ioctl(src_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && MjpegDecTraceEnabled()) {
-            std::cerr << "[RkMppMjpeg] RGA src DMA_BUF_SYNC(END READ) errno=" << errno << "\n";
+        {
+            struct dma_buf_sync sync {};
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            if (ioctl(src_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && MjpegDecTraceEnabled()) {
+                std::cerr << "[RkMppMjpeg] RGA src DMA_BUF_SYNC(END READ) errno=" << errno << "\n";
+            }
         }
+    };
+
+    IM_STATUS st = IM_STATUS_FAILED;
+    rga_buffer_handle_t hs = 0;
+    rga_buffer_handle_t hd = 0;
+    hs = importbuffer_fd(src_fd, src_import_sz);
+    hd = importbuffer_fd(dst_fd, dst_import_sz);
+    if (hs != 0 && hd != 0) {
+        rga_buffer_t src = wrapbuffer_handle(hs, w, h, RK_FORMAT_YCbCr_400);
+        rga_buffer_t dst = wrapbuffer_handle(hd, w, h, RK_FORMAT_YCbCr_400);
+        st = imcopy(src, dst, 1);
     }
+    if (hs != 0) {
+        releasebuffer_handle(hs);
+        hs = 0;
+    }
+    if (hd != 0) {
+        releasebuffer_handle(hd);
+        hd = 0;
+    }
+
+    if (st != IM_STATUS_SUCCESS && st != IM_STATUS_NOERROR) {
+        if (MjpegDecTraceEnabled()) {
+            std::cerr << "[RkMppMjpeg] RGA imcopy(importbuffer) status=" << static_cast<int>(st) << " ("
+                      << imStrError_t(st) << "), retry wrapbuffer_fd\n";
+        }
+        rga_buffer_t src = wrapbuffer_fd(src_fd, w, h, RK_FORMAT_YCbCr_400);
+        rga_buffer_t dst = wrapbuffer_fd(dst_fd, w, h, RK_FORMAT_YCbCr_400);
+        st = imcopy(src, dst, 1);
+    }
+
+    do_end_sync();
 
     if (st != IM_STATUS_SUCCESS && st != IM_STATUS_NOERROR) {
         if (MjpegDecTraceEnabled()) {
@@ -136,14 +294,6 @@ static bool RgaCopyDmaBufJpeg(int src_fd,
     return true;
 }
 #endif  // WEBRTC_DEMO_HAVE_LIBRGA
-
-static bool PreferMjpegV4l2DmabufImport() {
-    const char* e = std::getenv("WEBRTC_MJPEG_V4L2_DMABUF");
-    if (!e || e[0] == '\0') {
-        return false;
-    }
-    return e[0] != '0';
-}
 
 static constexpr int kMppBufferGroupIndex = 1;
 
@@ -180,6 +330,24 @@ static bool CopyMppSemiPlanarToNv12(RK_U32 fmt,
 
 }  // namespace
 
+bool RkMppMjpegDecoder::WantExtDmabufImport() const {
+    if (const char* e = std::getenv("WEBRTC_MJPEG_V4L2_DMABUF")) {
+        return e[0] != '0';
+    }
+    return pipeline_v4l2_ext_dma_;
+}
+
+bool RkMppMjpegDecoder::WantRgaToMpp() const {
+#if !defined(WEBRTC_DEMO_HAVE_LIBRGA)
+    return false;
+#else
+    if (const char* e = std::getenv("WEBRTC_MJPEG_RGA_TO_MPP")) {
+        return e[0] != '0';
+    }
+    return pipeline_rga_to_mpp_;
+#endif
+}
+
 RkMppMjpegDecoder::RkMppMjpegDecoder() = default;
 
 RkMppMjpegDecoder::~RkMppMjpegDecoder() {
@@ -206,6 +374,9 @@ void RkMppMjpegDecoder::Close() {
     }
     last_expect_w_ = last_expect_h_ = 0;
     output_buf_size_ = 0;
+    session_skip_rga_ = false;
+    pipeline_v4l2_ext_dma_ = false;
+    pipeline_rga_to_mpp_ = false;
 }
 
 size_t RkMppMjpegDecoder::ComputeJpegOutputBufSize(int width, int height) {
@@ -305,11 +476,9 @@ bool RkMppMjpegDecoder::BuildMppInputPacket(int dma_buf_fd,
         return false;
     }
     MppBuffer mbuf = nullptr;
-    const bool want_ext_import =
-        (dma_buf_fd >= 0 && dma_buf_capacity >= jpeg_len && PreferMjpegV4l2DmabufImport());
+    const bool want_ext_import = (dma_buf_fd >= 0 && dma_buf_capacity >= jpeg_len && WantExtDmabufImport());
 #if defined(WEBRTC_DEMO_HAVE_LIBRGA)
-    const bool want_rga =
-        (dma_buf_fd >= 0 && dma_buf_capacity >= jpeg_len && MjpegRgaCopyEnabled() && !want_ext_import);
+    const bool want_rga = (dma_buf_fd >= 0 && dma_buf_capacity >= jpeg_len && WantRgaToMpp() && !want_ext_import);
 #else
     const bool want_rga = false;
 #endif
@@ -344,9 +513,23 @@ bool RkMppMjpegDecoder::BuildMppInputPacket(int dma_buf_fd,
             return false;
         }
         MppBufferGroup ig = reinterpret_cast<MppBufferGroup>(input_group_);
-        if (mpp_buffer_get(ig, &mbuf, jpeg_len) != MPP_OK || !mbuf) {
+#if defined(WEBRTC_DEMO_HAVE_LIBRGA)
+        bool try_rga = want_rga && !session_skip_rga_;
+        size_t in_alloc = jpeg_len;
+        if (try_rga) {
+            const size_t rga_min_total = RgaY400SmallestTotalBytes(jpeg_len);
+            if (dma_buf_capacity < rga_min_total) {
+                try_rga = false;
+            } else {
+                in_alloc = std::max(jpeg_len, rga_min_total);
+            }
+        }
+#else
+        size_t in_alloc = jpeg_len;
+#endif
+        if (mpp_buffer_get(ig, &mbuf, in_alloc) != MPP_OK || !mbuf) {
             if (MjpegDecTraceEnabled()) {
-                std::cerr << "[RkMppMjpeg] mpp_buffer_get input jpeg failed len=" << jpeg_len << "\n";
+                std::cerr << "[RkMppMjpeg] mpp_buffer_get input jpeg failed len=" << in_alloc << "\n";
             }
             return false;
         }
@@ -357,13 +540,30 @@ bool RkMppMjpegDecoder::BuildMppInputPacket(int dma_buf_fd,
         }
         bool filled = false;
 #if defined(WEBRTC_DEMO_HAVE_LIBRGA)
-        if (want_rga) {
+        if (try_rga) {
             const int dst_fd = mpp_buffer_get_fd(mbuf);
             const size_t dst_cap = mpp_buffer_get_size(mbuf);
-            if (dst_fd >= 0 && RgaCopyDmaBufJpeg(dma_buf_fd, dma_buf_capacity, dst_fd, dst_cap, jpeg_len)) {
+            const auto t_rga0 = std::chrono::steady_clock::now();
+            const bool rga_ok =
+                (dst_fd >= 0) && RgaCopyDmaBufJpeg(dma_buf_fd, dma_buf_capacity, dst_fd, dst_cap, jpeg_len);
+            if (LatencyTraceEnabled()) {
+                const double rga_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_rga0).count();
+                std::cout << "[Latency] MPP JPEG input RGA copy ms=" << rga_ms << " ok=" << (rga_ok ? 1 : 0) << "\n";
+            }
+            if (rga_ok) {
                 filled = true;
-            } else if (MjpegDecTraceEnabled()) {
-                std::cerr << "[RkMppMjpeg] RGA copy failed, falling back to memcpy\n";
+            } else {
+                if (RgaDisableAfterFailEnabled()) {
+                    session_skip_rga_ = true;
+                    if (LatencyTraceEnabled() || MjpegDecTraceEnabled()) {
+                        std::cerr << "[RkMppMjpeg] RGA disabled for rest of session "
+                                     "(WEBRTC_MJPEG_RGA_DISABLE_AFTER_FAIL=1)\n";
+                    }
+                }
+                if (MjpegDecTraceEnabled()) {
+                    std::cerr << "[RkMppMjpeg] RGA copy failed, falling back to memcpy\n";
+                }
             }
         }
 #endif
@@ -372,7 +572,13 @@ bool RkMppMjpegDecoder::BuildMppInputPacket(int dma_buf_fd,
                 mpp_buffer_put(mbuf);
                 return false;
             }
+            const auto t_mc0 = std::chrono::steady_clock::now();
             std::memcpy(dst, jpeg, jpeg_len);
+            if (LatencyTraceEnabled()) {
+                const double mc_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_mc0).count();
+                std::cout << "[Latency] MPP JPEG input memcpy ms=" << mc_ms << " bytes=" << jpeg_len << "\n";
+            }
         }
     }
     mpp_buffer_set_index(mbuf, kMppBufferGroupIndex);
@@ -396,8 +602,8 @@ bool RkMppMjpegDecoder::SendMppPacket(void* packet_vp) {
     MppBufferGroup og = reinterpret_cast<MppBufferGroup>(output_buf_group_);
 
     const int timeout_ms = 200;
-    const int interval_ms = 5;
-    int wait_left = 2000;
+    const int interval_ms = MjpegDecLowLatency() ? 2 : 5;
+    int wait_left = MjpegDecLowLatency() ? 800 : 2000;
 
     while (wait_left > 0) {
         mpi->poll(ctx, MPP_PORT_INPUT, static_cast<MppPollType>(interval_ms));
@@ -538,9 +744,9 @@ bool RkMppMjpegDecoder::DecodeJpegToI420(const uint8_t* jpeg,
 
         bool need_resubmit = false;
         for (int poll_i = 0; poll_i < kMaxPollPerSubmit; ++poll_i) {
-            MppFrame frame = static_cast<MppFrame>(PollMppFrame(30));
+            MppFrame frame = static_cast<MppFrame>(PollMppFrame(MjpegPollOutputTimeoutMs()));
             if (!frame) {
-                usleep(2000);
+                usleep(static_cast<unsigned>(MjpegPollSleepUs()));
                 continue;
             }
             if (mpp_frame_get_info_change(frame)) {
@@ -677,9 +883,9 @@ bool RkMppMjpegDecoder::DecodeJpegToNV12(const uint8_t* jpeg,
 
         bool need_resubmit = false;
         for (int poll_i = 0; poll_i < kMaxPollPerSubmit; ++poll_i) {
-            MppFrame frame = static_cast<MppFrame>(PollMppFrame(30));
+            MppFrame frame = static_cast<MppFrame>(PollMppFrame(MjpegPollOutputTimeoutMs()));
             if (!frame) {
-                usleep(2000);
+                usleep(static_cast<unsigned>(MjpegPollSleepUs()));
                 continue;
             }
             if (mpp_frame_get_info_change(frame)) {
@@ -800,9 +1006,9 @@ bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
 
         bool need_resubmit = false;
         for (int poll_i = 0; poll_i < kMaxPollPerSubmit; ++poll_i) {
-            MppFrame frame = static_cast<MppFrame>(PollMppFrame(30));
+            MppFrame frame = static_cast<MppFrame>(PollMppFrame(MjpegPollOutputTimeoutMs()));
             if (!frame) {
-                usleep(2000);
+                usleep(static_cast<unsigned>(MjpegPollSleepUs()));
                 continue;
             }
             if (mpp_frame_get_info_change(frame)) {

@@ -71,6 +71,12 @@ struct PushStreamerConfig {
     int v4l2_poll_timeout_ms{50};
     /// MPP MJPEG→NV12 路径下 NV12 环形缓冲个数（须 ≥ 下游同时持有的帧数）；范围 4～16。
     int nv12_pool_slots{6};
+    /// MJPEG：在采集线程内解码并立即 QBUF，省约 1 帧流水线延迟（采集线程会被解码阻塞）。
+    bool mjpeg_decode_inline{false};
+    /// 配置默认启用 EXT_DMA（无环境变量覆盖时）；不稳定 BSP 请关。
+    bool mjpeg_v4l2_ext_dma{false};
+    /// 配置默认启用 RGA（无环境变量覆盖时）。
+    bool mjpeg_rga_to_mpp{false};
 
 };
 

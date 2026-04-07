@@ -357,6 +357,16 @@ private:
     std::function<void(webrtc::RTCError)> fn_;
 };
 
+static bool LatencyTraceEnabled() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    const char* e = std::getenv("WEBRTC_LATENCY_TRACE");
+    cached = (e && e[0] == '1') ? 1 : 0;
+    return cached != 0;
+}
+
 class PushStreamer::Impl : public webrtc::PeerConnectionObserver {
 public:
     explicit Impl(const PushStreamerConfig& config) : config_(config) {}
@@ -629,6 +639,16 @@ public:
                           << config_.max_bitrate_kbps << " kbps"
                           << " max_fps=" << max_fps
                           << " network_priority=" << config_.video_network_priority << std::endl;
+                if (LatencyTraceEnabled()) {
+                    const char* deg = "maintain_framerate";
+                    if (config_.degradation_preference == "maintain_resolution") {
+                        deg = "maintain_resolution";
+                    } else if (config_.degradation_preference == "balanced") {
+                        deg = "balanced";
+                    }
+                    std::cout << "[Latency] WebRTC degradation_preference=" << deg
+                              << " (弱网时影响降质策略与排队感知)\n";
+                }
             }
             break;
         }
@@ -781,6 +801,9 @@ public:
         mjpeg_pipe.nv12_pool_slots = config_.nv12_pool_slots;
         mjpeg_pipe.v4l2_buffer_count = config_.v4l2_buffer_count;
         mjpeg_pipe.v4l2_poll_timeout_ms = config_.v4l2_poll_timeout_ms;
+        mjpeg_pipe.mjpeg_decode_inline = config_.mjpeg_decode_inline;
+        mjpeg_pipe.mjpeg_v4l2_ext_dma = config_.mjpeg_v4l2_ext_dma;
+        mjpeg_pipe.mjpeg_rga_to_mpp = config_.mjpeg_rga_to_mpp;
         if (!static_cast<CameraVideoTrackSource*>(cam_holder)
                  ->Start(unique_id.c_str(), config_.video_width, config_.video_height, config_.video_fps,
                          mpp_mjpeg_decode, &mjpeg_pipe)) {
@@ -815,7 +838,14 @@ public:
 
         if (config_.capture_warmup_sec > 0) {
             std::cout << "[PushStreamer] Camera warmup " << config_.capture_warmup_sec << "s..." << std::endl;
+            const auto w0 = std::chrono::steady_clock::now();
             std::this_thread::sleep_for(std::chrono::seconds(config_.capture_warmup_sec));
+            if (LatencyTraceEnabled()) {
+                const auto wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0)
+                                     .count();
+                std::cout << "[Latency] capture_warmup actual_ms=" << wms << " configured_sec=" << config_.capture_warmup_sec
+                          << std::endl;
+            }
         }
         return true;
     }
@@ -831,17 +861,29 @@ public:
         }
         using clock = std::chrono::steady_clock;
         const auto deadline = clock::now() + std::chrono::seconds(max_wait);
+        const auto gate_t0 = clock::now();
         std::cout << "[PushStreamer] Capture gate: need >= " << need << " frames (" << context << "), max wait "
                   << max_wait << "s" << std::endl;
         while (clock::now() < deadline) {
             const unsigned int got = EffectiveCaptureFrameCount();
             if (got >= static_cast<unsigned int>(need)) {
                 std::cout << "[PushStreamer] Capture gate OK: " << got << " frames" << std::endl;
+                if (LatencyTraceEnabled()) {
+                    const auto gms =
+                        std::chrono::duration<double, std::milli>(clock::now() - gate_t0).count();
+                    std::cout << "[Latency] capture_gate elapsed_ms=" << gms << " frames=" << got << " need=" << need
+                              << std::endl;
+                }
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
         }
         std::cerr << "[PushStreamer] Capture gate failed (" << context << ")" << std::endl;
+        if (LatencyTraceEnabled()) {
+            const auto gms = std::chrono::duration<double, std::milli>(clock::now() - gate_t0).count();
+            std::cout << "[Latency] capture_gate TIMEOUT elapsed_ms=" << gms << " last_frames=" << EffectiveCaptureFrameCount()
+                      << " need=" << need << std::endl;
+        }
         return false;
     }
 

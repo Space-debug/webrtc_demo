@@ -31,6 +31,11 @@ class RkMppMjpegDecoder {
   bool Init();
   void Close();
 
+  /// 与 CameraVideoTrackSource 配置对齐；若已设置 WEBRTC_MJPEG_V4L2_DMABUF 环境变量则仍以环境为准。
+  void SetPipelineV4l2ExtDmabuf(bool enable) { pipeline_v4l2_ext_dma_ = enable; }
+  /// 与配置 MJPEG_RGA_TO_MPP 对齐；环境变量 WEBRTC_MJPEG_RGA_TO_MPP 优先。
+  void SetPipelineRgaToMpp(bool enable) { pipeline_rga_to_mpp_ = enable; }
+
   /// dma_buf_fd>=0：EXT_DMA（WEBRTC_MJPEG_V4L2_DMABUF）或 RGA（WEBRTC_MJPEG_RGA_TO_MPP）；capacity 一般取 QUERYBUF.length。
   /// 建议始终传入 jpeg（mmap）：RGA 失败时 memcpy 回退；EXT_DMA 成功时可忽略指针。
   bool DecodeJpegToI420(const uint8_t* jpeg,
@@ -72,6 +77,9 @@ class RkMppMjpegDecoder {
                            size_t jpeg_len,
                            void** out_packet);
 
+  bool WantExtDmabufImport() const;
+  bool WantRgaToMpp() const;
+
   void* ctx_{nullptr};
   void* mpi_{nullptr};
   void* dec_cfg_{nullptr};
@@ -84,6 +92,10 @@ class RkMppMjpegDecoder {
   int last_expect_w_{0};
   int last_expect_h_{0};
   size_t output_buf_size_{0};
+  /// WEBRTC_MJPEG_RGA_DISABLE_AFTER_FAIL=1 时首帧 RGA 失败后本会话不再尝试 RGA。
+  bool session_skip_rga_{false};
+  bool pipeline_v4l2_ext_dma_{false};
+  bool pipeline_rga_to_mpp_{false};
 };
 
 }  // namespace webrtc_demo
