@@ -24,6 +24,9 @@ void ConfigurePeerConnectionFactoryDependencies(
     webrtc::PeerConnectionFactoryDependencies& deps,
     const PeerConnectionFactoryMediaOptions* media_options = nullptr);
 
+// 初始化 WebRTC field trials
+void EnsureWebrtcFieldTrialsInitialized();
+
 // CreateModularPeerConnectionFactory 在 signaling_thread==nullptr 时会绑定「当前线程」为信令线程；
 // CLI 主线程通常不跑 WebRTC 消息循环，会导致 PostTask/SDP 异步链永远不执行。
 // 若 deps.signaling_thread 仍为空，则创建专用线程并写入 deps；owned_signaling_thread 须保留至 Factory 销毁后再 Stop。

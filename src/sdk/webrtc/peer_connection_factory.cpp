@@ -4,6 +4,8 @@
 
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <string>
 
 #include "api/audio/builtin_audio_processing_builder.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
@@ -14,12 +16,25 @@
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "rtc_base/thread.h"
+#include "system_wrappers/include/field_trial.h"
 
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
 #include "webrtc/rk_mpp_video_encoder_factory.h"
 #endif
 
 namespace webrtc_demo {
+
+namespace {
+  std::once_flag g_field_trials_once;
+  std::string g_field_trials_storage;
+}  // namespace
+
+void EnsureWebrtcFieldTrialsInitialized() {
+  std::call_once(g_field_trials_once, []() {
+    g_field_trials_storage = "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
+    webrtc::field_trial::InitFieldTrialsFromString(g_field_trials_storage.c_str());
+  });
+}
 
 void ConfigurePeerConnectionFactoryDependencies(
     webrtc::PeerConnectionFactoryDependencies& deps,

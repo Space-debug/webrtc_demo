@@ -486,6 +486,7 @@ int RkMppH264Encoder::InitEncode(const webrtc::VideoCodec* inst,
     }
 
     initialized_ = true;
+    next_video_frame_tracking_id_ = 500;
     RTC_LOG(LS_INFO) << "[RkMppH264] InitEncode ok " << width_ << "x" << height_ << "@" << fps_
                      << "fps bps=" << target_bps_;
     return WEBRTC_VIDEO_CODEC_OK;
@@ -761,15 +762,15 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
 
             const uint32_t rtp_ts = frame.rtp_timestamp();
             const uint32_t rtp_over_3000 = rtp_ts / 3000u;
-            if (rtp_over_3000 % 120u == 0u) {
+            if (next_video_frame_tracking_id_ % 120u == 0u) {
                 const int64_t encode_duration_ms =
                     (encode_finish_us - encode_before_us) / webrtc::kNumMicrosecsPerMillisec;
-                std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: encode_before_ms="
-                          << (encode_before_us / webrtc::kNumMicrosecsPerMillisec)
-                          << ", encode_duration_ms=" << encode_duration_ms
-                          << ", encode_finish_ms=" << (encode_finish_us / webrtc::kNumMicrosecsPerMillisec)
-                          << ", render_time_ms=" << frame.render_time_ms() << ", rtp_timestamp=" << rtp_ts
-                          << ", rtp_timestamp/3000=" << rtp_over_3000 << std::endl;
+                    std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: current_video_frame_tracking_id_="
+                    << next_video_frame_tracking_id_
+                    << ", encode_duration_ms=" << encode_duration_ms
+                    << ", encode_finish_ms=" << (encode_finish_us / webrtc::kNumMicrosecsPerMillisec)
+                    << ", render_time_ms=" << frame.render_time_ms() << ", rtp_timestamp=" << rtp_ts
+                    << ", rtp_timestamp/3000=" << rtp_over_3000 << std::endl;
             }
             if (const char* lt = std::getenv("WEBRTC_LATENCY_TRACE"); lt && lt[0] == '1') {
                 static std::atomic<unsigned> enc_lat_n{0};
@@ -794,6 +795,8 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             qp_parser.ParseBitstream(encoded);
             encoded.qp_ = qp_parser.GetLastSliceQp().value_or(-1);
 
+            encoded.SetVideoFrameTrackingId(next_video_frame_tracking_id_);
+            ++next_video_frame_tracking_id_;
             webrtc::CodecSpecificInfo specifics{};
             specifics.codecType = webrtc::kVideoCodecH264;
             specifics.codecSpecific.H264.packetization_mode = h264_settings_.packetization_mode;

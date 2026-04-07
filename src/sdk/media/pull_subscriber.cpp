@@ -299,6 +299,7 @@ public:
 
     bool Initialize() {
         std::cout << "[PullSubscriber] Initializing WebRTC (native API)..." << std::endl;
+        webrtc_demo::EnsureWebrtcFieldTrialsInitialized(); 
         if (!webrtc::InitializeSSL()) {
             return false;
         }

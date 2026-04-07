@@ -62,6 +62,9 @@ class RkMppH264Encoder final : public webrtc::VideoEncoder {
   bool initialized_{false};
   /// Annex-B 转换复用缓冲，避免每帧 std::vector 堆分配（容量随帧增长后保持稳定）。
   std::vector<uint8_t> annex_scratch_;
+
+  /// 与 WebRTC-VideoFrameTrackingIdAdvertised 配合，供接收端 RTP 扩展关联帧。
+  uint16_t next_video_frame_tracking_id_{0};
 };
 
 }  // namespace webrtc_demo

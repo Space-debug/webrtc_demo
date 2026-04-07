@@ -396,6 +396,7 @@ public:
 
     bool Initialize() {
         std::cout << "[PushStreamer] Initializing WebRTC (native API)..." << std::endl;
+        webrtc_demo::EnsureWebrtcFieldTrialsInitialized();
         if (!webrtc::InitializeSSL()) {
             std::cerr << "[PushStreamer] InitializeSSL failed" << std::endl;
             return false;
