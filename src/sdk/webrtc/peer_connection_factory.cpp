@@ -26,7 +26,10 @@ namespace {
 
 void EnsureWebrtcFieldTrialsInitialized() {
   std::call_once(g_field_trials_once, []() {
-    g_field_trials_storage = "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
+    g_field_trials_storage =
+        "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/"
+        "WebRTC-FlexFEC-03-Advertised/Enabled/"
+        "WebRTC-FlexFEC-03/Enabled/";
     webrtc::field_trial::InitFieldTrialsFromString(g_field_trials_storage.c_str());
   });
 }
