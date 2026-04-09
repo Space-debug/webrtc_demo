@@ -2,9 +2,9 @@
 
 #define MODULE_TAG "webrtc_demo_mpp"
 
-#include "webrtc/rk_mpp_h264_encoder.h"
+#include "webrtc/hw/rockchip_mpp/h264_encoder.h"
 
-#include "webrtc/mpp_native_dec_frame_buffer.h"
+#include "webrtc/hw/rockchip_mpp/native_dec_frame_buffer.h"
 
 #include <atomic>
 #include <chrono>
@@ -287,12 +287,12 @@ bool RkMppH264Encoder::ApplyRcToCfg() {
 }
 
 int RkMppH264Encoder::MppH264LevelForSize(int width, int height, uint32_t fps) {
-    (void)fps;
+    // H.264 Level：720p@>30、1080p@>30 需更高 level，否则硬编/码流与规范不匹配。
     if (width * height >= 1920 * 1080) {
-        return 41;
+        return fps > 30u ? 42 : 41;
     }
     if (width * height >= 1280 * 720) {
-        return 40;
+        return fps > 30u ? 42 : 40;
     }
     return 31;
 }
@@ -538,6 +538,14 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     }
 
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> vfb = frame.video_frame_buffer();
+    const int64_t encode_enter_us = webrtc::TimeMicros();
+    int64_t on_frame_to_encode_enter_us = -1;
+    if (MppNativeDecFrameBuffer* nfb = MppNativeDecFrameBuffer::TryGet(vfb)) {
+        const int64_t on_frame_us = nfb->on_frame_enter_us();
+        if (on_frame_us > 0 && encode_enter_us >= on_frame_us) {
+            on_frame_to_encode_enter_us = encode_enter_us - on_frame_us;
+        }
+    }
     MppBuffer input_mpp_buf = reinterpret_cast<MppBuffer>(frm_buf_);
 
     if (vfb->type() == webrtc::VideoFrameBuffer::Type::kNative) {
@@ -748,31 +756,6 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                                   encode_finish_us / webrtc::kNumMicrosecsPerMillisec);
             encoded.video_timing_mutable()->flags = webrtc::VideoSendTiming::kNotTriggered;
 
-            if (next_video_frame_tracking_id_ % 120u == 0u) {
-                int64_t mjpeg_input_to_encode_done_us = encode_finish_us - frame.timestamp_us();
-                int64_t usb_to_frame_timestamp_us = -1;
-                int64_t decode_queue_wait_us = -1;
-                if (MppNativeDecFrameBuffer* native_fb = MppNativeDecFrameBuffer::TryGet(vfb)) {
-                    const int64_t mjpeg_input_us = native_fb->mjpeg_input_timestamp_us();
-                    if (mjpeg_input_us > 0) {
-                        mjpeg_input_to_encode_done_us = encode_finish_us - mjpeg_input_us;
-                    }
-                    const int64_t v4l2_timestamp_us = native_fb->v4l2_timestamp_us();
-                    if (v4l2_timestamp_us > 0) {
-                        usb_to_frame_timestamp_us = frame.timestamp_us() - v4l2_timestamp_us;
-                    }
-                    decode_queue_wait_us = native_fb->decode_queue_wait_us();
-                }
-                std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: current_video_frame_tracking_id_="
-                          << next_video_frame_tracking_id_
-                          << ", mjpeg_input_to_encode_done_us=" << mjpeg_input_to_encode_done_us
-                          << " (" << (static_cast<double>(mjpeg_input_to_encode_done_us) / 1000.0) << " ms)"
-                          << ", usb_to_frame_timestamp_us=" << usb_to_frame_timestamp_us
-                          << " (" << (static_cast<double>(usb_to_frame_timestamp_us) / 1000.0) << " ms)"
-                          << ", decode_queue_wait_us=" << decode_queue_wait_us
-                          << " (" << (static_cast<double>(decode_queue_wait_us) / 1000.0) << " ms)"
-                          << std::endl;
-            }
             if (const char* lt = std::getenv("WEBRTC_LATENCY_TRACE"); lt && lt[0] == '1') {
                 static std::atomic<unsigned> enc_lat_n{0};
                 const unsigned n = ++enc_lat_n;
@@ -796,7 +779,9 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             qp_parser.ParseBitstream(encoded);
             encoded.qp_ = qp_parser.GetLastSliceQp().value_or(-1);
 
-            encoded.SetVideoFrameTrackingId(next_video_frame_tracking_id_);
+            const uint32_t trace_tid = next_video_frame_tracking_id_;
+            const bool trace_periodic_log = (trace_tid % 120u == 0u);
+            encoded.SetVideoFrameTrackingId(trace_tid);
             ++next_video_frame_tracking_id_;
             webrtc::CodecSpecificInfo specifics{};
             specifics.codecType = webrtc::kVideoCodecH264;
@@ -805,13 +790,70 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             specifics.codecSpecific.H264.base_layer_sync = false;
             specifics.codecSpecific.H264.idr_frame =
                 (encoded._frameType == webrtc::VideoFrameType::kVideoFrameKey);
-
+            const int64_t before_on_encoded_cb_us = webrtc::TimeMicros();
             webrtc::EncodedImageCallback::Result res =
                 callback_->OnEncodedImage(encoded, &specifics);
+            const int64_t after_on_encoded_cb_us = webrtc::TimeMicros();
+            const int64_t webrtc_onencodedimage_us = after_on_encoded_cb_us - before_on_encoded_cb_us;
             if (res.error != webrtc::EncodedImageCallback::Result::OK) {
                 mpp_packet_deinit(&out_pkt);
                 mpp_packet_deinit(&packet);
                 return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            if (const char* e2e = std::getenv("WEBRTC_E2E_LATENCY_TRACE"); e2e && e2e[0] == '1') {
+                int64_t t_mjpeg_input_us = frame.timestamp_us();
+                int64_t t_v4l2_us = -1;
+                int64_t t_on_frame_us = -1;
+                if (MppNativeDecFrameBuffer* e2e_native = MppNativeDecFrameBuffer::TryGet(vfb)) {
+                    const int64_t mjpeg_us = e2e_native->mjpeg_input_timestamp_us();
+                    if (mjpeg_us > 0) {
+                        t_mjpeg_input_us = mjpeg_us;
+                    }
+                    t_v4l2_us = e2e_native->v4l2_timestamp_us();
+                    t_on_frame_us = e2e_native->on_frame_enter_us();
+                }
+                std::cout << "[E2E_TX] rtp_ts=" << encoded.RtpTimestamp() << " trace_id="
+                          << static_cast<unsigned>(trace_tid) << " t_mjpeg_input_us=" << t_mjpeg_input_us
+                          << " t_v4l2_us=" << t_v4l2_us << " t_on_frame_us=" << t_on_frame_us
+                          << " t_enc_done_us=" << encode_finish_us
+                          << " t_after_onencoded_us=" << after_on_encoded_cb_us << std::endl;
+            }
+            if (trace_periodic_log) {
+                int64_t mjpeg_input_to_encode_done_us = encode_finish_us - frame.timestamp_us();
+                int64_t mjpeg_input_to_after_onencoded_us = after_on_encoded_cb_us - frame.timestamp_us();
+                int64_t usb_to_frame_timestamp_us = -1;
+                int64_t decode_queue_wait_us = -1;
+                if (MppNativeDecFrameBuffer* native_fb = MppNativeDecFrameBuffer::TryGet(vfb)) {
+                    const int64_t mjpeg_input_us = native_fb->mjpeg_input_timestamp_us();
+                    if (mjpeg_input_us > 0) {
+                        mjpeg_input_to_encode_done_us = encode_finish_us - mjpeg_input_us;
+                        mjpeg_input_to_after_onencoded_us = after_on_encoded_cb_us - mjpeg_input_us;
+                    }
+                    const int64_t v4l2_timestamp_us = native_fb->v4l2_timestamp_us();
+                    if (v4l2_timestamp_us > 0) {
+                        usb_to_frame_timestamp_us = frame.timestamp_us() - v4l2_timestamp_us;
+                    }
+                    decode_queue_wait_us = native_fb->decode_queue_wait_us();
+                }
+                std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: current_video_frame_tracking_id_="
+                          << trace_tid
+                          << ", mjpeg_input_to_encode_done_us=" << mjpeg_input_to_encode_done_us
+                          << " (" << (static_cast<double>(mjpeg_input_to_encode_done_us) / 1000.0) << " ms)"
+                          << ", mjpeg_input_to_after_onencoded_us=" << mjpeg_input_to_after_onencoded_us
+                          << " (" << (static_cast<double>(mjpeg_input_to_after_onencoded_us) / 1000.0) << " ms)"
+                          << ", webrtc_onencodedimage_us=" << webrtc_onencodedimage_us
+                          << " (" << (static_cast<double>(webrtc_onencodedimage_us) / 1000.0) << " ms)"
+                          << ", usb_to_frame_timestamp_us=" << usb_to_frame_timestamp_us;
+                if (usb_to_frame_timestamp_us >= 0) {
+                    std::cout << " (" << (static_cast<double>(usb_to_frame_timestamp_us) / 1000.0) << " ms)";
+                }
+                std::cout << ", decode_queue_wait_us=" << decode_queue_wait_us
+                          << " (" << (static_cast<double>(decode_queue_wait_us) / 1000.0) << " ms)"
+                          << ", on_frame_to_encode_enter_us=" << on_frame_to_encode_enter_us;
+                if (on_frame_to_encode_enter_us >= 0) {
+                    std::cout << " (" << (static_cast<double>(on_frame_to_encode_enter_us) / 1000.0) << " ms)";
+                }
+                std::cout << std::endl;
             }
             if (const char* ev = std::getenv("WEBRTC_MJPEG_TO_H264_TRACE")) {
                 if (ev[0] != '0') {

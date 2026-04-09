@@ -1,6 +1,7 @@
 #ifndef WEBRTC_DEMO_MPP_NATIVE_DEC_FRAME_BUFFER_H_
 #define WEBRTC_DEMO_MPP_NATIVE_DEC_FRAME_BUFFER_H_
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -46,6 +47,11 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
   int64_t poll_wait_us() const { return poll_wait_us_; }
   int64_t dqbuf_ioctl_us() const { return dqbuf_ioctl_us_; }
   int64_t decode_queue_wait_us() const { return decode_queue_wait_us_; }
+  /// CameraVideoTrackSource::OnFrame 入口打点，供测量 Track→Encoder 排队延迟。
+  void SetOnFrameEnterUs(int64_t t_us) {
+    on_frame_enter_us_.store(t_us, std::memory_order_relaxed);
+  }
+  int64_t on_frame_enter_us() const { return on_frame_enter_us_.load(std::memory_order_relaxed); }
   void* mpp_frame() const { return frame_; }
   /// 与 mpp_frame_get_buffer 一致，供编码器绑定输入帧。
   void* mpp_buffer_handle() const;
@@ -80,6 +86,7 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
   int64_t poll_wait_us_;
   int64_t dqbuf_ioctl_us_;
   int64_t decode_queue_wait_us_;
+  std::atomic<int64_t> on_frame_enter_us_{0};
 };
 
 }  // namespace webrtc_demo

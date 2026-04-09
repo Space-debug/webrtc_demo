@@ -1,8 +1,9 @@
-#include "signaling_client.h"
+#include "webrtc/signaling/client.h"
+#include "webrtc/utils/json_utils.h"
+#include "webrtc/utils/net_io.h"
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -12,69 +13,10 @@
 
 namespace webrtc_demo {
 
-namespace {
-
-static std::string EscapeJsonString(const std::string& input) {
-    std::ostringstream oss;
-    for (char c : input) {
-        if (c == '"') oss << "\\\"";
-        else if (c == '\\') oss << "\\\\";
-        else if (c == '\n') oss << "\\n";
-        else if (c == '\r') oss << "\\r";
-        else oss << c;
-    }
-    return oss.str();
-}
-
-static std::string ExtractJsonString(const std::string& line, const std::string& key) {
-    std::string token = "\"" + key + "\":\"";
-    size_t p = line.find(token);
-    if (p == std::string::npos) return "";
-    p += token.size();
-    std::string out;
-    for (size_t i = p; i < line.size(); ++i) {
-        if (line[i] == '\\' && i + 1 < line.size()) {
-            char n = line[i + 1];
-            if (n == 'n') out += '\n';
-            else if (n == 'r') out += '\r';
-            else out += n;
-            ++i;
-            continue;
-        }
-        if (line[i] == '"') break;
-        out += line[i];
-    }
-    return out;
-}
-
-static int ExtractJsonInt(const std::string& line, const std::string& key, int fallback = 0) {
-    std::string token = "\"" + key + "\":";
-    size_t p = line.find(token);
-    if (p == std::string::npos) return fallback;
-    p += token.size();
-    return std::atoi(line.c_str() + p);
-}
-
-}  // namespace
-
-static void ParseHostPort(const std::string& addr, std::string& host, uint16_t& port) {
-    std::string s = addr;
-    if (s.find("ws://") == 0) s = s.substr(5);
-    else if (s.find("tcp://") == 0) s = s.substr(6);
-    size_t colon = s.find(':');
-    if (colon != std::string::npos) {
-        host = s.substr(0, colon);
-        port = static_cast<uint16_t>(std::atoi(s.c_str() + colon + 1));
-    } else {
-        host = s;
-        port = 8765;
-    }
-}
-
 SignalingClient::SignalingClient(const std::string& server_addr, const std::string& role,
                                 const std::string& stream_id)
     : server_addr_(server_addr), role_(role) {
-    ParseHostPort(server_addr, host_, port_);
+    utils::ParseHostPort(server_addr, host_, port_);
     stream_id_ = stream_id.empty() ? "livestream" : stream_id;
 }
 
@@ -111,7 +53,7 @@ bool SignalingClient::Connect() {
 
     std::ostringstream reg;
     reg << "{\"type\":\"register\",\"role\":\"" << role_ << "\",\"stream_id\":\""
-        << EscapeJsonString(stream_id_) << "\"}\n";
+        << utils::EscapeJsonString(stream_id_) << "\"}\n";
     std::string msg = reg.str();
     if (send(sock_fd_, msg.data(), msg.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(msg.size())) {
         if (on_error_) on_error_("send register failed");
@@ -166,9 +108,9 @@ void SignalingClient::SendOffer(const std::string& sdp, const std::string& to_pe
     std::ostringstream oss;
     oss << "{\"type\":\"offer\"";
     if (!target.empty()) {
-        oss << ",\"to\":\"" << EscapeJsonString(target) << "\"";
+        oss << ",\"to\":\"" << utils::EscapeJsonString(target) << "\"";
     }
-    oss << ",\"sdp\":\"" << EscapeJsonString(sdp) << "\"";
+    oss << ",\"sdp\":\"" << utils::EscapeJsonString(sdp) << "\"";
     oss << "}";
     SendLine(oss.str());
 }
@@ -178,9 +120,9 @@ void SignalingClient::SendAnswer(const std::string& sdp, const std::string& to_p
     std::ostringstream oss;
     oss << "{\"type\":\"answer\"";
     if (!target.empty()) {
-        oss << ",\"to\":\"" << EscapeJsonString(target) << "\"";
+        oss << ",\"to\":\"" << utils::EscapeJsonString(target) << "\"";
     }
-    oss << ",\"sdp\":\"" << EscapeJsonString(sdp) << "\"";
+    oss << ",\"sdp\":\"" << utils::EscapeJsonString(sdp) << "\"";
     oss << "}";
     SendLine(oss.str());
 }
@@ -192,10 +134,10 @@ void SignalingClient::SendIceCandidate(const std::string& mid, int mline_index,
     std::ostringstream oss;
     oss << "{\"type\":\"ice\"";
     if (!target.empty()) {
-        oss << ",\"to\":\"" << EscapeJsonString(target) << "\"";
+        oss << ",\"to\":\"" << utils::EscapeJsonString(target) << "\"";
     }
-    oss << ",\"mid\":\"" << EscapeJsonString(mid) << "\",\"mlineIndex\":" << mline_index
-        << ",\"candidate\":\"" << EscapeJsonString(candidate);
+    oss << ",\"mid\":\"" << utils::EscapeJsonString(mid) << "\",\"mlineIndex\":" << mline_index
+        << ",\"candidate\":\"" << utils::EscapeJsonString(candidate);
     oss << "\"}";
     SendLine(oss.str());
 }
@@ -226,15 +168,15 @@ void SignalingClient::ParseAndDispatch(const std::string& line) {
     if (line.empty()) return;
     if (line.find("\"type\":\"register\"") != std::string::npos) return;
 
-    std::string type = ExtractJsonString(line, "type");
-    std::string from = ExtractJsonString(line, "from");
+    std::string type = utils::ExtractJsonString(line, "type");
+    std::string from = utils::ExtractJsonString(line, "from");
     if (!from.empty()) {
         std::lock_guard<std::mutex> lock(peer_mutex_);
         last_remote_peer_id_ = from;
     }
 
     if (type == "welcome") {
-        std::string id = ExtractJsonString(line, "id");
+        std::string id = utils::ExtractJsonString(line, "id");
         std::lock_guard<std::mutex> lock(peer_mutex_);
         self_peer_id_ = id;
         return;
@@ -250,19 +192,19 @@ void SignalingClient::ParseAndDispatch(const std::string& line) {
     }
 
     if (type == "answer") {
-        std::string sdp = ExtractJsonString(line, "sdp");
+        std::string sdp = utils::ExtractJsonString(line, "sdp");
         if (on_answer_) on_answer_(from, "answer", sdp);
         return;
     }
     if (type == "offer") {
-        std::string sdp = ExtractJsonString(line, "sdp");
+        std::string sdp = utils::ExtractJsonString(line, "sdp");
         if (on_offer_) on_offer_(from, "offer", sdp);
         return;
     }
     if (type == "ice") {
-        std::string mid = ExtractJsonString(line, "mid");
-        std::string candidate = ExtractJsonString(line, "candidate");
-        int mline = ExtractJsonInt(line, "mlineIndex", 0);
+        std::string mid = utils::ExtractJsonString(line, "mid");
+        std::string candidate = utils::ExtractJsonString(line, "candidate");
+        int mline = utils::ExtractJsonInt(line, "mlineIndex", 0);
         if (on_ice_ && !candidate.empty()) on_ice_(from, mid, mline, candidate);
     }
 }

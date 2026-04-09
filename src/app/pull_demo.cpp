@@ -253,6 +253,7 @@ int main(int argc, char* argv[]) {
         }
     }
     if (config_path.empty()) config_path = FindConfigPath(argv[0], "");
+    int jitter_min_delay_ms = 0;
     webrtc_demo::ConfigLoader cfg;
     if (!config_path.empty() && cfg.Load(config_path)) {
         url = cfg.Get("SIGNALING_ADDR", "127.0.0.1:8765");
@@ -283,8 +284,13 @@ int main(int argc, char* argv[]) {
         video_stats_interval_sec = headless ? 2.0 : 0.0;
     }
 
+    if (const char* jb = std::getenv("WEBRTC_PULL_JITTER_MIN_DELAY_MS")) {
+        jitter_min_delay_ms = std::atoi(jb);
+    }
+
     std::cout << "=== webrtc_pull_demo" << (headless ? " (headless)" : " (SDL2)") << " ===" << std::endl;
     std::cout << "Signaling: " << url << " stream: " << stream_id << std::endl;
+    std::cout << "JitterBufferMinimumDelay(ms): " << jitter_min_delay_ms << std::endl;
     if (video_stats_interval_sec > 0.0) {
         std::cout << "[Stats] Inbound video stats every " << video_stats_interval_sec << " s (GetStats)\n";
     }
@@ -302,7 +308,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    webrtc_demo::PullSubscriber player(url, stream_id);
+    webrtc_demo::PullSubscriberConfig recv_cfg;
+    recv_cfg.common.jitter_buffer_min_delay_ms = jitter_min_delay_ms;
+    webrtc_demo::PullSubscriber player(url, stream_id, recv_cfg);
     g_player = &player;
 
     std::signal(SIGINT, SignalHandler);

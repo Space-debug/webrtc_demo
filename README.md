@@ -19,9 +19,11 @@ webrtc_demo/
 │   ├── app/                    # 仅两个源文件：push_demo.cpp（推流） pull_demo.cpp（拉流）
 │   └── sdk/                    # webrtc_push_sdk 实现
 ├── scripts/
-│   ├── build.sh                # 编译脚本
-│   ├── push.sh                 # 推流脚本（可自动拉起信令）
-│   └── pull.sh                 # 拉流脚本（本地/远端通用）
+│   ├── build.sh                # 编译
+│   ├── push.sh                 # 推流（可自动拉起信令）
+│   └── pull.sh                 # 拉流；--e2e 同机端到端延迟一键测
+├── tools/
+│   └── parse_e2e_latency.py    # E2E 日志解析（由 pull.sh --e2e 调用）
 └── 3rdparty/
     └── libwebrtc/
         ├── include/                  # Google WebRTC 官方头文件（api/、rtc_base/、third_party/ 等）
@@ -148,6 +150,18 @@ HEADLESS=1 HEADLESS_FRAMES=20 ./scripts/pull.sh 192.168.3.222:8765 livestream
 ```
 
 无头拉流示例：`HEADLESS=1 ./scripts/pull.sh`，或 `webrtc_pull_demo --config config/streams.conf --headless`（`--config` 仅用于与推流一致的信令地址/流 ID，拉流专用参数用命令行或环境变量 `HEADLESS`、`HEADLESS_FRAMES` 等）。
+
+### 同机端到端延迟（一键）
+
+需已编译、本机摄像头可用、`python3` 可用：
+
+```bash
+./scripts/pull.sh --e2e /dev/video11
+```
+
+可选环境变量：`E2E_FRAMES`、`E2E_PULL_TIMEOUT_SEC`、`E2E_PUSH_READY_SEC`、`E2E_WIDTH`/`E2E_HEIGHT`/`E2E_FPS`、`E2E_VIDEO_STATS=1`、`CONFIG_FILE`、`WEBRTC_DEMO_BIN`。
+
+手动两终端测：见 `./scripts/push.sh --help` 中的说明；解析：`python3 tools/parse_e2e_latency.py build/e2e_last_push.log build/e2e_last_pull.log`。
 
 ### 3) 多摄像头推流 + 多客户端拉流
 

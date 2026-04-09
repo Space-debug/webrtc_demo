@@ -33,8 +33,16 @@ set(WEBRTC_PUSH_SDK_DIR ${CMAKE_SOURCE_DIR}/src/sdk)
 option(WEBRTC_DEMO_ENABLE_ROCKCHIP_MPP
     "Use Rockchip MPP for H.264 hardware encode when librockchip_mpp is present (e.g. RK3588 BSP)"
     ON)
+option(WEBRTC_SDK_INSTALL_ADVANCED_HEADERS
+    "Install advanced headers (signaling/hw backend selection interfaces)"
+    ON)
+option(WEBRTC_SDK_INSTALL_INTERNAL_HEADERS
+    "Install internal headers (utils/platform-specific internals)"
+    OFF)
 
 set(WEBRTC_SDK_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/utils/json_utils.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/net_io.cpp
     ${WEBRTC_PUSH_SDK_DIR}/camera/camera_utils.cpp
     ${WEBRTC_PUSH_SDK_DIR}/config/config_loader.cpp
     ${WEBRTC_PUSH_SDK_DIR}/signaling/signaling_client.cpp
@@ -42,7 +50,8 @@ set(WEBRTC_SDK_SOURCES
     ${WEBRTC_PUSH_SDK_DIR}/media/camera_video_track_source.cpp
     ${WEBRTC_PUSH_SDK_DIR}/media/pull_subscriber.cpp
     ${WEBRTC_PUSH_SDK_DIR}/webrtc/peer_connection_factory.cpp
-    ${WEBRTC_PUSH_SDK_DIR}/webrtc/compat/sequence_checker_expectation_to_string.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/webrtc/hw/backend_registry.cpp
+    ${WEBRTC_PUSH_SDK_DIR}/webrtc/sequence_checker_expectation_to_string.cpp
 )
 
 if(WEBRTC_DEMO_ENABLE_ROCKCHIP_MPP AND UNIX AND NOT APPLE)
@@ -54,10 +63,13 @@ if(WEBRTC_DEMO_ENABLE_ROCKCHIP_MPP AND UNIX AND NOT APPLE)
         PATHS /usr/lib/aarch64-linux-gnu /usr/lib/arm-linux-gnueabihf /usr/lib)
     if(WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE AND WEBRTC_DEMO_ROCKCHIP_MPP_LIB)
         list(APPEND WEBRTC_SDK_SOURCES
-            ${WEBRTC_PUSH_SDK_DIR}/webrtc/mpp_native_dec_frame_buffer.cpp
-            ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_h264_encoder.cpp
-            ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_mjpeg_decoder.cpp
-            ${WEBRTC_PUSH_SDK_DIR}/webrtc/rk_mpp_video_encoder_factory.cpp)
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/hw/rockchip_mpp/native_dec_frame_buffer.cpp
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/hw/rockchip_mpp/h264_encoder.cpp
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/hw/rockchip_mpp/mjpeg_decoder.cpp
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/hw/rockchip_mpp/h264_decoder.cpp
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/hw/rockchip_mpp/video_decoder_factory.cpp
+            ${WEBRTC_PUSH_SDK_DIR}/webrtc/hw/rockchip_mpp/video_encoder_factory.cpp
+            )
         message(STATUS "Rockchip MPP: enabled for hardware H264 (${WEBRTC_DEMO_ROCKCHIP_MPP_LIB})")
     else()
         message(STATUS "Rockchip MPP: not found (optional); H264 stays software-only on this build host")
@@ -68,7 +80,8 @@ add_library(webrtc_push_sdk STATIC ${WEBRTC_SDK_SOURCES})
 
 target_include_directories(webrtc_push_sdk
     PUBLIC
-        ${CMAKE_SOURCE_DIR}/include
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
     PRIVATE
         ${WEBRTC_PUSH_SDK_DIR}
         ${LIBWEBRTC_INCLUDE_DIR}
@@ -97,10 +110,14 @@ webrtc_push_link_libwebrtc_static_library(webrtc_push_sdk)
 # libwebrtc.a 中 rotate_sme.o 需要 __arm_tpidr2_save；须在本库之后链接存根，否则 .a 内对象不会提前被拉取。
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     add_library(sme_abi_stubs STATIC ${WEBRTC_PUSH_SDK_DIR}/webrtc/sme_abi_stubs.c)
-    target_link_libraries(webrtc_push_sdk PUBLIC sme_abi_stubs)
+    target_link_libraries(webrtc_push_sdk PRIVATE sme_abi_stubs)
+    install(TARGETS sme_abi_stubs
+        EXPORT WebrtcPushSdkTargets
+        ARCHIVE DESTINATION lib)
 endif()
 
 add_executable(webrtc_push_demo src/app/push_demo.cpp)
+target_include_directories(webrtc_push_demo PRIVATE ${WEBRTC_PUSH_SDK_DIR})
 target_link_libraries(webrtc_push_demo PRIVATE webrtc_push_sdk)
 
 find_package(SDL2 QUIET)
@@ -134,9 +151,53 @@ else()
     endif()
 endif()
 
-install(TARGETS webrtc_push_sdk ARCHIVE DESTINATION lib)
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/ DESTINATION include
-    FILES_MATCHING PATTERN "*.h")
+set(WEBRTC_SDK_PUBLIC_HEADERS
+    ${CMAKE_SOURCE_DIR}/include/config_loader.h
+    ${CMAKE_SOURCE_DIR}/include/pull_subscriber.h
+    ${CMAKE_SOURCE_DIR}/include/push_streamer.h
+    ${CMAKE_SOURCE_DIR}/include/webrtc_peer_connection_factory.h)
+install(FILES ${WEBRTC_SDK_PUBLIC_HEADERS} DESTINATION include)
+install(FILES ${CMAKE_SOURCE_DIR}/include/webrtc_demo/sdk.h DESTINATION include/webrtc_demo)
+
+if(WEBRTC_SDK_INSTALL_ADVANCED_HEADERS)
+    install(FILES
+        ${CMAKE_SOURCE_DIR}/include/webrtc/signaling/client.h
+        DESTINATION include/webrtc/signaling)
+    install(FILES
+        ${CMAKE_SOURCE_DIR}/include/webrtc/hw/backend_registry.h
+        DESTINATION include/webrtc/hw)
+endif()
+
+if(WEBRTC_SDK_INSTALL_INTERNAL_HEADERS)
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/webrtc/utils/ DESTINATION include/webrtc/utils
+        FILES_MATCHING PATTERN "*.h")
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/webrtc/hw/rockchip_mpp/ DESTINATION include/webrtc/hw/rockchip_mpp
+        FILES_MATCHING PATTERN "*.h")
+endif()
+
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/WebrtcPushSdkConfigVersion.cmake"
+    VERSION 1.0.0
+    COMPATIBILITY SameMajorVersion)
+
+configure_package_config_file(
+    "${CMAKE_SOURCE_DIR}/cmake/WebrtcPushSdkConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/WebrtcPushSdkConfig.cmake"
+    INSTALL_DESTINATION lib/cmake/WebrtcPushSdk
+    NO_CHECK_REQUIRED_COMPONENTS_MACRO)
+
+install(TARGETS webrtc_push_sdk
+    EXPORT WebrtcPushSdkTargets
+    ARCHIVE DESTINATION lib)
+install(EXPORT WebrtcPushSdkTargets
+    FILE WebrtcPushSdkTargets.cmake
+    NAMESPACE webrtc_demo::
+    DESTINATION lib/cmake/WebrtcPushSdk)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/WebrtcPushSdkConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/WebrtcPushSdkConfigVersion.cmake"
+    DESTINATION lib/cmake/WebrtcPushSdk)
 
 install(TARGETS webrtc_push_demo RUNTIME DESTINATION bin)
 if(TARGET webrtc_pull_demo)
@@ -144,7 +205,14 @@ if(TARGET webrtc_pull_demo)
 endif()
 
 if(UNIX)
-    add_executable(signaling_server src/tools/signaling_server.cpp)
+    add_executable(signaling_server
+        src/app/signaling_server.cpp
+        src/utils/json_utils.cpp
+        src/utils/net_io.cpp
+        src/sdk/signaling/signaling_server_main.cpp)
+    target_include_directories(signaling_server PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${WEBRTC_PUSH_SDK_DIR})
     target_link_libraries(signaling_server PRIVATE pthread stdc++)
     install(TARGETS signaling_server RUNTIME DESTINATION bin)
 endif()

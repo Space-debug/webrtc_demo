@@ -1,8 +1,8 @@
 #define MODULE_TAG "webrtc_mpp_mjpeg"
 
-#include "webrtc/rk_mpp_mjpeg_decoder.h"
+#include "webrtc/hw/rockchip_mpp/mjpeg_decoder.h"
 
-#include "webrtc/mpp_native_dec_frame_buffer.h"
+#include "webrtc/hw/rockchip_mpp/native_dec_frame_buffer.h"
 
 #include <algorithm>
 #include <chrono>

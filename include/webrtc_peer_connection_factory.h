@@ -11,11 +11,16 @@ class Thread;
 
 namespace webrtc_demo {
 
+enum class VideoCodecBackendPreference {
+  kBuiltin = 0,
+  kRockchipMpp = 1,
+};
+
 /// 可选：影响视频编码工厂等（仅推流端传入有意义）。
 struct PeerConnectionFactoryMediaOptions {
-  /// 在编译启用 WEBRTC_DEMO_HAVE_ROCKCHIP_MPP 且未设置 WEBRTC_DISABLE_MPP_H264=1 时，
-  /// 为 true 则 H.264 优先使用 RK MPP 硬件编码。
-  bool prefer_rockchip_mpp_h264{false};
+  /// 平台无关偏好：未来可扩展到 NVCodec/VAAPI/VideoToolbox 等。
+  VideoCodecBackendPreference encoder_backend{VideoCodecBackendPreference::kBuiltin};
+  VideoCodecBackendPreference decoder_backend{VideoCodecBackendPreference::kBuiltin};
 };
 
 // 与 webrtc::EnableMediaWithDefaults 一致：在 EnableMedia 之前补全

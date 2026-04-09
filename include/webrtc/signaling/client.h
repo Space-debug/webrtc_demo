@@ -1,22 +1,22 @@
-#ifndef SIGNALING_CLIENT_H
-#define SIGNALING_CLIENT_H
+#ifndef WEBRTC_DEMO_SIGNALING_CLIENT_H_
+#define WEBRTC_DEMO_SIGNALING_CLIENT_H_
 
 #include <functional>
-#include <mutex>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
 namespace webrtc_demo {
 
-/// P2P 信令客户端（纯 C++ TCP，无 Python/WebSocket）
-/// 地址格式: "127.0.0.1:8765" 或 "ws://127.0.0.1:8765"（ws:// 会被忽略）
+/// P2P signaling client (pure C++ TCP, no Python/WebSocket)
+/// Address format: "127.0.0.1:8765" or "ws://127.0.0.1:8765" (ws:// is ignored)
 class SignalingClient {
 public:
-    /// role: "publisher" 或 "subscriber"
-    /// stream_id: 流 ID，多摄像头时推流端/拉流端需指定，默认 livestream
+    /// role: "publisher" or "subscriber"
+    /// stream_id: stream id, default is livestream
     explicit SignalingClient(const std::string& server_addr, const std::string& role,
-                            const std::string& stream_id = "livestream");
+                             const std::string& stream_id = "livestream");
     ~SignalingClient();
 
     bool Start();
@@ -27,16 +27,16 @@ public:
     void SendIceCandidate(const std::string& mid, int mline_index, const std::string& candidate,
                           const std::string& to_peer_id = "");
 
-    using OnAnswerCallback = std::function<void(const std::string& peer_id, const std::string& type,
-                                                const std::string& sdp)>;
+    using OnAnswerCallback =
+        std::function<void(const std::string& peer_id, const std::string& type, const std::string& sdp)>;
     void SetOnAnswer(OnAnswerCallback cb) { on_answer_ = std::move(cb); }
 
-    using OnOfferCallback = std::function<void(const std::string& peer_id, const std::string& type,
-                                               const std::string& sdp)>;
+    using OnOfferCallback =
+        std::function<void(const std::string& peer_id, const std::string& type, const std::string& sdp)>;
     void SetOnOffer(OnOfferCallback cb) { on_offer_ = std::move(cb); }
 
-    using OnIceCallback = std::function<void(const std::string& peer_id, const std::string& mid,
-                                             int mline_index, const std::string& candidate)>;
+    using OnIceCallback = std::function<void(const std::string& peer_id, const std::string& mid, int mline_index,
+                                             const std::string& candidate)>;
     void SetOnIce(OnIceCallback cb) { on_ice_ = std::move(cb); }
 
     using OnPeerEventCallback = std::function<void(const std::string& peer_id)>;
@@ -76,4 +76,5 @@ private:
 
 }  // namespace webrtc_demo
 
-#endif  // SIGNALING_CLIENT_H
+#endif  // WEBRTC_DEMO_SIGNALING_CLIENT_H_
+

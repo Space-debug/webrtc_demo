@@ -6,6 +6,9 @@
  * - 固定大小线程池：按 fd % pool_size 分片，同连接信令始终进入同一工作线程，保序。
  * - 默认少打日志；设置环境变量 SIGNALING_VERBOSE=1 输出连接/离线详情。
  */
+#include "signaling/signaling_server_main.h"
+#include "webrtc/utils/json_utils.h"
+#include "webrtc/utils/net_io.h"
 #include <arpa/inet.h>
 #include <atomic>
 #include <condition_variable>
@@ -13,9 +16,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -26,7 +27,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -58,67 +58,16 @@ std::string NextPeerId(const char* role) {
     return std::string(prefix) + "-" + std::to_string(seq);
 }
 
-// 轻量解析，避免热路径上重复构造 key（与旧实现行为一致）
-static std::string JsonGetString(std::string_view line, std::string_view key) {
-    const std::string token = std::string("\"") + std::string(key) + "\":\"";
-    size_t p = line.find(token);
-    if (p == std::string::npos) {
-        return "";
-    }
-    p += token.size();
-    std::string out;
-    out.reserve(line.size() - p);
-    for (size_t i = p; i < line.size(); ++i) {
-        if (line[i] == '\\' && i + 1 < line.size()) {
-            out += line[i + 1];
-            ++i;
-            continue;
-        }
-        if (line[i] == '"') {
-            break;
-        }
-        out += line[i];
-    }
-    return out;
-}
-
-/// 非阻塞 fd 上写全量数据：处理部分写与 EAGAIN（poll POLLOUT），避免丢信令。
-static bool WriteAllWithPoll(int fd, const char* data, size_t len, int timeout_ms) {
-    size_t off = 0;
-    while (off < len) {
-        const ssize_t w = send(fd, data + off, len - off, MSG_NOSIGNAL);
-        if (w > 0) {
-            off += static_cast<size_t>(w);
-            continue;
-        }
-        if (w < 0 && errno == EINTR) {
-            continue;
-        }
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            pollfd pfd{};
-            pfd.fd = fd;
-            pfd.events = POLLOUT;
-            const int pr = poll(&pfd, 1, timeout_ms);
-            if (pr <= 0) {
-                return false;
-            }
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
 static void SendJsonLine(int fd, const std::string& line) {
     if (fd < 0) {
         return;
     }
     const int kIoTimeoutMs = 8000;
     const char nl = '\n';
-    if (!WriteAllWithPoll(fd, line.data(), line.size(), kIoTimeoutMs)) {
+    if (!webrtc_demo::utils::WriteAllWithPoll(fd, line.data(), line.size(), kIoTimeoutMs)) {
         return;
     }
-    (void)WriteAllWithPoll(fd, &nl, 1, kIoTimeoutMs);
+    (void)webrtc_demo::utils::WriteAllWithPoll(fd, &nl, 1, kIoTimeoutMs);
 }
 
 /// 在 JSON 单行末尾注入 "from"，减少 insert 整块搬移：只分配一次
@@ -156,62 +105,6 @@ struct Client : std::enable_shared_from_this<Client> {
 
 std::mutex g_clients_mutex;
 std::unordered_map<int, std::shared_ptr<Client>> g_clients;
-
-void SetNonBlocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) {
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
-}
-
-/// 新连接首条信令：在非阻塞 fd 上累积直到换行，避免 TCP 拆包导致误关连接。
-static bool RecvUntilNewline(int cfd, std::string* first_line, std::string* rest, int timeout_ms) {
-    std::string acc;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (true) {
-        const size_t nl = acc.find('\n');
-        if (nl != std::string::npos) {
-            *first_line = acc.substr(0, nl);
-            *rest = acc.substr(nl + 1);
-            return true;
-        }
-        if (acc.size() > 65536) {
-            return false;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            return false;
-        }
-        const int left_ms = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
-        pollfd pfd{};
-        pfd.fd = cfd;
-        pfd.events = POLLIN;
-        int slice = left_ms > 500 ? 500 : left_ms;
-        if (slice < 1) {
-            slice = 1;
-        }
-        const int pr = poll(&pfd, 1, slice);
-        if (pr <= 0) {
-            continue;
-        }
-        char buf[8192];
-        const ssize_t rn = recv(cfd, buf, sizeof(buf), 0);
-        if (rn > 0) {
-            acc.append(buf, static_cast<size_t>(rn));
-        } else if (rn == 0) {
-            return false;
-        } else {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            return false;
-        }
-    }
-}
 
 void EpollCtl(int op, int fd, uint32_t events) {
     epoll_event ev{};
@@ -253,7 +146,7 @@ void NotifyPublisherSubscriberEvent(const std::string& stream_id, const char* ty
 }
 
 void RoutePublisherMessage(const std::string& stream_id, const std::string& line, const std::string& from_id) {
-    const std::string target_id = JsonGetString(line, "to");
+    const std::string target_id = webrtc_demo::utils::ExtractJsonString(line, "to");
     if (target_id.empty()) {
         return;
     }
@@ -483,7 +376,7 @@ void ProcessClientRead(int fd) {
 
 /// msg 为单行 register JSON（不含换行）
 bool HandleInitialRegister(int fd, const std::string& msg) {
-    std::string stream_id = JsonGetString(msg, "stream_id");
+    std::string stream_id = webrtc_demo::utils::ExtractJsonString(msg, "stream_id");
     if (stream_id.empty()) {
         stream_id = "livestream";
     }
@@ -587,7 +480,7 @@ void SignalHandler(int) {
 
 }  // namespace
 
-int main(int argc, char* argv[]) {
+int webrtc_demo::RunSignalingServerMain(int argc, char* argv[]) {
     int port = 8765;
     if (argc >= 2) {
         port = std::atoi(argv[1]);
@@ -620,7 +513,7 @@ int main(int argc, char* argv[]) {
     }
     int opt = 1;
     setsockopt(g_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    SetNonBlocking(g_listen_fd);
+    webrtc_demo::utils::SetNonBlocking(g_listen_fd);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -686,11 +579,11 @@ int main(int argc, char* argv[]) {
                         }
                         break;
                     }
-                    SetNonBlocking(cfd);
+                    webrtc_demo::utils::SetNonBlocking(cfd);
 
                     std::string reg_line;
                     std::string leftover;
-                    if (!RecvUntilNewline(cfd, &reg_line, &leftover, 30000)) {
+                    if (!webrtc_demo::utils::RecvUntilNewline(cfd, &reg_line, &leftover, 30000)) {
                         close(cfd);
                         continue;
                     }

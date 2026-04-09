@@ -1,5 +1,5 @@
 #include "pull_subscriber.h"
-#include "signaling_client.h"
+#include "webrtc/signaling/client.h"
 #include "webrtc_peer_connection_factory.h"
 
 #include "api/jsep.h"
@@ -22,6 +22,7 @@
 #include "rtc_base/ref_counted_object.h"
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
+#include "rtc_base/time_utils.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -261,6 +262,9 @@ public:
     explicit VideoSink(Callback cb) : on_frame_(std::move(cb)) {}
 
     void OnFrame(const webrtc::VideoFrame& frame) override {
+        const bool e2e_trace = (std::getenv("WEBRTC_E2E_LATENCY_TRACE") != nullptr &&
+                                std::getenv("WEBRTC_E2E_LATENCY_TRACE")[0] == '1');
+        const int64_t t_sink_enter_us = e2e_trace ? webrtc::TimeMicros() : 0;
         if (!on_frame_) {
             return;
         }
@@ -278,12 +282,20 @@ public:
         argb_.resize(static_cast<size_t>(stride * h));
         libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(), i420->DataV(),
                            i420->StrideV(), argb_.data(), stride, w, h);
+        const int64_t t_argb_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
         static unsigned frame_count = 0;
         unsigned n = ++frame_count;
         if (n == 1 || n <= 5 || n % 30 == 0) {
             std::cout << "[VideoSink] OnFrame #" << n << std::endl;
         }
         on_frame_(argb_.data(), w, h, stride);
+        if (e2e_trace) {
+            const int64_t t_callback_done_us = webrtc::TimeMicros();
+            std::cout << "[E2E_RX] rtp_ts=" << frame.rtp_timestamp() << " frame_id="
+                      << static_cast<unsigned>(frame.id()) << " t_sink_us=" << t_sink_enter_us
+                      << " t_argb_done_us=" << t_argb_done_us
+                      << " t_callback_done_us=" << t_callback_done_us << std::endl;
+        }
     }
 
 private:
@@ -304,7 +316,11 @@ public:
             return false;
         }
         webrtc::PeerConnectionFactoryDependencies deps;
-        webrtc_demo::ConfigurePeerConnectionFactoryDependencies(deps);
+        webrtc_demo::PeerConnectionFactoryMediaOptions media_opts;
+        media_opts.decoder_backend = recv_config_.backend.use_rockchip_mpp_h264_decode
+                                         ? webrtc_demo::VideoCodecBackendPreference::kRockchipMpp
+                                         : webrtc_demo::VideoCodecBackendPreference::kBuiltin;
+        webrtc_demo::ConfigurePeerConnectionFactoryDependencies(deps, &media_opts);
         webrtc_demo::EnsureDedicatedPeerConnectionSignalingThread(deps, &owned_signaling_thread_);
         factory_ = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
         if (!factory_) {
@@ -567,9 +583,9 @@ private:
         if (!vt) {
             return;
         }
-        if (recv_config_.jitter_buffer_min_delay_ms >= 0) {
+        if (recv_config_.common.jitter_buffer_min_delay_ms >= 0) {
             r->SetJitterBufferMinimumDelay(
-                std::optional<double>(static_cast<double>(recv_config_.jitter_buffer_min_delay_ms) / 1000.0));
+                std::optional<double>(static_cast<double>(recv_config_.common.jitter_buffer_min_delay_ms) / 1000.0));
         }
         std::lock_guard<std::mutex> lock(mutex_);
         if (video_track_) {

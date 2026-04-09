@@ -1,6 +1,6 @@
 #!/bin/bash
-# 推流（本机测试推荐入口）：读 config/streams.conf，可选自动起信令、本机回环路由。
-# 拉流测试：另开终端执行 ./scripts/pull.sh（默认无头，持续拉流至断连或 Ctrl+C）。
+# 推流：读 config/streams.conf，可选自动起信令、本机回环路由。
+# 同机延迟：另开终端 ./scripts/pull.sh；一键 E2E 见 ./scripts/pull.sh --e2e
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
@@ -17,7 +17,16 @@ cfg_get() {
 
 [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && {
     echo "Usage: ./scripts/push.sh [stream_id] [camera]"
-    echo "环境: CONFIG_FILE  SIGNALING_ADDR  START_SIGNALING  AUTO_LOCAL_ROUTE  WIDTH HEIGHT FPS"
+    echo ""
+    echo "环境: CONFIG_FILE  SIGNALING_ADDR  START_SIGNALING=0|1  AUTO_LOCAL_ROUTE  WIDTH HEIGHT FPS"
+    echo "可选低延迟默认: PUSH_LOWLATENCY_DEFAULTS=1 时若未设置则补全:"
+    echo "  WEBRTC_V4L2_BUFFER_COUNT=2  WEBRTC_V4L2_POLL_TIMEOUT_MS=10  WEBRTC_MJPEG_DEC_LOW_LATENCY=1"
+    echo ""
+    echo "手动两终端测端到端延迟:"
+    echo "  终端1: export WEBRTC_E2E_LATENCY_TRACE=1; ./scripts/push.sh ...  （日志可重定向到 build/e2e_last_push.log）"
+    echo "  终端2: export WEBRTC_E2E_LATENCY_TRACE=1; HEADLESS_FRAMES=400 ./scripts/pull.sh ... > build/e2e_last_pull.log"
+    echo "  python3 tools/parse_e2e_latency.py build/e2e_last_push.log build/e2e_last_pull.log"
+    echo "一键同机 E2E: ./scripts/pull.sh --e2e [/dev/video11]"
     exit 0
 }
 
@@ -30,10 +39,19 @@ AUTO_LOCAL_ROUTE="${AUTO_LOCAL_ROUTE:-$(cfg_get AUTO_LOCAL_ROUTE 1)}"
 case "$(uname -m)" in aarch64|arm64) A=arm64;; x86_64|amd64) A=x64;; *) A=arm64;; esac
 export LD_LIBRARY_PATH="$ROOT/3rdparty/libwebrtc/lib/linux/$A:${LD_LIBRARY_PATH:-}"
 
+if [ "${PUSH_LOWLATENCY_DEFAULTS:-0}" = "1" ]; then
+    export WEBRTC_V4L2_BUFFER_COUNT="${WEBRTC_V4L2_BUFFER_COUNT:-2}"
+    export WEBRTC_V4L2_POLL_TIMEOUT_MS="${WEBRTC_V4L2_POLL_TIMEOUT_MS:-10}"
+    export WEBRTC_MJPEG_DEC_LOW_LATENCY="${WEBRTC_MJPEG_DEC_LOW_LATENCY:-1}"
+fi
+
 BIN_DIR="${WEBRTC_DEMO_BIN:-$ROOT/build/bin}"
 PUSH="$BIN_DIR/webrtc_push_demo"
 SIG="$BIN_DIR/signaling_server"
-[ -f "$PUSH" ] && [ -f "$SIG" ] || { echo "先执行: ./scripts/build.sh 或设置 WEBRTC_DEMO_BIN" >&2; exit 1; }
+[ -f "$PUSH" ] && [ -f "$SIG" ] || {
+    echo "先执行: ./scripts/build.sh 或设置 WEBRTC_DEMO_BIN" >&2
+    exit 1
+}
 
 PORT="${SIG_ADDR##*:}"
 [[ "$PORT" =~ ^[0-9]+$ ]] || PORT=8765

@@ -9,75 +9,57 @@
 
 namespace webrtc_demo {
 
-/// 推流配置
-struct PushStreamerConfig {
+struct PushStreamerCommonConfig {
     std::string stream_id{"stream_001"};
     int video_width{1280};
     int video_height{720};
     int video_fps{30};
-    int video_device_index{0};      /// 设备索引，与 --list-cameras 输出对应
-    std::string video_device_path;  /// 设备路径，如 /dev/video11，优先于 index
-    bool test_capture_only{false};  /// 仅测试采集，不创建 offer/连接
-    bool test_encode_mode{false};   /// 本地回环验证 H264 编码（采集→编码→接收）
-    /// 信令多订阅者模式：仅对加入的拉流端 CreateOfferForPeer，不在 Start 末尾发 default offer
+    int video_device_index{0};
+    std::string video_device_path;
+    bool test_capture_only{false};
+    bool test_encode_mode{false};
     bool signaling_subscriber_offer_only{false};
     std::string stun_server{"stun:stun.l.google.com:19302"};
     std::string turn_server;
     std::string turn_username;
     std::string turn_password;
 
-    // 码率控制
-    std::string bitrate_mode{"vbr"};  /// cbr=固定码率, vbr=可变码率
+    std::string bitrate_mode{"vbr"};
     int target_bitrate_kbps{1000};
     int min_bitrate_kbps{100};
     int max_bitrate_kbps{2000};
-
-    // 可变分辨率策略：弱网兼顾画质与流畅时建议 balanced
     std::string degradation_preference{"balanced"};
-
-    /// 发送：优先 ping「更可能成功」的 ICE 候选对，弱网/多网卡时更快切到可用链路
     bool ice_prioritize_likely_pairs{true};
-    /// 发送：RTP 的 DSCP 优先级（very_low|low|medium|high），路由器支持时有利于实时媒体
     std::string video_network_priority{"high"};
-    /// 发送：编码器最大帧率上限，0 表示与 video_fps 一致
     int video_encoding_max_framerate{0};
 
-    // 编解码
-    std::string video_codec{"h264"};  /// h264|h265|vp8|vp9|av1
-    std::string h264_profile{"main"}; /// baseline|main|high
+    std::string video_codec{"h264"};
+    std::string h264_profile{"main"};
     std::string h264_level{"3.0"};
-    int keyframe_interval{0};        /// GOP 帧数，0=自动
-    int capture_warmup_sec{0};       /// 摄像头预热秒数，默认 0（极速启动）
-    /// 创建 Offer 前至少收到多少帧（与 FrameCountingRenderer 同源）；0=关闭。减轻 OpenH264「input fps 0」类告警。
+    int keyframe_interval{0};
+    int capture_warmup_sec{0};
     int capture_gate_min_frames{0};
-    /// 等待采集门限的最长时间（秒），超时则放弃本次 Offer 并打日志
     int capture_gate_max_wait_sec{20};
+};
 
-    /// RK3588 等：H.264 优先 MPP 硬件编码（需 CMake 检测到 rockchip_mpp）。关则用纯软件编码工厂。
+struct PushStreamerBackendConfig {
     bool use_rockchip_mpp_h264{true};
-    /// 直采 MJPEG 时用 MPP 解码为 NV12 再转 I420；关则 libyuv 软解。
     bool use_rockchip_mpp_mjpeg_decode{true};
-    /// 为 true 时允许与 USE_ROCKCHIP_MPP_H264 同时开启 MPP MJPEG 解码（采集硬解 + 编码硬编）。
-    /// 默认 false：部分旧 BSP 同进程双 MPP 曾不稳定；RK 新 BSP + 当前 GStreamer 风格 MJPEG 解码可尝试设为 1。
     bool use_rockchip_dual_mpp_mjpeg_h264{false};
-
-    /// Linux 直采 MJPEG：队列仅保留「最新一帧」压缩数据，降低解码排队延迟（运动场景可能丢帧）。
     bool mjpeg_queue_latest_only{false};
-    /// MJPEG 压缩帧队列深度上限（latest_only 关闭时满则丢最旧）；范围 1～32；会受 V4L2 缓冲数限制。
     int mjpeg_queue_max{8};
-    /// V4L2 MMAP 缓冲个数，低延迟常用 2；须 ≥2。
     int v4l2_buffer_count{2};
-    /// poll 超时(ms)，有数据即返回。
     int v4l2_poll_timeout_ms{50};
-    /// MPP MJPEG→NV12 路径下 NV12 环形缓冲个数（须 ≥ 下游同时持有的帧数）；范围 4～16。
     int nv12_pool_slots{6};
-    /// MJPEG：在采集线程内解码并立即 QBUF，省约 1 帧流水线延迟（采集线程会被解码阻塞）。
     bool mjpeg_decode_inline{false};
-    /// 配置默认启用 EXT_DMA（无环境变量覆盖时）；不稳定 BSP 请关。
     bool mjpeg_v4l2_ext_dma{false};
-    /// 配置默认启用 RGA（无环境变量覆盖时）。
     bool mjpeg_rga_to_mpp{false};
+};
 
+/// 推流配置
+struct PushStreamerConfig {
+    PushStreamerCommonConfig common{};
+    PushStreamerBackendConfig backend{};
 };
 
 /// SDP 回调：用于将 SDP 发送到信令服务器

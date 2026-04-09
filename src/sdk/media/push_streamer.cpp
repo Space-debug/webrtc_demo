@@ -1,7 +1,7 @@
 #include "push_streamer.h"
 
 #include "api/array_view.h"
-#include "camera_utils.h"
+#include "camera/camera_utils.h"
 #include "media/camera_video_track_source.h"
 #include "webrtc_peer_connection_factory.h"
 
@@ -108,13 +108,13 @@ static webrtc::Priority ParseVideoNetworkPriority(const std::string& s) {
 webrtc::PeerConnectionInterface::RTCConfiguration MakeRtcConfiguration(const PushStreamerConfig& config) {
     webrtc::PeerConnectionInterface::RTCConfiguration rtc_config;
     webrtc::PeerConnectionInterface::IceServer stun;
-    stun.urls.push_back(config.stun_server);
+    stun.urls.push_back(config.common.stun_server);
     rtc_config.servers.push_back(stun);
-    if (!config.turn_server.empty()) {
+    if (!config.common.turn_server.empty()) {
         webrtc::PeerConnectionInterface::IceServer turn;
-        turn.urls.push_back(config.turn_server);
-        turn.username = config.turn_username;
-        turn.password = config.turn_password;
+        turn.urls.push_back(config.common.turn_server);
+        turn.username = config.common.turn_username;
+        turn.password = config.common.turn_password;
         rtc_config.servers.push_back(turn);
     }
     rtc_config.disable_ipv6_on_wifi = true;
@@ -124,7 +124,7 @@ webrtc::PeerConnectionInterface::RTCConfiguration MakeRtcConfiguration(const Pus
     rtc_config.tcp_candidate_policy = webrtc::PeerConnectionInterface::kTcpCandidatePolicyDisabled;
     rtc_config.set_dscp(true);
     rtc_config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-    rtc_config.prioritize_most_likely_ice_candidate_pairs = config.ice_prioritize_likely_pairs;
+    rtc_config.prioritize_most_likely_ice_candidate_pairs = config.common.ice_prioritize_likely_pairs;
     return rtc_config;
 }
 
@@ -404,7 +404,9 @@ public:
 
         webrtc::PeerConnectionFactoryDependencies deps;
         webrtc_demo::PeerConnectionFactoryMediaOptions media_opts;
-        media_opts.prefer_rockchip_mpp_h264 = config_.use_rockchip_mpp_h264;
+        media_opts.encoder_backend = config_.backend.use_rockchip_mpp_h264
+                                         ? webrtc_demo::VideoCodecBackendPreference::kRockchipMpp
+                                         : webrtc_demo::VideoCodecBackendPreference::kBuiltin;
         webrtc_demo::ConfigurePeerConnectionFactoryDependencies(deps, &media_opts);
         webrtc_demo::EnsureDedicatedPeerConnectionSignalingThread(deps, &owned_signaling_thread_);
 
@@ -481,10 +483,10 @@ public:
             return false;
         }
 
-        std::vector<std::string> stream_ids = {config_.stream_id};
+        std::vector<std::string> stream_ids = {config_.common.stream_id};
         // 多订阅者 + 仅对订阅者发 Offer：同一 VideoTrack 不要同时挂到「占位」默认 PC 与订阅者 PC，
         // 否则部分 libwebrtc 版本在第二路 CreateOffer 上可能长期不回调（拉流端收不到 SDP）。
-        if (!config_.signaling_subscriber_offer_only) {
+        if (!config_.common.signaling_subscriber_offer_only) {
             auto add = peer_connection_->AddTrack(video_track_, stream_ids);
             if (!add.ok()) {
                 std::cerr << "[PushStreamer] AddTrack failed: " << add.error().message() << std::endl;
@@ -492,11 +494,11 @@ public:
             }
             ApplyVideoCodecPreferences(peer_connection_);
             ApplyEncodingParameters(peer_connection_);
-            std::cout << "[PushStreamer] Video track added (stream_id=" << config_.stream_id << ")" << std::endl;
+            std::cout << "[PushStreamer] Video track added (stream_id=" << config_.common.stream_id << ")" << std::endl;
         } else {
             std::cout << "[PushStreamer] Video track ready (subscriber-offer-only; sender per subscriber PC, "
                          "stream_id="
-                      << config_.stream_id << ")" << std::endl;
+                      << config_.common.stream_id << ")" << std::endl;
         }
         return true;
     }
@@ -517,7 +519,7 @@ public:
         if (!factory_ || !pc) {
             return;
         }
-        std::string want = config_.video_codec;
+        std::string want = config_.common.video_codec;
         for (auto& ch : want) {
             ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         }
@@ -561,12 +563,12 @@ public:
             }
         }
         if (preferred.empty()) {
-            std::cout << "[PushStreamer] SetCodecPreferences skipped: no match for VIDEO_CODEC=" << config_.video_codec
+            std::cout << "[PushStreamer] SetCodecPreferences skipped: no match for VIDEO_CODEC=" << config_.common.video_codec
                       << std::endl;
             return;
         }
         if (want == "h264") {
-            const std::string want_idc = H264ProfileIdcHex2(config_.h264_profile);
+            const std::string want_idc = H264ProfileIdcHex2(config_.common.h264_profile);
             std::vector<webrtc::RtpCodecCapability> filtered;
             filtered.reserve(preferred.size());
             for (const auto& c : preferred) {
@@ -577,7 +579,7 @@ public:
             if (!filtered.empty()) {
                 preferred = std::move(filtered);
                 std::cout << "[PushStreamer] H264 profile filter: profile_idc=0x" << want_idc << " (H264_PROFILE="
-                          << config_.h264_profile << ")" << std::endl;
+                          << config_.common.h264_profile << ")" << std::endl;
             } else {
                 std::cout << "[PushStreamer] H264 profile filter skipped: no payload matched profile_idc=0x" << want_idc
                           << ", using all H264 payloads" << std::endl;
@@ -613,21 +615,21 @@ public:
                 continue;
             }
             webrtc::RtpParameters params = sender->GetParameters();
-            const webrtc::Priority net_prio = ParseVideoNetworkPriority(config_.video_network_priority);
-            const int fps_cap = (config_.video_encoding_max_framerate > 0) ? config_.video_encoding_max_framerate
-                                                                           : config_.video_fps;
+            const webrtc::Priority net_prio = ParseVideoNetworkPriority(config_.common.video_network_priority);
+            const int fps_cap = (config_.common.video_encoding_max_framerate > 0) ? config_.common.video_encoding_max_framerate
+                                                                           : config_.common.video_fps;
             const double max_fps = (fps_cap > 0) ? static_cast<double>(fps_cap) : 30.0;
             for (auto& enc : params.encodings) {
-                enc.min_bitrate_bps = config_.min_bitrate_kbps * 1000;
-                enc.max_bitrate_bps = config_.max_bitrate_kbps * 1000;
+                enc.min_bitrate_bps = config_.common.min_bitrate_kbps * 1000;
+                enc.max_bitrate_bps = config_.common.max_bitrate_kbps * 1000;
                 enc.network_priority = net_prio;
                 enc.max_framerate = max_fps;
             }
-            if (config_.degradation_preference == "maintain_resolution") {
+            if (config_.common.degradation_preference == "maintain_resolution") {
                 params.degradation_preference = webrtc::DegradationPreference::MAINTAIN_RESOLUTION;
-            } else if (config_.degradation_preference == "maintain_framerate") {
+            } else if (config_.common.degradation_preference == "maintain_framerate") {
                 params.degradation_preference = webrtc::DegradationPreference::MAINTAIN_FRAMERATE;
-            } else if (config_.degradation_preference == "balanced") {
+            } else if (config_.common.degradation_preference == "balanced") {
                 params.degradation_preference = webrtc::DegradationPreference::BALANCED;
             } else {
                 params.degradation_preference = webrtc::DegradationPreference::MAINTAIN_FRAMERATE;
@@ -636,15 +638,15 @@ public:
             if (!err.ok()) {
                 std::cerr << "[PushStreamer] SetParameters failed: " << err.message() << std::endl;
             } else {
-                std::cout << "[PushStreamer] Encoding params: bitrate " << config_.min_bitrate_kbps << "-"
-                          << config_.max_bitrate_kbps << " kbps"
+                std::cout << "[PushStreamer] Encoding params: bitrate " << config_.common.min_bitrate_kbps << "-"
+                          << config_.common.max_bitrate_kbps << " kbps"
                           << " max_fps=" << max_fps
-                          << " network_priority=" << config_.video_network_priority << std::endl;
+                          << " network_priority=" << config_.common.video_network_priority << std::endl;
                 if (LatencyTraceEnabled()) {
                     const char* deg = "maintain_framerate";
-                    if (config_.degradation_preference == "maintain_resolution") {
+                    if (config_.common.degradation_preference == "maintain_resolution") {
                         deg = "maintain_resolution";
-                    } else if (config_.degradation_preference == "balanced") {
+                    } else if (config_.common.degradation_preference == "balanced") {
                         deg = "balanced";
                     }
                     std::cout << "[Latency] WebRTC degradation_preference=" << deg
@@ -658,8 +660,8 @@ public:
     bool ResolveDeviceUniqueId(std::string* out_unique) {
         // 显式 /dev/videoN 时优先按路径直采，勿依赖 WebRTC 枚举（枚举偶发为 0 时仍应能推流）。
         // 是否 CAPTURE 由 CameraVideoTrackSource::StartDirectV4l2 再验；此处不要求枚举下标算成功。
-        if (!config_.video_device_path.empty()) {
-            const std::string& p = config_.video_device_path;
+        if (!config_.common.video_device_path.empty()) {
+            const std::string& p = config_.common.video_device_path;
             if (p.rfind("/dev/video", 0) == 0 && access(p.c_str(), R_OK | W_OK) == 0) {
                 *out_unique = p;
                 std::cout << "[PushStreamer] Camera " << p << " -> capture by device path (multi-node safe)"
@@ -679,10 +681,10 @@ public:
             return false;
         }
 
-        if (!config_.video_device_path.empty()) {
+        if (!config_.common.video_device_path.empty()) {
             // 与 device_info_v4l2 一致：/dev/videoN → 第 N' 个 CAPTURE 节点的枚举下标（非路径配置等）
             {
-                int path_idx = webrtc_demo::GetWebRtcCaptureDeviceIndexForPath(config_.video_device_path);
+                int path_idx = webrtc_demo::GetWebRtcCaptureDeviceIndexForPath(config_.common.video_device_path);
                 if (path_idx >= 0 && static_cast<uint32_t>(path_idx) < n) {
                     char name[256] = {0};
                     char unique[256] = {0};
@@ -690,14 +692,14 @@ public:
                     if (info->GetDeviceName(static_cast<uint32_t>(path_idx), name, sizeof(name), unique, sizeof(unique),
                                             product, sizeof(product)) == 0) {
                         *out_unique = unique;
-                        std::cout << "[PushStreamer] Camera path " << config_.video_device_path
+                        std::cout << "[PushStreamer] Camera path " << config_.common.video_device_path
                                   << " -> /dev/video enum index match" << std::endl;
                         return true;
                     }
                 }
             }
             // Linux 上 GetDeviceName 的 unique 实为 V4L2 bus_info（product 常为空，勿用 product==bus）
-            std::string bus = GetDeviceBusInfo(config_.video_device_path);
+            std::string bus = GetDeviceBusInfo(config_.common.video_device_path);
             for (uint32_t i = 0; i < n; ++i) {
                 char name[256] = {0};
                 char unique[256] = {0};
@@ -707,7 +709,7 @@ public:
                 }
                 if (!bus.empty() && std::string(unique) == bus) {
                     *out_unique = unique;
-                    std::cout << "[PushStreamer] Camera path " << config_.video_device_path << " -> bus_info match"
+                    std::cout << "[PushStreamer] Camera path " << config_.common.video_device_path << " -> bus_info match"
                               << std::endl;
                     return true;
                 }
@@ -719,14 +721,14 @@ public:
                 if (info->GetDeviceName(i, name, sizeof(name), unique, sizeof(unique), product, sizeof(product)) != 0) {
                     continue;
                 }
-                if (std::string(unique).find(config_.video_device_path) != std::string::npos) {
+                if (std::string(unique).find(config_.common.video_device_path) != std::string::npos) {
                     *out_unique = unique;
                     return true;
                 }
             }
             // WebRTC 的 unique 往往不含 /dev/videoN；用 V4L2 card 与枚举设备名对齐（常见）
             {
-                std::string card = webrtc_demo::GetDeviceCardName(config_.video_device_path);
+                std::string card = webrtc_demo::GetDeviceCardName(config_.common.video_device_path);
                 if (!card.empty()) {
                     for (uint32_t i = 0; i < n; ++i) {
                         char name[256] = {0};
@@ -738,18 +740,18 @@ public:
                         }
                         if (std::string(name) == card) {
                             *out_unique = unique;
-                            std::cout << "[PushStreamer] Camera path " << config_.video_device_path
+                            std::cout << "[PushStreamer] Camera path " << config_.common.video_device_path
                                       << " -> device name/card match" << std::endl;
                             return true;
                         }
                     }
                 }
             }
-            std::cerr << "[PushStreamer] No device match for " << config_.video_device_path << ", using index 0"
+            std::cerr << "[PushStreamer] No device match for " << config_.common.video_device_path << ", using index 0"
                       << std::endl;
         }
 
-        uint32_t idx = static_cast<uint32_t>(config_.video_device_index);
+        uint32_t idx = static_cast<uint32_t>(config_.common.video_device_index);
         if (idx >= n) {
             std::cerr << "[PushStreamer] Device index out of range" << std::endl;
             return false;
@@ -780,33 +782,33 @@ public:
             camera_source_->AddOrUpdateSink(frame_counter_.get(), webrtc::VideoSinkWants());
         }
 
-        bool mpp_mjpeg_decode = config_.use_rockchip_mpp_mjpeg_decode;
+        bool mpp_mjpeg_decode = config_.backend.use_rockchip_mpp_mjpeg_decode;
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
-        bool allow_dual_mpp = config_.use_rockchip_dual_mpp_mjpeg_h264;
+        bool allow_dual_mpp = config_.backend.use_rockchip_dual_mpp_mjpeg_h264;
         if (const char* ev = std::getenv("WEBRTC_DUAL_MPP_MJPEG_H264")) {
             if (ev[0] == '1' || ev[0] == 'y' || ev[0] == 'Y' || ev[0] == 't' || ev[0] == 'T') {
                 allow_dual_mpp = true;
             }
         }
-        if (mpp_mjpeg_decode && config_.use_rockchip_mpp_h264 && !allow_dual_mpp) {
+        if (mpp_mjpeg_decode && config_.backend.use_rockchip_mpp_h264 && !allow_dual_mpp) {
             mpp_mjpeg_decode = false;
             std::cout << "[PushStreamer] MPP MJPEG decode off while MPP H.264 encode on (use libyuv for MJPEG). "
                          "Set USE_DUAL_MPP_MJPEG_H264=1 or WEBRTC_DUAL_MPP_MJPEG_H264=1 to enable both.\n";
-        } else if (mpp_mjpeg_decode && config_.use_rockchip_mpp_h264 && allow_dual_mpp) {
+        } else if (mpp_mjpeg_decode && config_.backend.use_rockchip_mpp_h264 && allow_dual_mpp) {
             std::cout << "[PushStreamer] Dual MPP: MJPEG hardware decode + H.264 hardware encode (experimental).\n";
         }
 #endif
         V4l2MjpegPipelineOptions mjpeg_pipe;
-        mjpeg_pipe.mjpeg_queue_latest_only = config_.mjpeg_queue_latest_only;
-        mjpeg_pipe.mjpeg_queue_max = config_.mjpeg_queue_max;
-        mjpeg_pipe.nv12_pool_slots = config_.nv12_pool_slots;
-        mjpeg_pipe.v4l2_buffer_count = config_.v4l2_buffer_count;
-        mjpeg_pipe.v4l2_poll_timeout_ms = config_.v4l2_poll_timeout_ms;
-        mjpeg_pipe.mjpeg_decode_inline = config_.mjpeg_decode_inline;
-        mjpeg_pipe.mjpeg_v4l2_ext_dma = config_.mjpeg_v4l2_ext_dma;
-        mjpeg_pipe.mjpeg_rga_to_mpp = config_.mjpeg_rga_to_mpp;
+        mjpeg_pipe.mjpeg_queue_latest_only = config_.backend.mjpeg_queue_latest_only;
+        mjpeg_pipe.mjpeg_queue_max = config_.backend.mjpeg_queue_max;
+        mjpeg_pipe.nv12_pool_slots = config_.backend.nv12_pool_slots;
+        mjpeg_pipe.v4l2_buffer_count = config_.backend.v4l2_buffer_count;
+        mjpeg_pipe.v4l2_poll_timeout_ms = config_.backend.v4l2_poll_timeout_ms;
+        mjpeg_pipe.mjpeg_decode_inline = config_.backend.mjpeg_decode_inline;
+        mjpeg_pipe.mjpeg_v4l2_ext_dma = config_.backend.mjpeg_v4l2_ext_dma;
+        mjpeg_pipe.mjpeg_rga_to_mpp = config_.backend.mjpeg_rga_to_mpp;
         if (!static_cast<CameraVideoTrackSource*>(cam_holder)
-                 ->Start(unique_id.c_str(), config_.video_width, config_.video_height, config_.video_fps,
+                 ->Start(unique_id.c_str(), config_.common.video_width, config_.common.video_height, config_.common.video_fps,
                          mpp_mjpeg_decode, &mjpeg_pipe)) {
             std::cerr << "[PushStreamer] CameraVideoTrackSource::Start failed" << std::endl;
             if (frame_counter_ && camera_source_) {
@@ -830,21 +832,21 @@ public:
             int nw = 0;
             int nh = 0;
             if (camera_impl_->GetNegotiatedCaptureSize(&nw, &nh) &&
-                (nw != config_.video_width || nh != config_.video_height)) {
+                (nw != config_.common.video_width || nh != config_.common.video_height)) {
                 std::cout << "[PushStreamer] V4L2 negotiated " << nw << "x" << nh << ", config requests "
-                          << config_.video_width << "x" << config_.video_height
+                          << config_.common.video_width << "x" << config_.common.video_height
                           << " — set WIDTH/HEIGHT in streams.conf to match to reduce capture/encode scaling.\n";
             }
         }
 
-        if (config_.capture_warmup_sec > 0) {
-            std::cout << "[PushStreamer] Camera warmup " << config_.capture_warmup_sec << "s..." << std::endl;
+        if (config_.common.capture_warmup_sec > 0) {
+            std::cout << "[PushStreamer] Camera warmup " << config_.common.capture_warmup_sec << "s..." << std::endl;
             const auto w0 = std::chrono::steady_clock::now();
-            std::this_thread::sleep_for(std::chrono::seconds(config_.capture_warmup_sec));
+            std::this_thread::sleep_for(std::chrono::seconds(config_.common.capture_warmup_sec));
             if (LatencyTraceEnabled()) {
                 const auto wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0)
                                      .count();
-                std::cout << "[Latency] capture_warmup actual_ms=" << wms << " configured_sec=" << config_.capture_warmup_sec
+                std::cout << "[Latency] capture_warmup actual_ms=" << wms << " configured_sec=" << config_.common.capture_warmup_sec
                           << std::endl;
             }
         }
@@ -852,11 +854,11 @@ public:
     }
 
     bool WaitForCaptureGate(const std::string& context) {
-        const int need = config_.capture_gate_min_frames;
+        const int need = config_.common.capture_gate_min_frames;
         if (need <= 0 || !frame_counter_) {
             return true;
         }
-        int max_wait = config_.capture_gate_max_wait_sec;
+        int max_wait = config_.common.capture_gate_max_wait_sec;
         if (max_wait < 1) {
             max_wait = 1;
         }
@@ -974,7 +976,7 @@ public:
             std::cerr << "[PushStreamer] EnsurePeerConnectionForPeer: no video track" << std::endl;
             return false;
         }
-        std::vector<std::string> stream_ids = {config_.stream_id};
+        std::vector<std::string> stream_ids = {config_.common.stream_id};
         auto add = pc->AddTrack(video_track_, stream_ids);
         if (!add.ok()) {
             std::cerr << "[PushStreamer] AddTrack for peer failed: " << add.error().message() << std::endl;
@@ -1023,7 +1025,7 @@ public:
                                               << std::endl;
                                     return;
                                 }
-                                if (config_.test_encode_mode && peer_id_ptr->empty()) {
+                                if (config_.common.test_encode_mode && peer_id_ptr->empty()) {
                                     if (std::getenv("WEBRTC_DUMP_OFFER")) {
                                         std::cout << "\n--- Local offer SDP ---\n" << sdp << "\n--- End ---\n" << std::flush;
                                     }
@@ -1309,7 +1311,7 @@ public:
         if (!candidate->ToString(&sdp)) {
             return;
         }
-        if (config_.test_encode_mode && receiver_) {
+        if (config_.common.test_encode_mode && receiver_) {
             webrtc::scoped_refptr<webrtc::PeerConnectionInterface> recv = receiver_;
             webrtc::Thread* sig = recv->signaling_thread();
             if (!sig) {
@@ -1368,8 +1370,8 @@ public:
     unsigned int GetDecodedFrameCount() const {
         return loopback_observer_ ? loopback_observer_->GetDecodedCount() : 0;
     }
-    bool TestCaptureOnly() const { return config_.test_capture_only; }
-    bool SignalingSubscriberOfferOnly() const { return config_.signaling_subscriber_offer_only; }
+    bool TestCaptureOnly() const { return config_.common.test_capture_only; }
+    bool SignalingSubscriberOfferOnly() const { return config_.common.signaling_subscriber_offer_only; }
 
 private:
     PushStreamerConfig config_;

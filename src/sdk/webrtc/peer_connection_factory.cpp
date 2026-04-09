@@ -13,14 +13,9 @@
 #include "api/enable_media.h"
 #include "api/scoped_refptr.h"
 #include "api/task_queue/default_task_queue_factory.h"
-#include "api/video_codecs/builtin_video_decoder_factory.h"
-#include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "rtc_base/thread.h"
 #include "system_wrappers/include/field_trial.h"
-
-#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
-#include "webrtc/rk_mpp_video_encoder_factory.h"
-#endif
+#include "webrtc/hw/backend_registry.h"
 
 namespace webrtc_demo {
 
@@ -66,22 +61,22 @@ void ConfigurePeerConnectionFactoryDependencies(
 #pragma GCC diagnostic pop
 #endif
   if (deps.video_encoder_factory == nullptr) {
-#if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
-    const bool want_mpp = media_options && media_options->prefer_rockchip_mpp_h264;
-    const char* dis = std::getenv("WEBRTC_DISABLE_MPP_H264");
-    const bool env_disable = dis && dis[0] == '1' && dis[1] == '\0';
-    if (want_mpp && !env_disable) {
-      deps.video_encoder_factory = CreateRockchipMppPreferredVideoEncoderFactory();
-    } else {
-      deps.video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
+    webrtc_demo::hw::VideoBackendPreferences prefs;
+    if (media_options) {
+      prefs.encoder_backend = media_options->encoder_backend == webrtc_demo::VideoCodecBackendPreference::kRockchipMpp
+                                  ? webrtc_demo::hw::VideoCodecBackend::kRockchipMpp
+                                  : webrtc_demo::hw::VideoCodecBackend::kBuiltin;
     }
-#else
-    (void)media_options;
-    deps.video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
-#endif
+    deps.video_encoder_factory = webrtc_demo::hw::CreatePreferredVideoEncoderFactory(prefs);
   }
   if (deps.video_decoder_factory == nullptr) {
-    deps.video_decoder_factory = webrtc::CreateBuiltinVideoDecoderFactory();
+    webrtc_demo::hw::VideoBackendPreferences prefs;
+    if (media_options) {
+      prefs.decoder_backend = media_options->decoder_backend == webrtc_demo::VideoCodecBackendPreference::kRockchipMpp
+                                  ? webrtc_demo::hw::VideoCodecBackend::kRockchipMpp
+                                  : webrtc_demo::hw::VideoCodecBackend::kBuiltin;
+    }
+    deps.video_decoder_factory = webrtc_demo::hw::CreatePreferredVideoDecoderFactory(prefs);
   }
   webrtc::EnableMedia(deps);
 }

@@ -1,7 +1,7 @@
 #include "push_streamer.h"
-#include "camera_utils.h"
+#include "camera/camera_utils.h"
 #include "config_loader.h"
-#include "signaling_client.h"
+#include "webrtc/signaling/client.h"
 #include <cctype>
 #include <chrono>
 #include <csignal>
@@ -11,6 +11,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -68,7 +69,7 @@ void PrintUsage(const char* prog) {
               << "  WEBRTC_MJPEG_DECODE_INLINE=1    MJPEG 在采集线程解码（省约 1 帧延迟；采集易被解码拖慢）\n"
               << "  WEBRTC_MJPEG_DEC_LOW_LATENCY=1  MPP MJPEG 解码 poll/休眠更激进\n"
               << "  WEBRTC_MJPEG_RGA_DISABLE_AFTER_FAIL=1  首帧 RGA 失败后本会话不再尝试 RGA\n"
-              << "  WEBRTC_MPP_ENC_GOP=N            覆盖 H264 GOP 帧数（1~600，低延迟可试 30~60）\n"
+              << "  WEBRTC_MPP_ENC_GOP=N            覆盖 MPP H.264 GOP（1~600；未设时用 config KEYFRAME_INTERVAL）\n"
               << "Arguments:\n"
               << "  stream_id         Stream ID; omitted -> STREAM_ID in config\n"
               << "  camera            Device path/index; omitted -> STREAM_<id>_CAMERA\n"
@@ -155,22 +156,22 @@ int main(int argc, char* argv[]) {
         }
         signaling_url = cfg.GetStream(stream_id, "SIGNALING_ADDR",
                                       cfg.Get("SIGNALING_ADDR", "127.0.0.1:8765"));
-        config.video_width = cfg.GetStreamInt(stream_id, "WIDTH", 1280);
-        config.video_height = cfg.GetStreamInt(stream_id, "HEIGHT", 720);
-        config.video_fps = cfg.GetStreamInt(stream_id, "FPS", 30);
+        config.common.video_width = cfg.GetStreamInt(stream_id, "WIDTH", 1280);
+        config.common.video_height = cfg.GetStreamInt(stream_id, "HEIGHT", 720);
+        config.common.video_fps = cfg.GetStreamInt(stream_id, "FPS", 30);
         if (camera_arg.empty()) {
             camera_arg = cfg.GetStream(stream_id, "CAMERA", "");
         }
-        config.bitrate_mode = cfg.GetStream(stream_id, "BITRATE_MODE", "");
-        if (config.bitrate_mode.empty()) {
-            config.bitrate_mode = "vbr";
+        config.common.bitrate_mode = cfg.GetStream(stream_id, "BITRATE_MODE", "");
+        if (config.common.bitrate_mode.empty()) {
+            config.common.bitrate_mode = "vbr";
         }
-        config.target_bitrate_kbps = cfg.GetStreamInt(stream_id, "TARGET_BITRATE", 2200);
-        config.min_bitrate_kbps = cfg.GetStreamInt(stream_id, "MIN_BITRATE", 1200);
-        config.max_bitrate_kbps = cfg.GetStreamInt(stream_id, "MAX_BITRATE", 3500);
-        config.degradation_preference = cfg.GetStream(stream_id, "DEGRADATION_PREFERENCE", "");
-        if (config.degradation_preference.empty()) {
-            config.degradation_preference = "balanced";
+        config.common.target_bitrate_kbps = cfg.GetStreamInt(stream_id, "TARGET_BITRATE", 2200);
+        config.common.min_bitrate_kbps = cfg.GetStreamInt(stream_id, "MIN_BITRATE", 1200);
+        config.common.max_bitrate_kbps = cfg.GetStreamInt(stream_id, "MAX_BITRATE", 3500);
+        config.common.degradation_preference = cfg.GetStream(stream_id, "DEGRADATION_PREFERENCE", "");
+        if (config.common.degradation_preference.empty()) {
+            config.common.degradation_preference = "balanced";
         }
         {
             std::string icep = cfg.GetStream(stream_id, "ICE_PRIORITIZE_LIKELY_PAIRS", "");
@@ -178,28 +179,28 @@ int main(int argc, char* argv[]) {
                 icep = "1";
             }
             for (auto& c : icep) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            config.ice_prioritize_likely_pairs =
+            config.common.ice_prioritize_likely_pairs =
                 (icep == "1" || icep == "true" || icep == "yes" || icep == "on");
         }
-        config.video_network_priority = cfg.GetStream(stream_id, "VIDEO_NETWORK_PRIORITY", "high");
-        config.video_encoding_max_framerate = cfg.GetStreamInt(stream_id, "VIDEO_ENCODING_MAX_FPS", 0);
-        config.video_codec = cfg.GetStream(stream_id, "VIDEO_CODEC", "");
-        if (config.video_codec.empty()) {
-            config.video_codec = "h264";
+        config.common.video_network_priority = cfg.GetStream(stream_id, "VIDEO_NETWORK_PRIORITY", "high");
+        config.common.video_encoding_max_framerate = cfg.GetStreamInt(stream_id, "VIDEO_ENCODING_MAX_FPS", 0);
+        config.common.video_codec = cfg.GetStream(stream_id, "VIDEO_CODEC", "");
+        if (config.common.video_codec.empty()) {
+            config.common.video_codec = "h264";
         }
-        config.h264_profile = cfg.GetStream(stream_id, "H264_PROFILE", "");
-        if (config.h264_profile.empty()) {
-            config.h264_profile = "main";
+        config.common.h264_profile = cfg.GetStream(stream_id, "H264_PROFILE", "");
+        if (config.common.h264_profile.empty()) {
+            config.common.h264_profile = "main";
         }
-        config.h264_level = cfg.GetStream(stream_id, "H264_LEVEL", "");
-        if (config.h264_level.empty()) {
-            config.h264_level = "3.0";
+        config.common.h264_level = cfg.GetStream(stream_id, "H264_LEVEL", "");
+        if (config.common.h264_level.empty()) {
+            config.common.h264_level = "3.0";
         }
-        config.keyframe_interval = cfg.GetStreamInt(stream_id, "KEYFRAME_INTERVAL", 0);
-        config.use_rockchip_mpp_h264 = cfg.GetStreamInt(stream_id, "USE_ROCKCHIP_MPP_H264", 1) != 0;
-        config.use_rockchip_mpp_mjpeg_decode =
+        config.common.keyframe_interval = cfg.GetStreamInt(stream_id, "KEYFRAME_INTERVAL", 0);
+        config.backend.use_rockchip_mpp_h264 = cfg.GetStreamInt(stream_id, "USE_ROCKCHIP_MPP_H264", 1) != 0;
+        config.backend.use_rockchip_mpp_mjpeg_decode =
             cfg.GetStreamInt(stream_id, "USE_ROCKCHIP_MPP_MJPEG_DECODE", 1) != 0;
-        config.use_rockchip_dual_mpp_mjpeg_h264 =
+        config.backend.use_rockchip_dual_mpp_mjpeg_h264 =
             cfg.GetStreamInt(stream_id, "USE_DUAL_MPP_MJPEG_H264", 0) != 0;
         {
             std::string mql = cfg.GetStream(stream_id, "MJPEG_QUEUE_LATEST_ONLY", "");
@@ -209,22 +210,22 @@ int main(int argc, char* argv[]) {
             for (auto& c : mql) {
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             }
-            config.mjpeg_queue_latest_only =
+            config.backend.mjpeg_queue_latest_only =
                 (mql == "1" || mql == "true" || mql == "yes" || mql == "on");
         }
-        config.mjpeg_queue_max = cfg.GetStreamInt(stream_id, "MJPEG_QUEUE_MAX", 8);
-        config.nv12_pool_slots = cfg.GetStreamInt(stream_id, "NV12_POOL_SLOTS", 6);
-        config.v4l2_buffer_count = cfg.GetStreamInt(stream_id, "V4L2_BUFFER_COUNT", 2);
-        config.v4l2_poll_timeout_ms = cfg.GetStreamInt(stream_id, "V4L2_POLL_TIMEOUT_MS", 50);
-        config.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
-        config.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
-        config.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);
+        config.backend.mjpeg_queue_max = cfg.GetStreamInt(stream_id, "MJPEG_QUEUE_MAX", 8);
+        config.backend.nv12_pool_slots = cfg.GetStreamInt(stream_id, "NV12_POOL_SLOTS", 6);
+        config.backend.v4l2_buffer_count = cfg.GetStreamInt(stream_id, "V4L2_BUFFER_COUNT", 2);
+        config.backend.v4l2_poll_timeout_ms = cfg.GetStreamInt(stream_id, "V4L2_POLL_TIMEOUT_MS", 50);
+        config.common.capture_warmup_sec = cfg.GetStreamInt(stream_id, "CAPTURE_WARMUP_SEC", 0);
+        config.common.capture_gate_min_frames = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MIN_FRAMES", 0);
+        config.common.capture_gate_max_wait_sec = cfg.GetStreamInt(stream_id, "CAPTURE_GATE_MAX_WAIT_SEC", 20);
         {
             std::string inl = cfg.GetStream(stream_id, "MJPEG_DECODE_INLINE", "");
             for (auto& c : inl) {
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             }
-            config.mjpeg_decode_inline =
+            config.backend.mjpeg_decode_inline =
                 (inl == "1" || inl == "true" || inl == "yes" || inl == "on");
         }
         {
@@ -233,7 +234,7 @@ int main(int argc, char* argv[]) {
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             }
             if (!v.empty()) {
-                config.mjpeg_v4l2_ext_dma =
+                config.backend.mjpeg_v4l2_ext_dma =
                     (v == "1" || v == "true" || v == "yes" || v == "on");
             }
         }
@@ -243,119 +244,139 @@ int main(int argc, char* argv[]) {
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             }
             if (!v.empty()) {
-                config.mjpeg_rga_to_mpp = (v == "1" || v == "true" || v == "yes" || v == "on");
+                config.backend.mjpeg_rga_to_mpp = (v == "1" || v == "true" || v == "yes" || v == "on");
             }
         }
     }
     if (cmdline_signaling.has_value()) signaling_url = *cmdline_signaling;
-    if (cmdline_width.has_value()) config.video_width = *cmdline_width;
-    if (cmdline_height.has_value()) config.video_height = *cmdline_height;
-    if (cmdline_fps.has_value()) config.video_fps = *cmdline_fps;
+    if (cmdline_width.has_value()) config.common.video_width = *cmdline_width;
+    if (cmdline_height.has_value()) config.common.video_height = *cmdline_height;
+    if (cmdline_fps.has_value()) config.common.video_fps = *cmdline_fps;
     if (const char* g = std::getenv("WEBRTC_CAPTURE_GATE_MIN_FRAMES")) {
-        config.capture_gate_min_frames = std::atoi(g);
+        config.common.capture_gate_min_frames = std::atoi(g);
     }
     if (const char* gw = std::getenv("WEBRTC_CAPTURE_GATE_MAX_WAIT_SEC")) {
-        config.capture_gate_max_wait_sec = std::atoi(gw);
+        config.common.capture_gate_max_wait_sec = std::atoi(gw);
     }
     if (const char* wu = std::getenv("WEBRTC_CAPTURE_WARMUP_SEC")) {
-        config.capture_warmup_sec = std::atoi(wu);
+        config.common.capture_warmup_sec = std::atoi(wu);
     }
     if (const char* il = std::getenv("WEBRTC_MJPEG_DECODE_INLINE")) {
         const char c = il[0];
         if (c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T') {
-            config.mjpeg_decode_inline = true;
+            config.backend.mjpeg_decode_inline = true;
         }
         if (c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F') {
-            config.mjpeg_decode_inline = false;
+            config.backend.mjpeg_decode_inline = false;
         }
     }
     if (stream_id.empty()) stream_id = "livestream";
 
-    config.stream_id = stream_id;
+    config.common.stream_id = stream_id;
     if (!camera_arg.empty()) {
         if (strncmp(camera_arg.c_str(), "/dev/video", 10) == 0 || camera_arg[0] == '/')
-            config.video_device_path = camera_arg;
+            config.common.video_device_path = camera_arg;
         else
-            config.video_device_index = std::atoi(camera_arg.c_str());
+            config.common.video_device_index = std::atoi(camera_arg.c_str());
     }
 
-    if (test_capture) config.test_capture_only = true;
-    if (test_encode) config.test_encode_mode = true;
+    if (test_capture) config.common.test_capture_only = true;
+    if (test_encode) config.common.test_encode_mode = true;
 
     // 码率模式归一化：
     // - cbr: 用 target 作为固定码率（min=max=target）
     // - vbr: 继续使用 min/max 边界，target 仅用于日志与配置语义
     {
-        std::string mode = config.bitrate_mode;
+        std::string mode = config.common.bitrate_mode;
         for (auto& c : mode) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        config.bitrate_mode = mode;
-        if (config.min_bitrate_kbps <= 0) config.min_bitrate_kbps = 100;
-        if (config.max_bitrate_kbps <= 0) config.max_bitrate_kbps = 2000;
-        if (config.min_bitrate_kbps > config.max_bitrate_kbps) {
-            std::swap(config.min_bitrate_kbps, config.max_bitrate_kbps);
+        config.common.bitrate_mode = mode;
+        if (config.common.min_bitrate_kbps <= 0) config.common.min_bitrate_kbps = 100;
+        if (config.common.max_bitrate_kbps <= 0) config.common.max_bitrate_kbps = 2000;
+        if (config.common.min_bitrate_kbps > config.common.max_bitrate_kbps) {
+            std::swap(config.common.min_bitrate_kbps, config.common.max_bitrate_kbps);
         }
-        if (config.target_bitrate_kbps <= 0) {
-            config.target_bitrate_kbps = (config.min_bitrate_kbps + config.max_bitrate_kbps) / 2;
+        if (config.common.target_bitrate_kbps <= 0) {
+            config.common.target_bitrate_kbps = (config.common.min_bitrate_kbps + config.common.max_bitrate_kbps) / 2;
         }
-        if (config.target_bitrate_kbps < config.min_bitrate_kbps) {
-            config.target_bitrate_kbps = config.min_bitrate_kbps;
+        if (config.common.target_bitrate_kbps < config.common.min_bitrate_kbps) {
+            config.common.target_bitrate_kbps = config.common.min_bitrate_kbps;
         }
-        if (config.target_bitrate_kbps > config.max_bitrate_kbps) {
-            config.target_bitrate_kbps = config.max_bitrate_kbps;
+        if (config.common.target_bitrate_kbps > config.common.max_bitrate_kbps) {
+            config.common.target_bitrate_kbps = config.common.max_bitrate_kbps;
         }
-        if (config.capture_warmup_sec < 0) {
-            config.capture_warmup_sec = 0;
+        if (config.common.capture_warmup_sec < 0) {
+            config.common.capture_warmup_sec = 0;
         }
-        if (config.capture_gate_min_frames < 0) {
-            config.capture_gate_min_frames = 0;
+        if (config.common.capture_gate_min_frames < 0) {
+            config.common.capture_gate_min_frames = 0;
         }
-        if (config.capture_gate_max_wait_sec < 1) {
-            config.capture_gate_max_wait_sec = 1;
+        if (config.common.capture_gate_max_wait_sec < 1) {
+            config.common.capture_gate_max_wait_sec = 1;
         }
-        if (config.v4l2_buffer_count < 2) {
-            config.v4l2_buffer_count = 2;
+        if (config.backend.v4l2_buffer_count < 2) {
+            config.backend.v4l2_buffer_count = 2;
         }
-        if (config.v4l2_buffer_count > 32) {
-            config.v4l2_buffer_count = 32;
+        if (config.backend.v4l2_buffer_count > 32) {
+            config.backend.v4l2_buffer_count = 32;
         }
-        if (config.v4l2_poll_timeout_ms < 1) {
-            config.v4l2_poll_timeout_ms = 1;
+        if (config.backend.v4l2_poll_timeout_ms < 1) {
+            config.backend.v4l2_poll_timeout_ms = 1;
         }
-        if (config.v4l2_poll_timeout_ms > 2000) {
-            config.v4l2_poll_timeout_ms = 2000;
+        if (config.backend.v4l2_poll_timeout_ms > 2000) {
+            config.backend.v4l2_poll_timeout_ms = 2000;
         }
-        if (config.bitrate_mode == "cbr") {
-            config.min_bitrate_kbps = config.target_bitrate_kbps;
-            config.max_bitrate_kbps = config.target_bitrate_kbps;
+        if (config.common.bitrate_mode == "cbr") {
+            config.common.min_bitrate_kbps = config.common.target_bitrate_kbps;
+            config.common.max_bitrate_kbps = config.common.target_bitrate_kbps;
         }
     }
 
-    std::cout << "[Main] Config: stream_id=" << config.stream_id
-              << " resolution=" << config.video_width << "x" << config.video_height
-              << " fps=" << config.video_fps
-              << " rockchip_mpp_h264=" << (config.use_rockchip_mpp_h264 ? "on" : "off")
-              << " bitrate=" << config.target_bitrate_kbps << "kbps(" << config.bitrate_mode << ")"
-              << " ice_prioritize_likely=" << (config.ice_prioritize_likely_pairs ? "on" : "off")
-              << " video_net_prio=" << config.video_network_priority
-              << " codec=" << config.video_codec
-              << " warmup=" << config.capture_warmup_sec << "s"
-              << " capture_gate=" << (config.capture_gate_min_frames > 0
-                                        ? std::to_string(config.capture_gate_min_frames) + "frames<=" +
-                                              std::to_string(config.capture_gate_max_wait_sec) + "s"
+    std::cout << "[Main] Config: stream_id=" << config.common.stream_id
+              << " resolution=" << config.common.video_width << "x" << config.common.video_height
+              << " fps=" << config.common.video_fps
+              << " rockchip_mpp_h264=" << (config.backend.use_rockchip_mpp_h264 ? "on" : "off")
+              << " bitrate=" << config.common.target_bitrate_kbps << "kbps(" << config.common.bitrate_mode << ")"
+              << " ice_prioritize_likely=" << (config.common.ice_prioritize_likely_pairs ? "on" : "off")
+              << " video_net_prio=" << config.common.video_network_priority
+              << " codec=" << config.common.video_codec
+              << " warmup=" << config.common.capture_warmup_sec << "s"
+              << " capture_gate=" << (config.common.capture_gate_min_frames > 0
+                                        ? std::to_string(config.common.capture_gate_min_frames) + "frames<=" +
+                                              std::to_string(config.common.capture_gate_max_wait_sec) + "s"
                                         : std::string("off"))
-              << " mjpeg_inline_decode=" << (config.mjpeg_decode_inline ? "on" : "off")
-              << " mjpeg_ext_dma_cfg=" << (config.mjpeg_v4l2_ext_dma ? "on" : "off")
-              << " mjpeg_rga_cfg=" << (config.mjpeg_rga_to_mpp ? "on" : "off")
-              << " device=" << (config.video_device_path.empty() ? std::to_string(config.video_device_index) : config.video_device_path)
+              << " mjpeg_inline_decode=" << (config.backend.mjpeg_decode_inline ? "on" : "off")
+              << " mjpeg_ext_dma_cfg=" << (config.backend.mjpeg_v4l2_ext_dma ? "on" : "off")
+              << " mjpeg_rga_cfg=" << (config.backend.mjpeg_rga_to_mpp ? "on" : "off")
+              << " device=" << (config.common.video_device_path.empty() ? std::to_string(config.common.video_device_index) : config.common.video_device_path)
               << std::endl;
-    if (config.keyframe_interval > 0) {
-        std::cout << "[Main] Note: keyframe interval not exposed in this libwebrtc binding; "
-                     "encoder + RTCP PLI/FIR drive GOP."
-                  << std::endl;
+
+    // Rockchip MPP H.264：rc:gop 由 h264_encoder 读 WEBRTC_MPP_ENC_GOP 或 WebRTC 默认；配置文件 KEYFRAME_INTERVAL 在此注入。
+    if (config.common.keyframe_interval > 600 || config.common.keyframe_interval < 0) {
+        std::cerr << "[Main] KEYFRAME_INTERVAL out of range (use 0=auto or 1..600); ignoring for MPP GOP.\n";
+        config.common.keyframe_interval = 0;
+    }
+    {
+        std::string vcodec = config.common.video_codec;
+        for (auto& c : vcodec) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (config.backend.use_rockchip_mpp_h264 && vcodec == "h264" && config.common.keyframe_interval >= 1) {
+            if (!std::getenv("WEBRTC_MPP_ENC_GOP")) {
+                const std::string g = std::to_string(config.common.keyframe_interval);
+                if (setenv("WEBRTC_MPP_ENC_GOP", g.c_str(), 1) != 0) {
+                    std::cerr << "[Main] setenv WEBRTC_MPP_ENC_GOP failed\n";
+                } else {
+                    std::cout << "[Main] MPP H.264 GOP frames=" << g << " (from KEYFRAME_INTERVAL; override with env WEBRTC_MPP_ENC_GOP)\n";
+                }
+            }
+        } else if (config.common.keyframe_interval >= 1) {
+            std::cout << "[Main] Note: KEYFRAME_INTERVAL applies to MPP H.264 GOP only when "
+                         "USE_ROCKCHIP_MPP_H264=1 and VIDEO_CODEC=h264.\n";
+        }
     }
 
     if (use_signaling) {
-        config.signaling_subscriber_offer_only = true;
+        config.common.signaling_subscriber_offer_only = true;
     }
 
     PushStreamer streamer(config);
@@ -364,7 +385,7 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<SignalingClient> signaling;
     if (use_signaling) {
         std::cout << "[Main] Signaling mode, server: " << signaling_url << std::endl;
-        signaling = std::make_unique<SignalingClient>(signaling_url, "publisher", config.stream_id);
+        signaling = std::make_unique<SignalingClient>(signaling_url, "publisher", config.common.stream_id);
         g_signaling = signaling.get();
     } else {
         std::cout << "[Main] No signaling (test-capture / test-encode)" << std::endl;

@@ -14,8 +14,8 @@
 
 #if defined(WEBRTC_LINUX) && defined(__linux__)
 #if defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
-#include "webrtc/mpp_native_dec_frame_buffer.h"
-#include "webrtc/rk_mpp_mjpeg_decoder.h"
+#include "webrtc/hw/rockchip_mpp/native_dec_frame_buffer.h"
+#include "webrtc/hw/rockchip_mpp/mjpeg_decoder.h"
 #endif
 #include <cerrno>
 #include <fcntl.h>
@@ -892,6 +892,11 @@ bool CameraVideoTrackSource::Start(const char* device_unique_id, int width, int 
 }
 
 void CameraVideoTrackSource::OnFrame(const webrtc::VideoFrame& frame) {
+#if defined(WEBRTC_LINUX) && defined(__linux__) && defined(WEBRTC_DEMO_HAVE_ROCKCHIP_MPP)
+    if (MppNativeDecFrameBuffer* native = MppNativeDecFrameBuffer::TryGet(frame.video_frame_buffer())) {
+        native->SetOnFrameEnterUs(webrtc::TimeMicros());
+    }
+#endif
     captured_frames_.fetch_add(1, std::memory_order_relaxed);
     AdaptedVideoTrackSource::OnFrame(frame);
 }

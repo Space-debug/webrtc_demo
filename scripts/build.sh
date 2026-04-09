@@ -9,4 +9,4 @@ cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD" -j"$(nproc)"
 echo "OK: ${BUILD}/bin/webrtc_push_demo  ${BUILD}/bin/webrtc_pull_demo (若已装 SDL2)  ${BUILD}/bin/signaling_server"
 echo "RK MPP：cmake -S \"$ROOT\" -B ${ROOT}/build_mpp -DCMAKE_BUILD_TYPE=Release -DWEBRTC_DEMO_ENABLE_ROCKCHIP_MPP=ON && cmake --build ${ROOT}/build_mpp -j\$(nproc)"
-echo "端到端：WEBRTC_DEMO_BIN=${ROOT}/build_mpp/bin ./scripts/e2e_headless_once.sh"
+echo "同机端到端延迟：./scripts/pull.sh --e2e [/dev/video11]（需 python3）"

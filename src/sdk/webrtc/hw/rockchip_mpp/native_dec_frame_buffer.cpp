@@ -1,4 +1,4 @@
-#include "webrtc/mpp_native_dec_frame_buffer.h"
+#include "webrtc/hw/rockchip_mpp/native_dec_frame_buffer.h"
 
 #include <cstring>
 
