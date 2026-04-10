@@ -404,7 +404,10 @@ EOF
     echo "  ./scripts/pull.sh [--gui] [signaling_addr] [stream_id]"
     echo "  ./scripts/pull.sh --e2e [camera]     # 同机一键 E2E 延迟（需 python3）"
     echo ""
-    echo "普通拉流：默认无头；HEADLESS_FRAMES>=1 时收满帧或超时退出。"
+    echo "普通拉流：默认无头低延迟（PULL_LOWLATENCY_PROFILE=aggressive|balanced|stable|off，默认 aggressive）。"
+    echo "  有界面：./scripts/pull.sh --gui [signaling] [stream]  或  HEADLESS=0 ..."
+    echo "  GUI 下默认 WEBRTC_PULL_UI_POLL_SLEEP_MS=1ms（可设 0 更低延迟）；需 DISPLAY，无桌面可用 xvfb-run。"
+    echo "  无头：HEADLESS_FRAMES>=1 时收满帧或超时退出。"
     echo "E2E：默认启用低时延 profile=aggressive（可设 E2E_LOWLAT_PROFILE=balanced|stable|off）。"
     echo "      推流侧 profile 也可设 PUSH_LOWLATENCY_PROFILE=aggressive|balanced|stable|off（默认 aggressive）。"
     echo "      E2E_UI_MODE=1 可启用 UI 渲染链路打点（统计 v4l2->present_submit）；无 DISPLAY 时自动 xvfb-run。"
@@ -412,7 +415,7 @@ EOF
     echo "      可选实时调度：E2E_SCHED_MODE=auto|rr|off（rr 需 root/CAP_SYS_NICE），优先级 E2E_SCHED_PRIO=1..99。"
     echo "      环境变量 E2E_FRAMES、E2E_PULL_TIMEOUT_SEC、E2E_PUSH_READY_SEC、E2E_AFTER_PUSH_READY_SLEEP_SEC、"
     echo "      E2E_SKIP_FIRST_PAIRS（默认 30，稳态口径）、E2E_WIDTH/HEIGHT/FPS、E2E_VIDEO_STATS（默认 0）、"
-    echo "      CONFIG_FILE、WEBRTC_DEMO_BIN 等。"
+    echo "      普通拉流还可设 PULL_LOWLATENCY_PROFILE、WEBRTC_PULL_UI_POLL_SLEEP_MS、CONFIG_FILE、WEBRTC_DEMO_BIN 等。"
     exit 0
 }
 
@@ -427,6 +430,35 @@ export LD_LIBRARY_PATH="$ROOT/3rdparty/libwebrtc/lib/linux/$A:${LD_LIBRARY_PATH:
 export WEBRTC_PULL_JITTER_MIN_DELAY_MS="${WEBRTC_PULL_JITTER_MIN_DELAY_MS:-0}"
 export WEBRTC_MPP_H264_DEC_LOW_LATENCY="${WEBRTC_MPP_H264_DEC_LOW_LATENCY:-1}"
 
+# 普通拉流低延迟 profile（默认 aggressive）；关: PULL_LOWLATENCY_PROFILE=off
+PULL_LOWLATENCY_PROFILE="${PULL_LOWLATENCY_PROFILE:-aggressive}"
+case "$PULL_LOWLATENCY_PROFILE" in
+    aggressive)
+        export WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS="${WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS:-0}"
+        export WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE="${WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE:-4}"
+        export WEBRTC_MPP_H264_DEC_POLL_TIMEOUT_MS="${WEBRTC_MPP_H264_DEC_POLL_TIMEOUT_MS:-1}"
+        ;;
+    balanced)
+        export WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS="${WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS:-0}"
+        export WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE="${WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE:-5}"
+        export WEBRTC_MPP_H264_DEC_POLL_TIMEOUT_MS="${WEBRTC_MPP_H264_DEC_POLL_TIMEOUT_MS:-2}"
+        ;;
+    stable)
+        export WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS="${WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS:-1}"
+        export WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE="${WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE:-6}"
+        export WEBRTC_MPP_H264_DEC_POLL_TIMEOUT_MS="${WEBRTC_MPP_H264_DEC_POLL_TIMEOUT_MS:-1}"
+        ;;
+    off|none)
+        ;;
+    *)
+        echo "Unknown PULL_LOWLATENCY_PROFILE=$PULL_LOWLATENCY_PROFILE (use aggressive|balanced|stable|off)" >&2
+        exit 2
+        ;;
+esac
+if [ "$PULL_LOWLATENCY_PROFILE" != "off" ] && [ "$PULL_LOWLATENCY_PROFILE" != "none" ]; then
+    echo "Pull lowlat profile: ${PULL_LOWLATENCY_PROFILE}  pacing_ms=${WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS:-default}  decode_queue=${WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE:-default}  dec_poll_ms=${WEBRTC_MPP_H264_DEC_POLL_TIMEOUT_MS:-default}"
+fi
+
 BIN="${WEBRTC_DEMO_BIN:-$ROOT/build/bin}/webrtc_pull_demo"
 [ -f "$BIN" ] || {
     echo "先执行 ./scripts/build.sh 或设置 WEBRTC_DEMO_BIN（并安装 libsdl2-dev）" >&2
@@ -437,6 +469,11 @@ HEADLESS="${HEADLESS:-1}"
 if [ "${1:-}" = "--gui" ] || [ "${1:-}" = "-w" ]; then
     HEADLESS=0
     shift
+fi
+
+# 有窗口时降低 UI 线程轮询间隔（默认同 aggressive；可 WEBRTC_PULL_UI_POLL_SLEEP_MS=0）
+if [ "$HEADLESS" != "1" ] && [ "$HEADLESS" != "true" ] && [ "$HEADLESS" != "yes" ]; then
+    export WEBRTC_PULL_UI_POLL_SLEEP_MS="${WEBRTC_PULL_UI_POLL_SLEEP_MS:-1}"
 fi
 
 SIGNALING="${1:-}"

@@ -38,11 +38,21 @@ public:
         }
         renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED);
         if (!renderer_) {
-            std::cerr << "[SdlDisplay] SDL_CreateRenderer failed: " << SDL_GetError() << std::endl;
-            SDL_DestroyWindow(window_);
-            window_ = nullptr;
-            SDL_Quit();
-            return;
+            const std::string accel_err = SDL_GetError();
+            SDL_ClearError();
+            renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_SOFTWARE);
+            if (!renderer_) {
+                std::cerr << "[SdlDisplay] SDL_CreateRenderer failed (accelerated: " << accel_err
+                          << "; software: " << SDL_GetError() << ")" << std::endl;
+                SDL_DestroyWindow(window_);
+                window_ = nullptr;
+                SDL_Quit();
+                return;
+            }
+            std::cout << "[SdlDisplay] Using software renderer (no accelerated driver; OK for display / E2E test)"
+                      << std::endl;
+        } else {
+            std::cout << "[SdlDisplay] Using accelerated renderer" << std::endl;
         }
         std::cout << "[SdlDisplay] Window created, waiting for first frame..." << std::endl;
     }
@@ -360,8 +370,10 @@ int main(int argc, char* argv[]) {
     if (!headless) {
         display = std::make_unique<SdlDisplay>("webrtc_pull_demo");
         if (!display->IsOpen()) {
-            std::cerr << "SDL window failed; install: sudo apt install libsdl2-dev\n"
-                      << "Or use headless: " << argv[0] << " --headless ..." << std::endl;
+            std::cerr << "SDL display failed. On board: use local desktop session or set DISPLAY; try "
+                         "SDL_VIDEODRIVER=x11 (or wayland).\n"
+                      << "Packages: libsdl2-2.0-0 + display stack; libsdl2-dev is for building only.\n"
+                      << "Or headless: " << argv[0] << " --headless ..." << std::endl;
             return 1;
         }
     }
