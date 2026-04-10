@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "api/environment/environment.h"
@@ -19,6 +20,13 @@
 namespace webrtc_demo::hw::rockchip_mpp {
 
 namespace {
+
+bool IsH264FormatName(const std::string& name) {
+    if (name.size() != 4) {
+        return false;
+    }
+    return (name[0] == 'H' || name[0] == 'h') && name[1] == '2' && name[2] == '6' && name[3] == '4';
+}
 
 class MppH264PrimaryEncoderFactory final : public webrtc::VideoEncoderFactory {
 public:
@@ -58,7 +66,7 @@ public:
 
     std::unique_ptr<webrtc::VideoEncoder> Create(const webrtc::Environment& env,
                                                  const webrtc::SdpVideoFormat& format) override {
-        if (format.name != "H264") {
+        if (!IsH264FormatName(format.name)) {
             return builtin_->Create(env, format);
         }
         return std::make_unique<webrtc::SimulcastEncoderAdapter>(env, &mpp_h264_primary_, &internal_fallback_, format);
