@@ -60,7 +60,8 @@ webrtc::scoped_refptr<MppNativeDecFrameBuffer> MppNativeDecFrameBuffer::CreateFr
                                                                                            int64_t v4l2_timestamp_us,
                                                                                            int64_t poll_wait_us,
                                                                                            int64_t dqbuf_ioctl_us,
-                                                                                           int64_t decode_queue_wait_us) {
+                                                                                           int64_t decode_queue_wait_us,
+                                                                                           int64_t wall_capture_utc_ms) {
     if (!mpp_frame) {
         return nullptr;
     }
@@ -68,7 +69,7 @@ webrtc::scoped_refptr<MppNativeDecFrameBuffer> MppNativeDecFrameBuffer::CreateFr
         new webrtc::RefCountedObject<MppNativeDecFrameBuffer>(mpp_frame, width, height, hor_stride, ver_stride,
                                                               mpp_fmt, mjpeg_input_timestamp_us, dq_time_us,
                                                               v4l2_timestamp_us, poll_wait_us, dqbuf_ioctl_us,
-                                                              decode_queue_wait_us));
+                                                              decode_queue_wait_us, wall_capture_utc_ms));
 }
 
 MppNativeDecFrameBuffer* MppNativeDecFrameBuffer::TryGet(const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& buffer) {
@@ -89,7 +90,8 @@ MppNativeDecFrameBuffer::MppNativeDecFrameBuffer(void* mpp_frame,
                                                  int64_t v4l2_timestamp_us,
                                                  int64_t poll_wait_us,
                                                  int64_t dqbuf_ioctl_us,
-                                                 int64_t decode_queue_wait_us)
+                                                 int64_t decode_queue_wait_us,
+                                                 int64_t wall_capture_utc_ms)
     : frame_(mpp_frame),
       width_(width),
       height_(height),
@@ -101,7 +103,8 @@ MppNativeDecFrameBuffer::MppNativeDecFrameBuffer(void* mpp_frame,
       v4l2_timestamp_us_(v4l2_timestamp_us),
       poll_wait_us_(poll_wait_us),
       dqbuf_ioctl_us_(dqbuf_ioctl_us),
-      decode_queue_wait_us_(decode_queue_wait_us) {}
+      decode_queue_wait_us_(decode_queue_wait_us),
+      wall_capture_utc_ms_(wall_capture_utc_ms) {}
 
 MppNativeDecFrameBuffer::~MppNativeDecFrameBuffer() {
     if (frame_) {

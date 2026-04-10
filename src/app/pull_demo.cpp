@@ -2,6 +2,7 @@
 #include "config_loader.h"
 
 #include <SDL.h>
+#include "rtc_base/time_utils.h"
 
 #include <atomic>
 #include <cctype>
@@ -63,7 +64,8 @@ public:
     SdlDisplay(const SdlDisplay&) = delete;
     SdlDisplay& operator=(const SdlDisplay&) = delete;
 
-    void UpdateFrame(const uint8_t* argb, int width, int height, int stride) {
+    void UpdateFrame(const uint8_t* argb, int width, int height, int stride, uint16_t trace_id,
+                     int64_t t_sink_callback_done_us) {
         if (!argb || width <= 0 || height <= 0) return;
         std::lock_guard<std::mutex> lock(mutex_);
         size_t size = static_cast<size_t>(stride) * height;
@@ -73,6 +75,8 @@ public:
             frame_height_ = height;
         }
         std::memcpy(frame_buffer_.data(), argb, size);
+        frame_trace_id_ = trace_id;
+        frame_sink_callback_done_us_ = t_sink_callback_done_us;
         frame_dirty_ = true;
     }
 
@@ -83,25 +87,48 @@ public:
             if (event.type == SDL_QUIT) return false;
             if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) return false;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (frame_width_ > 0 && frame_height_ > 0) {
+        // 仅在收到新帧时更新纹理并提交显示，避免空转 render loop 带来的调度扰动。
+        bool has_new_frame = false;
+        uint16_t trace_id = 0;
+        int64_t sink_done_us = 0;
+        int frame_w = 0;
+        int frame_h = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (frame_width_ <= 0 || frame_height_ <= 0 || !frame_dirty_) {
+                return true;
+            }
+            has_new_frame = true;
+            trace_id = frame_trace_id_;
+            sink_done_us = frame_sink_callback_done_us_;
+            frame_w = frame_width_;
+            frame_h = frame_height_;
             if (!texture_) {
                 texture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-                                             frame_width_, frame_height_);
+                                             frame_w, frame_h);
             }
             if (texture_) {
                 int tex_w = 0, tex_h = 0;
                 SDL_QueryTexture(texture_, nullptr, nullptr, &tex_w, &tex_h);
-                if (tex_w != frame_width_ || tex_h != frame_height_) {
+                if (tex_w != frame_w || tex_h != frame_h) {
                     SDL_DestroyTexture(texture_);
                     texture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-                                                 frame_width_, frame_height_);
-                }
-                if (texture_ && frame_dirty_) {
-                    SDL_UpdateTexture(texture_, nullptr, frame_buffer_.data(), frame_width_ * 4);
-                    frame_dirty_ = false;
+                                                 frame_w, frame_h);
                 }
             }
+            if (texture_) {
+                SDL_UpdateTexture(texture_, nullptr, frame_buffer_.data(), frame_w * 4);
+                frame_dirty_ = false;
+            }
+        }
+        if (!has_new_frame || !texture_) {
+            return true;
+        }
+        if (const char* e2e = std::getenv("WEBRTC_E2E_LATENCY_TRACE"); e2e && e2e[0] == '1') {
+            const int64_t t_present_submit_us = webrtc::TimeMicros();
+            std::cout << "[E2E_UI] trace_id=" << static_cast<unsigned>(trace_id)
+                      << " t_sink_callback_done_us=" << sink_done_us
+                      << " t_present_submit_us=" << t_present_submit_us << std::endl;
         }
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         SDL_RenderClear(renderer_);
@@ -124,6 +151,8 @@ private:
     int frame_width_{0};
     int frame_height_{0};
     bool frame_dirty_{false};
+    uint16_t frame_trace_id_{0};
+    int64_t frame_sink_callback_done_us_{0};
 };
 
 }  // namespace
@@ -179,7 +208,9 @@ static void PrintPlayerUsage(const char* prog) {
               << "  --fps-min-frames M Strict: min frames (default 150, >= --frames)\n"
               << "  --video-stats-interval-sec S  Periodically log inbound video stats (goog_timing_frame_info\n"
               << "                               etc.). S=0 disables. Default: headless 2, windowed 0.\n"
+              << "  --sink-argb        Headless: 仍做 I420→ARGB（默认无头跳过转换以降客户端延迟）\n"
               << "  -h, --help         This help\n"
+              << "Env: WEBRTC_PULL_SKIP_ARGB=0|1 覆盖无头是否跳过 ARGB；WEBRTC_PULL_JITTER_MIN_DELAY_MS\n"
               << std::endl;
 }
 
@@ -199,6 +230,7 @@ int main(int argc, char* argv[]) {
     double fps_min_measure_sec = 10.0;
     unsigned fps_min_frames = 150;
     double video_stats_interval_sec = -1.0;
+    bool force_sink_argb = false;
 
     int i = 1;
     while (i < argc && argv[i][0] == '-') {
@@ -248,6 +280,9 @@ int main(int argc, char* argv[]) {
                 video_stats_interval_sec = 0.0;
             }
             i += 2;
+        } else if (strcmp(argv[i], "--sink-argb") == 0) {
+            force_sink_argb = true;
+            ++i;
         } else {
             ++i;
         }
@@ -284,20 +319,43 @@ int main(int argc, char* argv[]) {
         video_stats_interval_sec = headless ? 2.0 : 0.0;
     }
 
+    int ui_poll_sleep_ms = 16;
+    if (const char* e2e = std::getenv("WEBRTC_E2E_LATENCY_TRACE"); e2e && e2e[0] == '1') {
+        ui_poll_sleep_ms = 1;
+    }
+    if (const char* ui = std::getenv("WEBRTC_PULL_UI_POLL_SLEEP_MS")) {
+        const int v = std::atoi(ui);
+        if (v >= 0 && v <= 33) {
+            ui_poll_sleep_ms = v;
+        }
+    }
+
     if (const char* jb = std::getenv("WEBRTC_PULL_JITTER_MIN_DELAY_MS")) {
         jitter_min_delay_ms = std::atoi(jb);
+    }
+
+    bool skip_sink_argb = headless && !force_sink_argb;
+    if (const char* sk = std::getenv("WEBRTC_PULL_SKIP_ARGB")) {
+        if (sk[0] == '0') {
+            skip_sink_argb = false;
+        } else if (sk[0] == '1') {
+            skip_sink_argb = headless;
+        }
     }
 
     std::cout << "=== webrtc_pull_demo" << (headless ? " (headless)" : " (SDL2)") << " ===" << std::endl;
     std::cout << "Signaling: " << url << " stream: " << stream_id << std::endl;
     std::cout << "JitterBufferMinimumDelay(ms): " << jitter_min_delay_ms << std::endl;
+    if (headless) {
+        std::cout << "Sink ARGB conversion: " << (skip_sink_argb ? "OFF (client low-latency)" : "ON") << std::endl;
+    }
     if (video_stats_interval_sec > 0.0) {
         std::cout << "[Stats] Inbound video stats every " << video_stats_interval_sec << " s (GetStats)\n";
     }
     if (!headless) {
         std::cout << "Press Esc or close window to exit" << std::endl;
+        std::cout << "[SDL] UI poll sleep: " << ui_poll_sleep_ms << " ms" << std::endl;
     }
-
     std::unique_ptr<SdlDisplay> display;
     if (!headless) {
         display = std::make_unique<SdlDisplay>("webrtc_pull_demo");
@@ -310,6 +368,7 @@ int main(int argc, char* argv[]) {
 
     webrtc_demo::PullSubscriberConfig recv_cfg;
     recv_cfg.common.jitter_buffer_min_delay_ms = jitter_min_delay_ms;
+    recv_cfg.common.skip_sink_argb_conversion = skip_sink_argb;
     webrtc_demo::PullSubscriber player(url, stream_id, recv_cfg);
     g_player = &player;
 
@@ -318,9 +377,12 @@ int main(int argc, char* argv[]) {
     std::atomic<unsigned> decoded_frames{0};
     auto decode_timing = std::make_shared<HeadlessDecodeTiming>();
     player.SetOnVideoFrame([&decoded_frames, &display, headless, decode_timing](const uint8_t* argb, int width,
-                                                                               int height, int stride) {
+                                                                               int height, int stride, uint16_t trace_id,
+                                                                               int64_t t_sink_callback_done_us) {
         (void)argb;
         (void)stride;
+        (void)trace_id;
+        (void)t_sink_callback_done_us;
         unsigned n = ++decoded_frames;
         if (headless) {
             const auto now = std::chrono::steady_clock::now();
@@ -336,7 +398,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "[Headless] Decoded frame #" << n << " " << width << "x" << height << std::endl;
             }
         } else if (display) {
-            display->UpdateFrame(argb, width, height, stride);
+            display->UpdateFrame(argb, width, height, stride, trace_id, t_sink_callback_done_us);
         }
     });
 
@@ -457,7 +519,11 @@ int main(int argc, char* argv[]) {
     } else {
         while (player.IsPlaying() && display->PollAndRender()) {
             pump_inbound_video_stats();
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60fps UI 刷新
+            if (ui_poll_sleep_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(ui_poll_sleep_ms));
+            } else {
+                std::this_thread::yield();
+            }
         }
 
         if (player.IsPlaying()) {

@@ -474,6 +474,11 @@ int RkMppH264Encoder::InitEncode(const webrtc::VideoCodec* inst,
     }
 
     initialized_ = true;
+    // 每帧单调递增的 VideoFrameTrackingId（16bit，经 RTP 扩展带到对端）。从 500 起跳，避免与
+    // VideoFrame::kNotSetId==0 混淆；InitEncode 时重置，便于与单次采集日志对齐。
+    // 接收端 MPP 解码器把 EncodedImage::VideoFrameTrackingId 写入 VideoFrame::id，[E2E_RX] 的
+    // trace_id 与之相同；parse_e2e_latency.py 按 trace_id 配对。[E2E_TX]/[E2E_RX] 的 wall_utc_ms
+    // 为 TimeUTCMillis，两台 PC 需 chrony/NTP 同步后差值才表示真实端到端（毫秒）。
     next_video_frame_tracking_id_ = 500;
     RTC_LOG(LS_INFO) << "[RkMppH264] InitEncode ok " << width_ << "x" << height_ << "@" << fps_
                      << "fps bps=" << target_bps_;
@@ -780,7 +785,14 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             encoded.qp_ = qp_parser.GetLastSliceQp().value_or(-1);
 
             const uint32_t trace_tid = next_video_frame_tracking_id_;
-            const bool trace_periodic_log = (trace_tid % 120u == 0u);
+            unsigned trace_every_n = 45u;
+            if (const char* ev = std::getenv("WEBRTC_MPP_ENC_TRACE_EVERY_N")) {
+                const int v = std::atoi(ev);
+                if (v >= 1 && v <= 600) {
+                    trace_every_n = static_cast<unsigned>(v);
+                }
+            }
+            const bool trace_periodic_log = (trace_tid % trace_every_n == 0u);
             encoded.SetVideoFrameTrackingId(trace_tid);
             ++next_video_frame_tracking_id_;
             webrtc::CodecSpecificInfo specifics{};
@@ -804,6 +816,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                 int64_t t_mjpeg_input_us = frame.timestamp_us();
                 int64_t t_v4l2_us = -1;
                 int64_t t_on_frame_us = -1;
+                int64_t wall_utc_ms = -1;
                 if (MppNativeDecFrameBuffer* e2e_native = MppNativeDecFrameBuffer::TryGet(vfb)) {
                     const int64_t mjpeg_us = e2e_native->mjpeg_input_timestamp_us();
                     if (mjpeg_us > 0) {
@@ -811,12 +824,14 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                     }
                     t_v4l2_us = e2e_native->v4l2_timestamp_us();
                     t_on_frame_us = e2e_native->on_frame_enter_us();
+                    wall_utc_ms = e2e_native->wall_capture_utc_ms();
                 }
                 std::cout << "[E2E_TX] rtp_ts=" << encoded.RtpTimestamp() << " trace_id="
                           << static_cast<unsigned>(trace_tid) << " t_mjpeg_input_us=" << t_mjpeg_input_us
                           << " t_v4l2_us=" << t_v4l2_us << " t_on_frame_us=" << t_on_frame_us
                           << " t_enc_done_us=" << encode_finish_us
-                          << " t_after_onencoded_us=" << after_on_encoded_cb_us << std::endl;
+                          << " t_after_onencoded_us=" << after_on_encoded_cb_us << " wall_utc_ms=" << wall_utc_ms
+                          << std::endl;
             }
             if (trace_periodic_log) {
                 int64_t mjpeg_input_to_encode_done_us = encode_finish_us - frame.timestamp_us();

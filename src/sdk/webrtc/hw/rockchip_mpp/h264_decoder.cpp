@@ -31,6 +31,18 @@ static bool LowLatencyEnv() {
     return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
 }
 
+int DecodePollTimeoutMs() {
+    // 低时延默认缩短到 1ms，减少「收齐包后等待下一次 poll」的调度量化延迟。
+    int def = LowLatencyEnv() ? 1 : 5;
+    if (const char* e = std::getenv("WEBRTC_MPP_H264_DEC_POLL_TIMEOUT_MS")) {
+        const int v = std::atoi(e);
+        if (v >= 0 && v <= 20) {
+            return v;
+        }
+    }
+    return def;
+}
+
 }  // namespace
 
 H264Decoder::H264Decoder(const webrtc::Environment& env) : env_(env) {
@@ -134,7 +146,7 @@ bool H264Decoder::TryDrainOneDecodedFrame(int64_t render_time_ms, const webrtc::
     MppApi* mpi = reinterpret_cast<MppApi*>(mpi_);
 
     for (int attempt = 0; attempt < 80; ++attempt) {
-        mpi->poll(ctx, MPP_PORT_OUTPUT, static_cast<MppPollType>(5));
+        mpi->poll(ctx, MPP_PORT_OUTPUT, static_cast<MppPollType>(DecodePollTimeoutMs()));
         MppFrame frame = nullptr;
         MPP_RET ret = mpi->decode_get_frame(ctx, &frame);
         if (ret == MPP_ERR_TIMEOUT) {
@@ -208,11 +220,12 @@ bool H264Decoder::TryDrainOneDecodedFrame(int64_t render_time_ms, const webrtc::
             ts_us = ref_meta.capture_time_ms_ * webrtc::kNumMicrosecsPerMillisec;
         }
 
-        webrtc::VideoFrame out = webrtc::VideoFrame::Builder()
-                                     .set_video_frame_buffer(i420)
-                                     .set_rtp_timestamp(ref_meta.RtpTimestamp())
-                                     .set_timestamp_us(ts_us)
-                                     .build();
+        webrtc::VideoFrame::Builder frame_builder;
+        frame_builder.set_video_frame_buffer(i420).set_rtp_timestamp(ref_meta.RtpTimestamp()).set_timestamp_us(ts_us);
+        if (const auto tid = ref_meta.VideoFrameTrackingId(); tid.has_value() && *tid != webrtc::VideoFrame::kNotSetId) {
+            frame_builder.set_id(*tid);
+        }
+        webrtc::VideoFrame out = frame_builder.build();
 
         mpp_frame_deinit(&frame);
 

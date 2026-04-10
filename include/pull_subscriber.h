@@ -13,6 +13,9 @@ struct PullSubscriberCommonConfig {
     /// 抖动缓冲最小延迟（毫秒）。0 倾向最低时延；调大可减轻卡顿、增加端到端延迟。
     /// 设为 -1 表示不调用 SetJitterBufferMinimumDelay，使用 WebRTC 内部默认。
     int jitter_buffer_min_delay_ms{0};
+    /// 为 true 时不做 I420→ARGB（省 CPU、缩短 Sink 内耗时；回调里 pixels 为 nullptr，仅 width/height 有效）。
+    /// 适合无头压测；SDL 预览须为 false。
+    bool skip_sink_argb_conversion{false};
 };
 
 struct PullSubscriberBackendConfig {
@@ -39,7 +42,8 @@ public:
     bool IsPlaying() const { return is_playing_; }
 
     using OnVideoFrameCallback =
-        std::function<void(const uint8_t* argb, int width, int height, int stride)>;
+        std::function<void(const uint8_t* argb, int width, int height, int stride, uint16_t trace_id,
+                           int64_t t_sink_callback_done_us)>;
     void SetOnVideoFrame(OnVideoFrameCallback cb) { on_video_frame_ = std::move(cb); }
 
     using OnConnectionStateCallback = std::function<void(PullConnectionState state)>;

@@ -26,7 +26,8 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
                                                                            int64_t v4l2_timestamp_us,
                                                                            int64_t poll_wait_us,
                                                                            int64_t dqbuf_ioctl_us,
-                                                                           int64_t decode_queue_wait_us);
+                                                                           int64_t decode_queue_wait_us,
+                                                                           int64_t wall_capture_utc_ms);
 
   static MppNativeDecFrameBuffer* TryGet(const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& buffer);
 
@@ -47,6 +48,8 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
   int64_t poll_wait_us() const { return poll_wait_us_; }
   int64_t dqbuf_ioctl_us() const { return dqbuf_ioctl_us_; }
   int64_t decode_queue_wait_us() const { return decode_queue_wait_us_; }
+  /// MJPEG 进入 MPP 解码时刻的 UTC 毫秒（webrtc::TimeUTCMillis），与单机的 TimeMicros 解耦；两台 PC 需 NTP 同步才有可比性。
+  int64_t wall_capture_utc_ms() const { return wall_capture_utc_ms_; }
   /// CameraVideoTrackSource::OnFrame 入口打点，供测量 Track→Encoder 排队延迟。
   void SetOnFrameEnterUs(int64_t t_us) {
     on_frame_enter_us_.store(t_us, std::memory_order_relaxed);
@@ -68,7 +71,8 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
                           int64_t v4l2_timestamp_us,
                           int64_t poll_wait_us,
                           int64_t dqbuf_ioctl_us,
-                          int64_t decode_queue_wait_us);
+                          int64_t decode_queue_wait_us,
+                          int64_t wall_capture_utc_ms);
 
  protected:
   ~MppNativeDecFrameBuffer() override;
@@ -86,6 +90,7 @@ class MppNativeDecFrameBuffer : public webrtc::VideoFrameBuffer {
   int64_t poll_wait_us_;
   int64_t dqbuf_ioctl_us_;
   int64_t decode_queue_wait_us_;
+  int64_t wall_capture_utc_ms_;
   std::atomic<int64_t> on_frame_enter_us_{0};
 };
 

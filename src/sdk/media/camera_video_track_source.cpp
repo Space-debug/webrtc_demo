@@ -1,5 +1,6 @@
 #include "media/camera_video_track_source.h"
 
+#include <cstdint>
 #include <cstring>
 
 #include "api/video/i420_buffer.h"
@@ -89,6 +90,14 @@ bool CameraVideoTrackSource::GetNegotiatedCaptureSize(int* width, int* height) c
     (void)height;
 #endif
     return false;
+}
+
+bool CameraVideoTrackSource::GetNegotiatedCaptureFramerate(int* out_fps) const {
+    if (!out_fps || negotiated_capture_fps_ <= 0) {
+        return false;
+    }
+    *out_fps = negotiated_capture_fps_;
+    return true;
 }
 
 #if defined(WEBRTC_LINUX) && defined(__linux__)
@@ -543,6 +552,24 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
         return false;
     }
 
+    // 驱动在 S_PARM/STREAMON 之后给出的实际帧间隔：fps ≈ denominator / numerator（V4L2 文档 timeperframe）。
+    negotiated_capture_fps_ = (fps > 0 ? fps : 30);
+    {
+        struct v4l2_streamparm gparm {};
+        gparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(direct_fd_, VIDIOC_G_PARM, &gparm) == 0 &&
+            (gparm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
+            const __u32 n = gparm.parm.capture.timeperframe.numerator;
+            const __u32 d = gparm.parm.capture.timeperframe.denominator;
+            if (n > 0 && d > 0) {
+                const int calc = static_cast<int>((static_cast<uint64_t>(d) + n / 2) / n);
+                if (calc >= 1 && calc <= 480) {
+                    negotiated_capture_fps_ = calc;
+                }
+            }
+        }
+    }
+
     {
         int fl = fcntl(direct_fd_, F_GETFL, 0);
         if (fl >= 0) {
@@ -570,7 +597,7 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
     }
     direct_thread_ = std::thread([this]() { DirectCaptureThreadMain(); });
     std::cout << "[CameraV4L2] Direct capture " << device_path << " " << direct_cap_w_ << "x" << direct_cap_h_
-              << " @" << (fps > 0 ? fps : 30) << "fps fourcc=0x" << std::hex << direct_pixfmt_ << std::dec
+              << " @" << negotiated_capture_fps_ << "fps fourcc=0x" << std::hex << direct_pixfmt_ << std::dec
               << " mmap_bufs=" << nbuf << " poll_timeout_ms=" << v4l2_poll_timeout_ms_;
     if (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
         if (mjpeg_decode_inline_) {
@@ -824,6 +851,7 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
 #endif  // WEBRTC_LINUX && __linux__
 
 void CameraVideoTrackSource::Stop() {
+    negotiated_capture_fps_ = 0;
 #if defined(WEBRTC_LINUX) && defined(__linux__)
     StopDirectV4l2();
 #endif
@@ -888,6 +916,7 @@ bool CameraVideoTrackSource::Start(const char* device_unique_id, int width, int 
         vcm_ = nullptr;
         return false;
     }
+    negotiated_capture_fps_ = used.maxFPS > 0 ? used.maxFPS : (fps > 0 ? fps : 30);
     return true;
 }
 

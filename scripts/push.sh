@@ -19,8 +19,12 @@ cfg_get() {
     echo "Usage: ./scripts/push.sh [stream_id] [camera]"
     echo ""
     echo "环境: CONFIG_FILE  SIGNALING_ADDR  START_SIGNALING=0|1  AUTO_LOCAL_ROUTE  WIDTH HEIGHT FPS"
-    echo "可选低延迟默认: PUSH_LOWLATENCY_DEFAULTS=1 时若未设置则补全:"
-    echo "  WEBRTC_V4L2_BUFFER_COUNT=2  WEBRTC_V4L2_POLL_TIMEOUT_MS=10  WEBRTC_MJPEG_DEC_LOW_LATENCY=1"
+    echo "推流低延迟 profile: PUSH_LOWLATENCY_PROFILE=aggressive|balanced|stable|off（默认 aggressive=最低延迟）"
+    echo "  aggressive: V4L2_BUFFER_COUNT=2  V4L2_POLL_TIMEOUT_MS=5  MJPEG_DEC_LOW_LATENCY=1"
+    echo "  balanced:   V4L2_BUFFER_COUNT=3  V4L2_POLL_TIMEOUT_MS=8  MJPEG_DEC_LOW_LATENCY=1"
+    echo "  stable:     V4L2_BUFFER_COUNT=3  V4L2_POLL_TIMEOUT_MS=5  MJPEG_DEC_LOW_LATENCY=1"
+    echo "  off:        不注入上述环境变量（走应用/配置默认）"
+    echo "兼容: PUSH_LOWLATENCY_DEFAULTS=1 且 profile=off 时仍升为 aggressive"
     echo ""
     echo "手动两终端测端到端延迟:"
     echo "  终端1: export WEBRTC_E2E_LATENCY_TRACE=1; ./scripts/push.sh ...  （日志可重定向到 build/e2e_last_push.log）"
@@ -39,10 +43,36 @@ AUTO_LOCAL_ROUTE="${AUTO_LOCAL_ROUTE:-$(cfg_get AUTO_LOCAL_ROUTE 1)}"
 case "$(uname -m)" in aarch64|arm64) A=arm64;; x86_64|amd64) A=x64;; *) A=arm64;; esac
 export LD_LIBRARY_PATH="$ROOT/3rdparty/libwebrtc/lib/linux/$A:${LD_LIBRARY_PATH:-}"
 
-if [ "${PUSH_LOWLATENCY_DEFAULTS:-0}" = "1" ]; then
-    export WEBRTC_V4L2_BUFFER_COUNT="${WEBRTC_V4L2_BUFFER_COUNT:-2}"
-    export WEBRTC_V4L2_POLL_TIMEOUT_MS="${WEBRTC_V4L2_POLL_TIMEOUT_MS:-10}"
-    export WEBRTC_MJPEG_DEC_LOW_LATENCY="${WEBRTC_MJPEG_DEC_LOW_LATENCY:-1}"
+# 默认 aggressive：与「最低延迟推流」一致；需保守行为时显式 PUSH_LOWLATENCY_PROFILE=off
+PUSH_LOWLATENCY_PROFILE="${PUSH_LOWLATENCY_PROFILE:-aggressive}"
+if [ "${PUSH_LOWLATENCY_DEFAULTS:-0}" = "1" ] && [ "$PUSH_LOWLATENCY_PROFILE" = "off" ]; then
+    PUSH_LOWLATENCY_PROFILE="aggressive"
+fi
+case "$PUSH_LOWLATENCY_PROFILE" in
+    aggressive)
+        export WEBRTC_V4L2_BUFFER_COUNT="${WEBRTC_V4L2_BUFFER_COUNT:-2}"
+        export WEBRTC_V4L2_POLL_TIMEOUT_MS="${WEBRTC_V4L2_POLL_TIMEOUT_MS:-5}"
+        export WEBRTC_MJPEG_DEC_LOW_LATENCY="${WEBRTC_MJPEG_DEC_LOW_LATENCY:-1}"
+        ;;
+    balanced)
+        export WEBRTC_V4L2_BUFFER_COUNT="${WEBRTC_V4L2_BUFFER_COUNT:-3}"
+        export WEBRTC_V4L2_POLL_TIMEOUT_MS="${WEBRTC_V4L2_POLL_TIMEOUT_MS:-8}"
+        export WEBRTC_MJPEG_DEC_LOW_LATENCY="${WEBRTC_MJPEG_DEC_LOW_LATENCY:-1}"
+        ;;
+    stable)
+        export WEBRTC_V4L2_BUFFER_COUNT="${WEBRTC_V4L2_BUFFER_COUNT:-3}"
+        export WEBRTC_V4L2_POLL_TIMEOUT_MS="${WEBRTC_V4L2_POLL_TIMEOUT_MS:-5}"
+        export WEBRTC_MJPEG_DEC_LOW_LATENCY="${WEBRTC_MJPEG_DEC_LOW_LATENCY:-1}"
+        ;;
+    off|none)
+        ;;
+    *)
+        echo "Unknown PUSH_LOWLATENCY_PROFILE=$PUSH_LOWLATENCY_PROFILE (use aggressive|balanced|stable|off)" >&2
+        exit 2
+        ;;
+esac
+if [ "$PUSH_LOWLATENCY_PROFILE" != "off" ] && [ "$PUSH_LOWLATENCY_PROFILE" != "none" ]; then
+    echo "Push lowlat profile: ${PUSH_LOWLATENCY_PROFILE}  v4l2_buf=${WEBRTC_V4L2_BUFFER_COUNT:-default}  poll_timeout_ms=${WEBRTC_V4L2_POLL_TIMEOUT_MS:-default}"
 fi
 
 BIN_DIR="${WEBRTC_DEMO_BIN:-$ROOT/build/bin}"

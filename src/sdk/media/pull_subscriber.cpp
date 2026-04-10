@@ -259,12 +259,14 @@ public:
 class VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
 public:
     using Callback = PullSubscriber::OnVideoFrameCallback;
-    explicit VideoSink(Callback cb) : on_frame_(std::move(cb)) {}
+    explicit VideoSink(Callback cb, bool skip_argb_conversion)
+        : on_frame_(std::move(cb)), skip_argb_conversion_(skip_argb_conversion) {}
 
     void OnFrame(const webrtc::VideoFrame& frame) override {
         const bool e2e_trace = (std::getenv("WEBRTC_E2E_LATENCY_TRACE") != nullptr &&
                                 std::getenv("WEBRTC_E2E_LATENCY_TRACE")[0] == '1');
         const int64_t t_sink_enter_us = e2e_trace ? webrtc::TimeMicros() : 0;
+        const int64_t wall_sink_utc_ms = e2e_trace ? webrtc::TimeUTCMillis() : int64_t{0};
         if (!on_frame_) {
             return;
         }
@@ -274,6 +276,27 @@ public:
         }
         int w = frame.width();
         int h = frame.height();
+        if (w <= 0 || h <= 0) {
+            return;
+        }
+        if (skip_argb_conversion_) {
+            const int64_t t_fast_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
+            static unsigned frame_count = 0;
+            unsigned n = ++frame_count;
+            if (n == 1 || n <= 5 || n % 30 == 0) {
+                std::cout << "[VideoSink] OnFrame #" << n << " (skip ARGB)" << std::endl;
+            }
+            const int64_t t_callback_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
+            on_frame_(nullptr, w, h, 0, frame.id(), t_callback_done_us);
+            if (e2e_trace) {
+                std::cout << "[E2E_RX] rtp_ts=" << frame.rtp_timestamp() << " trace_id="
+                          << static_cast<unsigned>(frame.id()) << " frame_id="
+                          << static_cast<unsigned>(frame.id()) << " t_sink_us=" << t_sink_enter_us
+                          << " wall_utc_ms=" << wall_sink_utc_ms << " t_argb_done_us=" << t_fast_done_us
+                          << " t_callback_done_us=" << t_callback_done_us << std::endl;
+            }
+            return;
+        }
         int stride = w * 4;
         auto i420 = buf->ToI420();
         if (!i420) {
@@ -288,18 +311,20 @@ public:
         if (n == 1 || n <= 5 || n % 30 == 0) {
             std::cout << "[VideoSink] OnFrame #" << n << std::endl;
         }
-        on_frame_(argb_.data(), w, h, stride);
+        const int64_t t_callback_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
+        on_frame_(argb_.data(), w, h, stride, frame.id(), t_callback_done_us);
         if (e2e_trace) {
-            const int64_t t_callback_done_us = webrtc::TimeMicros();
-            std::cout << "[E2E_RX] rtp_ts=" << frame.rtp_timestamp() << " frame_id="
+            std::cout << "[E2E_RX] rtp_ts=" << frame.rtp_timestamp() << " trace_id="
+                      << static_cast<unsigned>(frame.id()) << " frame_id="
                       << static_cast<unsigned>(frame.id()) << " t_sink_us=" << t_sink_enter_us
-                      << " t_argb_done_us=" << t_argb_done_us
+                      << " wall_utc_ms=" << wall_sink_utc_ms << " t_argb_done_us=" << t_argb_done_us
                       << " t_callback_done_us=" << t_callback_done_us << std::endl;
         }
     }
 
 private:
     Callback on_frame_;
+    bool skip_argb_conversion_{false};
     std::vector<uint8_t> argb_;
 };
 
@@ -614,7 +639,11 @@ void PullSubscriber::Play() {
 
     impl_->on_connection_state_ = on_connection_state_;
     impl_->on_error_ = on_error_;
-    impl_->video_sink_ = std::make_shared<VideoSink>(on_video_frame_);
+    impl_->video_sink_ =
+        std::make_shared<VideoSink>(on_video_frame_, impl_->recv_config_.common.skip_sink_argb_conversion);
+    if (impl_->recv_config_.common.skip_sink_argb_conversion) {
+        std::cout << "[PullSubscriber] VideoSink: skip I420→ARGB (client low-latency path)" << std::endl;
+    }
 
     impl_->signaling_->SetOnOffer([this](const std::string& peer_id, const std::string& type,
                                          const std::string& sdp) {

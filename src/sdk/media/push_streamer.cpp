@@ -825,8 +825,21 @@ public:
             std::cerr << "[PushStreamer] CreateVideoTrack failed" << std::endl;
             return false;
         }
+        // 提示发送链按「运动/实时」内容处理，利于码控与帧类型决策（见 VideoTrackInterface::ContentHint）。
+        video_track_->set_content_hint(webrtc::VideoTrackInterface::ContentHint::kFluid);
 
         std::cout << "[PushStreamer] Video capture started" << std::endl;
+
+        {
+            int cam_fps = 0;
+            if (camera_impl_->GetNegotiatedCaptureFramerate(&cam_fps) && cam_fps > 0) {
+                if (cam_fps != config_.common.video_fps) {
+                    std::cout << "[PushStreamer] Using camera actual frame rate " << cam_fps << " fps (config FPS="
+                              << config_.common.video_fps << " was request only; encoding/WebRTC caps follow device)\n";
+                }
+                config_.common.video_fps = cam_fps;
+            }
+        }
 
         {
             int nw = 0;

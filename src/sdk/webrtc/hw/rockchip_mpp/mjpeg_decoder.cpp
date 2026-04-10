@@ -992,6 +992,7 @@ bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
     }
 
     const int64_t mjpeg_input_us = webrtc::TimeMicros();
+    const int64_t wall_capture_utc_ms = webrtc::TimeUTCMillis();
     bool decoded = false;
     constexpr int kMaxSubmit = 8;
     constexpr int kMaxPollPerSubmit = 500;
@@ -1064,7 +1065,7 @@ bool RkMppMjpegDecoder::DecodeJpegToNativeDecFrame(const uint8_t* jpeg,
             webrtc::scoped_refptr<MppNativeDecFrameBuffer> wrapped =
                 MppNativeDecFrameBuffer::CreateFromMppFrame(frame, fw, fh, hs, ver_stride, fmt, mjpeg_input_us,
                                                             dq_time_us, v4l2_timestamp_us, poll_wait_us,
-                                                            dqbuf_ioctl_us, decode_queue_wait_us);
+                                                            dqbuf_ioctl_us, decode_queue_wait_us, wall_capture_utc_ms);
             if (!wrapped) {
                 mpp_frame_deinit(&frame);
                 return false;
