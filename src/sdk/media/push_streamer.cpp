@@ -16,6 +16,8 @@
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
+#include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtcstats_objects.h"
 #include "api/video/video_frame.h"
 #include "api/video/video_sink_interface.h"
 #include "modules/video_capture/video_capture_factory.h"
@@ -367,6 +369,69 @@ static bool LatencyTraceEnabled() {
     return cached != 0;
 }
 
+static int ReadEnvInt(const char* name, int fallback, int min_v, int max_v) {
+    const char* e = std::getenv(name);
+    if (!e || !e[0]) {
+        return fallback;
+    }
+    char* end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (end == e || (end && *end != '\0')) {
+        return fallback;
+    }
+    if (v < min_v) {
+        return min_v;
+    }
+    if (v > max_v) {
+        return max_v;
+    }
+    return static_cast<int>(v);
+}
+
+class OutboundVideoStatsLogger : public webrtc::RTCStatsCollectorCallback {
+public:
+    explicit OutboundVideoStatsLogger(std::string pc_tag) : pc_tag_(std::move(pc_tag)) {}
+
+    void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+        if (!report) {
+            return;
+        }
+        const std::vector<const webrtc::RTCOutboundRtpStreamStats*> outbound =
+            report->GetStatsOfType<webrtc::RTCOutboundRtpStreamStats>();
+        for (const webrtc::RTCOutboundRtpStreamStats* s : outbound) {
+            if (!s->kind.has_value() || *s->kind != "video") {
+                continue;
+            }
+            std::cout << "[OutboundVideoStats] pc=" << pc_tag_ << " id=" << s->id();
+            if (s->ssrc.has_value()) {
+                std::cout << " ssrc=" << *s->ssrc;
+            }
+            if (s->frames_encoded.has_value()) {
+                std::cout << " frames_encoded=" << *s->frames_encoded;
+            }
+            if (s->key_frames_encoded.has_value()) {
+                std::cout << " key_frames_encoded=" << *s->key_frames_encoded;
+            }
+            if (s->packets_sent.has_value()) {
+                std::cout << " packets_sent=" << *s->packets_sent;
+            }
+            if (s->bytes_sent.has_value()) {
+                std::cout << " bytes_sent=" << *s->bytes_sent;
+            }
+            if (s->retransmitted_packets_sent.has_value()) {
+                std::cout << " retrans_pkts=" << *s->retransmitted_packets_sent;
+            }
+            if (s->quality_limitation_reason.has_value()) {
+                std::cout << " ql_reason=" << *s->quality_limitation_reason;
+            }
+            std::cout << std::endl;
+        }
+    }
+
+private:
+    std::string pc_tag_;
+};
+
 class PushStreamer::Impl : public webrtc::PeerConnectionObserver {
 public:
     explicit Impl(const PushStreamerConfig& config) : config_(config) {}
@@ -421,6 +486,7 @@ public:
     }
 
     void Shutdown() {
+        StopOutboundStatsLoop();
         if (frame_counter_ && camera_source_) {
             camera_source_->RemoveSink(frame_counter_.get());
         }
@@ -495,6 +561,7 @@ public:
             ApplyVideoCodecPreferences(peer_connection_);
             ApplyEncodingParameters(peer_connection_);
             std::cout << "[PushStreamer] Video track added (stream_id=" << config_.common.stream_id << ")" << std::endl;
+            MaybeStartOutboundStatsLoop();
         } else {
             std::cout << "[PushStreamer] Video track ready (subscriber-offer-only; sender per subscriber PC, "
                          "stream_id="
@@ -638,6 +705,20 @@ public:
             if (!err.ok()) {
                 std::cerr << "[PushStreamer] SetParameters failed: " << err.message() << std::endl;
             } else {
+                webrtc::BitrateSettings br;
+                const int min_bps = std::max(0, config_.common.min_bitrate_kbps * 1000);
+                const int target_bps = std::max(min_bps, config_.common.target_bitrate_kbps * 1000);
+                const int max_bps = std::max(target_bps, config_.common.max_bitrate_kbps * 1000);
+                br.min_bitrate_bps = min_bps;
+                br.start_bitrate_bps = target_bps;
+                br.max_bitrate_bps = max_bps;
+                auto br_err = pc->SetBitrate(br);
+                if (!br_err.ok()) {
+                    std::cerr << "[PushStreamer] SetBitrate failed: " << br_err.message() << std::endl;
+                } else {
+                    std::cout << "[PushStreamer] SetBitrate: min/start/max=" << min_bps << "/" << target_bps
+                              << "/" << max_bps << " bps" << std::endl;
+                }
                 std::cout << "[PushStreamer] Encoding params: bitrate " << config_.common.min_bitrate_kbps << "-"
                           << config_.common.max_bitrate_kbps << " kbps"
                           << " max_fps=" << max_fps
@@ -655,6 +736,51 @@ public:
             }
             break;
         }
+    }
+
+    void MaybeStartOutboundStatsLoop() {
+        const int interval_sec = ReadEnvInt("WEBRTC_PUSH_OUTBOUND_STATS_INTERVAL_SEC", 0, 0, 60);
+        if (interval_sec <= 0 || outbound_stats_started_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        outbound_stats_stop_.store(false, std::memory_order_release);
+        std::cout << "[PushStreamer] Outbound stats enabled, interval=" << interval_sec << "s" << std::endl;
+        outbound_stats_thread_ = std::thread([this, interval_sec]() {
+            while (!outbound_stats_stop_.load(std::memory_order_acquire)) {
+                auto [pc, tag] = SelectStatsPeerConnection();
+                if (pc) {
+                    auto cb = webrtc::make_ref_counted<OutboundVideoStatsLogger>(tag);
+                    pc->GetStats(cb.get());
+                }
+                for (int i = 0; i < interval_sec * 10; ++i) {
+                    if (outbound_stats_stop_.load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+        });
+    }
+
+    void StopOutboundStatsLoop() {
+        outbound_stats_stop_.store(true, std::memory_order_release);
+        if (outbound_stats_thread_.joinable()) {
+            outbound_stats_thread_.join();
+        }
+        outbound_stats_started_.store(false, std::memory_order_release);
+    }
+
+    std::pair<webrtc::scoped_refptr<webrtc::PeerConnectionInterface>, std::string> SelectStatsPeerConnection() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& kv : peer_connections_) {
+            if (kv.second) {
+                return {kv.second, kv.first};
+            }
+        }
+        if (peer_connection_) {
+            return {peer_connection_, "default"};
+        }
+        return {nullptr, "none"};
     }
 
     bool ResolveDeviceUniqueId(std::string* out_unique) {
@@ -1006,6 +1132,7 @@ public:
             extra_peer_observers_[peer_id] = std::move(observer);
         }
         std::cout << "[PushStreamer] Subscriber PeerConnection created: " << peer_id << std::endl;
+        MaybeStartOutboundStatsLoop();
         return true;
     }
 
@@ -1410,6 +1537,9 @@ private:
     std::unordered_map<std::string, webrtc::scoped_refptr<webrtc::PeerConnectionInterface>> peer_connections_;
     std::unordered_map<std::string, std::unique_ptr<ExtraPeerObserver>> extra_peer_observers_;
     std::mutex mutex_;
+    std::thread outbound_stats_thread_;
+    std::atomic<bool> outbound_stats_stop_{false};
+    std::atomic<bool> outbound_stats_started_{false};
 };
 
 PushStreamer::PushStreamer(const PushStreamerConfig& config) : impl_(std::make_unique<Impl>(config)) {}

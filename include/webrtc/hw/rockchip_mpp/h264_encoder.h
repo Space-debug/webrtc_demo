@@ -1,6 +1,7 @@
 #ifndef WEBRTC_DEMO_RK_MPP_H264_ENCODER_H_
 #define WEBRTC_DEMO_RK_MPP_H264_ENCODER_H_
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -10,7 +11,7 @@
 
 namespace webrtc_demo {
 
-/// Rockchip MPP 硬件 H.264 编码器（RK3588 等）。输入 NV12 时直拷至 MPP 缓冲；否则 I420 经 libyuv 转 NV12。
+/// Rockchip MPP 硬件 H.264 编码器（RK3588 等）。NV12 直拷至 MPP；MPP MJPEG 解码的 kNative 帧在 stride 匹配时可直通缓冲免拷贝。
 /// 与 OpenH264 相同走 Annex B + start code，供 WebRTC RTP 打包。
 class RkMppH264Encoder final : public webrtc::VideoEncoder {
  public:
@@ -58,6 +59,15 @@ class RkMppH264Encoder final : public webrtc::VideoEncoder {
   int max_bps_{0};
   int gop_{0};
   int mpp_rc_mode_{0};  // MppEncRcMode
+  int intra_refresh_mode_{0};
+  int intra_refresh_arg_{0};
+  bool split_by_byte_enabled_{false};
+  int split_bytes_{0};
+  int idr_min_interval_ms_{0};
+  int idr_loss_quick_trigger_ms_{0};
+  int idr_force_max_wait_ms_{0};
+  int64_t last_forced_idr_ctrl_us_{-1};
+  int64_t last_idr_emit_us_{-1};
 
   bool initialized_{false};
   /// Annex-B 转换复用缓冲，避免每帧 std::vector 堆分配（容量随帧增长后保持稳定）。

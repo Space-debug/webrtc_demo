@@ -85,6 +85,9 @@ STREAM_livestream_CAMERA=/dev/video0
 - 省略命令行 `stream_id` 时用 `STREAM_ID`；摄像头来自 `STREAM_<id>_CAMERA`（无则空，需命令行或设备索引）。
 - 同一物理头多档分辨率可建多个 `stream_id`，公共参数共用，各路用 `STREAM_*` 只改 `WIDTH/HEIGHT/FPS` 等差异项。
 - 先用 `v4l2-ctl -d /dev/video0 --list-formats-ext` 查设备能力再填分辨率/帧率。
+- 本仓库内置两份推荐配置：
+  - `config/streams.conf`：720p 稳态（默认）
+  - `config/streams_1080p_stable.conf`：1080p 稳态（与 720p 分离）
 
 ### 采集与像素格式（V4L2）
 
@@ -109,6 +112,12 @@ MJPEG / YUYV 等由 **库与驱动协商**，无需 v4l2loopback 采集桥接。
 
 ```bash
 ./scripts/push.sh livestream /dev/video11
+```
+
+1080p 稳态可直接切配置文件：
+
+```bash
+CONFIG_FILE=./config/streams_1080p_stable.conf ./scripts/push.sh livestream /dev/video11
 ```
 
 默认行为：
@@ -156,6 +165,14 @@ HEADLESS=1 HEADLESS_FRAMES=20 ./scripts/pull.sh 192.168.3.222:8765 livestream
 需已编译、本机摄像头可用、`python3` 可用：
 
 ```bash
+./scripts/pull.sh --e2e /dev/video11
+```
+
+1080p 稳态 E2E（建议固定核，抖动更小）：
+
+```bash
+CONFIG_FILE=./config/streams_1080p_stable.conf \
+E2E_PUSH_CORE=6 E2E_PULL_CORE=7 E2E_SCHED_MODE=nice \
 ./scripts/pull.sh --e2e /dev/video11
 ```
 

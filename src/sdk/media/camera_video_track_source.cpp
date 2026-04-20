@@ -25,6 +25,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <chrono>
 #include <deque>
@@ -611,6 +612,9 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
 }
 
 void CameraVideoTrackSource::DecodeWorkerThreadMain() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "wrtc_mjpg_dec");
+#endif
     while (true) {
         MjpegPendingBuf job{};
         bool have_job = false;
@@ -732,18 +736,29 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index,
     if (log_libyuv_mjpeg) {
         decode_before_us = webrtc::TimeMicros();
     }
+    int conv_ret = 0;
     {
         const webrtc::VideoType vtype = (direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG))
                                               ? webrtc::VideoType::kMJPEG
                                               : webrtc::VideoType::kYUY2;
-        int conv = libyuv::ConvertToI420(src, bytesused, i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),
+        conv_ret = libyuv::ConvertToI420(src, bytesused, i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),
                                          i420->StrideU(), i420->MutableDataV(), i420->StrideV(), 0, 0, w, h, w, h,
                                          libyuv::kRotate0, webrtc::ConvertVideoType(vtype));
+        int conv = conv_ret;
         if (conv != 0 && direct_pixfmt_ == static_cast<uint32_t>(V4L2_PIX_FMT_MJPEG)) {
             conv = libyuv::MJPGToI420(src, bytesused, i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),
                                       i420->StrideU(), i420->MutableDataV(), i420->StrideV(), w, h, w, h);
         }
         ok = (conv == 0);
+    }
+    if (!ok) {
+        static std::atomic<unsigned> conv_fail_n{0};
+        const unsigned n = ++conv_fail_n;
+        if ((n <= 5u) || ((n % 30u) == 0u)) {
+            std::cerr << "[CameraV4L2] frame convert failed pixfmt=0x" << std::hex << direct_pixfmt_ << std::dec
+                      << " bytes=" << bytesused << " size=" << w << "x" << h << " conv_ret=" << conv_ret
+                      << " (frame dropped)" << std::endl;
+        }
     }
     if (ok && log_libyuv_mjpeg) {
         LogMjpegDecodeTiming("libyuv-i420", decode_before_us, webrtc::TimeMicros());
@@ -759,6 +774,9 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index,
 }
 
 void CameraVideoTrackSource::DirectCaptureThreadMain() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "wrtc_v4l2_cap");
+#endif
     std::atomic<unsigned> poll_log_counter{0};
     while (direct_run_.load(std::memory_order_relaxed)) {
         struct pollfd pfd {};
@@ -817,27 +835,24 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
             }
             // 延迟 QBUF：解码线程从 mmap 读 JPEG 并入 MPP 后再归还驱动，去掉「整帧 memcpy 到队列」。
             {
-                std::unique_lock<std::mutex> lk(jpeg_queue_mu_);
-                if (mjpeg_queue_latest_only_) {
-                    while (!jpeg_queue_.empty()) {
-                        MjpegPendingBuf drop = jpeg_queue_.front();
-                        jpeg_queue_.pop_front();
-                        lk.unlock();
-                        QBufV4l2Index(drop.index);
-                        lk.lock();
+                std::deque<MjpegPendingBuf> dropped;
+                {
+                    std::unique_lock<std::mutex> lk(jpeg_queue_mu_);
+                    if (mjpeg_queue_latest_only_) {
+                        dropped.swap(jpeg_queue_);
+                    } else {
+                        while (jpeg_queue_.size() >= mjpeg_queue_max_) {
+                            dropped.push_back(jpeg_queue_.front());
+                            jpeg_queue_.pop_front();
+                        }
                     }
-                } else {
-                    while (jpeg_queue_.size() >= mjpeg_queue_max_) {
-                        MjpegPendingBuf drop = jpeg_queue_.front();
-                        jpeg_queue_.pop_front();
-                        lk.unlock();
-                        QBufV4l2Index(drop.index);
-                        lk.lock();
-                    }
+                    jpeg_queue_.push_back(
+                        MjpegPendingBuf{buf.index, buf.bytesused, dq_time_us, v4l2_timestamp_us, poll_wait_us,
+                                       dqbuf_ioctl_us, webrtc::TimeMicros()});
                 }
-                jpeg_queue_.push_back(
-                    MjpegPendingBuf{buf.index, buf.bytesused, dq_time_us, v4l2_timestamp_us, poll_wait_us,
-                                   dqbuf_ioctl_us, webrtc::TimeMicros()});
+                for (const MjpegPendingBuf& drop : dropped) {
+                    QBufV4l2Index(drop.index);
+                }
             }
             jpeg_queue_cv_.notify_one();
             continue;

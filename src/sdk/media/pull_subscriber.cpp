@@ -457,6 +457,9 @@ public:
                     if (!desc->ToString(&sdp)) {
                         return;
                     }
+                    if (std::getenv("WEBRTC_DUMP_LOCAL_ANSWER")) {
+                        std::cout << "\n--- Local answer SDP ---\n" << sdp << "\n--- End ---\n" << std::flush;
+                    }
                     auto set_local = webrtc::scoped_refptr<webrtc::SetLocalDescriptionObserverInterface>(
                         new webrtc::RefCountedObject<SetLocalDescObserver>(
                             [this, sdp](webrtc::RTCError err) {

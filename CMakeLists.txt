@@ -120,6 +120,12 @@ add_executable(webrtc_push_demo src/app/push_demo.cpp)
 target_include_directories(webrtc_push_demo PRIVATE ${WEBRTC_PUSH_SDK_DIR})
 target_link_libraries(webrtc_push_demo PRIVATE webrtc_push_sdk)
 
+if(WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE AND WEBRTC_DEMO_ROCKCHIP_MPP_LIB)
+    add_executable(mpp_h264_smoke src/app/mpp_h264_smoke.cpp)
+    target_include_directories(mpp_h264_smoke PRIVATE ${WEBRTC_DEMO_ROCKCHIP_MPP_INCLUDE})
+    target_link_libraries(mpp_h264_smoke PRIVATE ${WEBRTC_DEMO_ROCKCHIP_MPP_LIB})
+endif()
+
 find_package(SDL2 QUIET)
 if(NOT SDL2_FOUND)
     find_package(PkgConfig QUIET)
@@ -200,6 +206,9 @@ install(FILES
     DESTINATION lib/cmake/WebrtcPushSdk)
 
 install(TARGETS webrtc_push_demo RUNTIME DESTINATION bin)
+if(TARGET mpp_h264_smoke)
+    install(TARGETS mpp_h264_smoke RUNTIME DESTINATION bin)
+endif()
 if(TARGET webrtc_pull_demo)
     install(TARGETS webrtc_pull_demo RUNTIME DESTINATION bin)
 endif()

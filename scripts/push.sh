@@ -19,7 +19,7 @@ cfg_get() {
     echo "Usage: ./scripts/push.sh [stream_id] [camera]"
     echo ""
     echo "环境: CONFIG_FILE  SIGNALING_ADDR  START_SIGNALING=0|1  AUTO_LOCAL_ROUTE  WIDTH HEIGHT FPS"
-    echo "推流低延迟 profile: PUSH_LOWLATENCY_PROFILE=aggressive|balanced|stable|off（默认 aggressive=最低延迟）"
+    echo "推流低延迟 profile: PUSH_LOWLATENCY_PROFILE=aggressive|balanced|stable|off（默认 stable=更稳）"
     echo "  aggressive: V4L2_BUFFER_COUNT=2  V4L2_POLL_TIMEOUT_MS=5  MJPEG_DEC_LOW_LATENCY=1"
     echo "  balanced:   V4L2_BUFFER_COUNT=3  V4L2_POLL_TIMEOUT_MS=8  MJPEG_DEC_LOW_LATENCY=1"
     echo "  stable:     V4L2_BUFFER_COUNT=3  V4L2_POLL_TIMEOUT_MS=5  MJPEG_DEC_LOW_LATENCY=1"
@@ -43,8 +43,8 @@ AUTO_LOCAL_ROUTE="${AUTO_LOCAL_ROUTE:-$(cfg_get AUTO_LOCAL_ROUTE 1)}"
 case "$(uname -m)" in aarch64|arm64) A=arm64;; x86_64|amd64) A=x64;; *) A=arm64;; esac
 export LD_LIBRARY_PATH="$ROOT/3rdparty/libwebrtc/lib/linux/$A:${LD_LIBRARY_PATH:-}"
 
-# 默认 aggressive：与「最低延迟推流」一致；需保守行为时显式 PUSH_LOWLATENCY_PROFILE=off
-PUSH_LOWLATENCY_PROFILE="${PUSH_LOWLATENCY_PROFILE:-aggressive}"
+# 默认 stable：日常更稳；追求极限最低延迟时再显式切 aggressive。
+PUSH_LOWLATENCY_PROFILE="${PUSH_LOWLATENCY_PROFILE:-stable}"
 if [ "${PUSH_LOWLATENCY_DEFAULTS:-0}" = "1" ] && [ "$PUSH_LOWLATENCY_PROFILE" = "off" ]; then
     PUSH_LOWLATENCY_PROFILE="aggressive"
 fi
@@ -74,6 +74,16 @@ esac
 if [ "$PUSH_LOWLATENCY_PROFILE" != "off" ] && [ "$PUSH_LOWLATENCY_PROFILE" != "none" ]; then
     echo "Push lowlat profile: ${PUSH_LOWLATENCY_PROFILE}  v4l2_buf=${WEBRTC_V4L2_BUFFER_COUNT:-default}  poll_timeout_ms=${WEBRTC_V4L2_POLL_TIMEOUT_MS:-default}"
 fi
+
+# MPP H.264 默认策略（可用环境变量覆盖）：
+# 常态以 P + intra refresh 平滑传输，弱网/丢包触发关键帧请求时允许更快 IDR 恢复。
+export WEBRTC_MPP_ENC_INTRA_REFRESH_MODE="${WEBRTC_MPP_ENC_INTRA_REFRESH_MODE:-1}"
+export WEBRTC_MPP_ENC_INTRA_REFRESH_ARG="${WEBRTC_MPP_ENC_INTRA_REFRESH_ARG:-1}"
+# 该板 BSP 上 split-by-byte 历史上有不稳定案例，默认关闭，必要时再按环境临时开启。
+export WEBRTC_MPP_ENC_SPLIT_BYTES="${WEBRTC_MPP_ENC_SPLIT_BYTES:-0}"
+export WEBRTC_MPP_ENC_IDR_MIN_INTERVAL_MS="${WEBRTC_MPP_ENC_IDR_MIN_INTERVAL_MS:-250}"
+export WEBRTC_MPP_ENC_IDR_LOSS_QUICK_MS="${WEBRTC_MPP_ENC_IDR_LOSS_QUICK_MS:-180}"
+export WEBRTC_MPP_ENC_IDR_FORCE_MAX_WAIT_MS="${WEBRTC_MPP_ENC_IDR_FORCE_MAX_WAIT_MS:-1200}"
 
 BIN_DIR="${WEBRTC_DEMO_BIN:-$ROOT/build/bin}"
 PUSH="$BIN_DIR/webrtc_push_demo"

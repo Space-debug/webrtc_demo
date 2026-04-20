@@ -31,7 +31,8 @@ namespace {
     return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
   }
 
-  /// 客户端低延迟默认：1ms pacing + 队列 6（易饥饿可调 WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE=8）。
+  /// 客户端低延迟：FieldTrial WebRTC-ZeroPlayoutDelay（pacing + max_decode_queue_size）。
+  /// 脚本 steady profile：2ms pacing + 队列 8；仍可用 WEBRTC_DEMO_* 覆盖（4..16）。
   std::string ZeroPlayoutDelayTrialString() {
     int pacing_ms = 1;
     if (const char* p = std::getenv("WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS")) {
