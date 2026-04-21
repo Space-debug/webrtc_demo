@@ -5,6 +5,10 @@
 #include <memory>
 #include <vector>
 
+#include "api/scoped_refptr.h"
+#include "api/video/video_frame.h"
+#include "api/video/video_frame_buffer.h"
+
 #include "api/environment/environment.h"
 #include "api/video_codecs/video_encoder.h"
 #include "modules/video_coding/codecs/h264/include/h264.h"
@@ -36,6 +40,12 @@ class RkMppH264Encoder final : public webrtc::VideoEncoder {
   void DestroyMpp();
   bool ApplyRcToCfg();
   static int MppH264LevelForSize(int width, int height, uint32_t fps);
+  /// 将 split_assembly_buf_ 中拼好的一帧 Annex B（或等价）码流发出一次 OnEncodedImage。
+  int32_t EmitAssembledFrame(const webrtc::VideoFrame& frame,
+                             const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& vfb,
+                             int64_t encode_before_us,
+                             int64_t on_frame_to_encode_enter_us,
+                             bool mpp_reports_intra);
 
   const webrtc::Environment& env_;
   webrtc::H264EncoderSettings h264_settings_;
@@ -72,6 +82,8 @@ class RkMppH264Encoder final : public webrtc::VideoEncoder {
   bool initialized_{false};
   /// Annex-B 转换复用缓冲，避免每帧 std::vector 堆分配（容量随帧增长后保持稳定）。
   std::vector<uint8_t> annex_scratch_;
+  /// MPP_ENC_SPLIT_BY_BYTE 多包输出时在 EOI 前累积裸码流，EOI 后一次性回调 WebRTC。
+  std::vector<uint8_t> split_assembly_buf_;
 
   /// 与 WebRTC-VideoFrameTrackingIdAdvertised 配合，供接收端 RTP 扩展关联帧。
   uint16_t next_video_frame_tracking_id_{0};

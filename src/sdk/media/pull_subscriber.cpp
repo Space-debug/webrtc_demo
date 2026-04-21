@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <atomic>
 #include <functional>
 #include <chrono>
 #include <iostream>
@@ -39,6 +40,48 @@
 namespace webrtc_demo {
 
 namespace {
+
+bool SignalingTimingTraceEnabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("WEBRTC_DEMO_SIGNALING_TIMING_TRACE");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+int64_t SignalingNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void TraceSigTiming(const std::string& msg) {
+    if (!SignalingTimingTraceEnabled()) {
+        return;
+    }
+    std::cout << "[SIG_TIMING][pull] t_us=" << SignalingNowUs() << " " << msg << std::endl;
+}
+
+bool MediaTimingTraceEnabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("WEBRTC_DEMO_MEDIA_TIMING_TRACE");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+unsigned MediaTimingTraceEveryN() {
+    static const unsigned every_n = []() {
+        if (const char* v = std::getenv("WEBRTC_DEMO_MEDIA_TIMING_TRACE_EVERY_N")) {
+            const int n = std::atoi(v);
+            if (n >= 1 && n <= 600) {
+                return static_cast<unsigned>(n);
+            }
+        }
+        return 30u;
+    }();
+    return every_n;
+}
 
 // 与 api/video/video_timing.cc 中 TimingFrameInfo::ToString() 输出顺序一致。
 static std::vector<std::string> SplitCommaFields(const std::string& s) {
@@ -266,6 +309,7 @@ public:
         const bool e2e_trace = (std::getenv("WEBRTC_E2E_LATENCY_TRACE") != nullptr &&
                                 std::getenv("WEBRTC_E2E_LATENCY_TRACE")[0] == '1');
         const int64_t t_sink_enter_us = e2e_trace ? webrtc::TimeMicros() : 0;
+        const int64_t t_now_us = webrtc::TimeMicros();
         const int64_t wall_sink_utc_ms = e2e_trace ? webrtc::TimeUTCMillis() : int64_t{0};
         if (!on_frame_) {
             return;
@@ -288,6 +332,16 @@ public:
             }
             const int64_t t_callback_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
             on_frame_(nullptr, w, h, 0, frame.id(), t_callback_done_us);
+            if (MediaTimingTraceEnabled()) {
+                static std::atomic<unsigned> media_sink_n{0};
+                const unsigned n_trace = ++media_sink_n;
+                if ((n_trace % MediaTimingTraceEveryN()) == 0u) {
+                    std::cout << "[MEDIA_TIMING][sink] t_us=" << t_now_us << " trace_id="
+                              << static_cast<unsigned>(frame.id()) << " rtp_ts=" << frame.rtp_timestamp()
+                              << " event=onframe_skip_argb t_callback_done_us=" << t_callback_done_us
+                              << std::endl;
+                }
+            }
             if (e2e_trace) {
                 std::cout << "[E2E_RX] rtp_ts=" << frame.rtp_timestamp() << " trace_id="
                           << static_cast<unsigned>(frame.id()) << " frame_id="
@@ -313,6 +367,16 @@ public:
         }
         const int64_t t_callback_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
         on_frame_(argb_.data(), w, h, stride, frame.id(), t_callback_done_us);
+        if (MediaTimingTraceEnabled()) {
+            static std::atomic<unsigned> media_sink_n{0};
+            const unsigned n_trace = ++media_sink_n;
+            if ((n_trace % MediaTimingTraceEveryN()) == 0u) {
+                std::cout << "[MEDIA_TIMING][sink] t_us=" << t_now_us << " trace_id="
+                          << static_cast<unsigned>(frame.id()) << " rtp_ts=" << frame.rtp_timestamp()
+                          << " event=onframe_argb_done t_argb_done_us=" << t_argb_done_us
+                          << " t_callback_done_us=" << t_callback_done_us << std::endl;
+            }
+        }
         if (e2e_trace) {
             std::cout << "[E2E_RX] rtp_ts=" << frame.rtp_timestamp() << " trace_id="
                       << static_cast<unsigned>(frame.id()) << " frame_id="
@@ -408,6 +472,7 @@ public:
             return;
         }
         auto work = [this, pc, type, sdp]() {
+            TraceSigTiming("SetRemoteDescription begin type=" + type + " sdp_len=" + std::to_string(sdp.size()));
             auto opt_t = webrtc::SdpTypeFromString(type);
             if (!opt_t.has_value()) {
                 if (on_error_) {
@@ -430,6 +495,7 @@ public:
                         }
                         return;
                     }
+                    TraceSigTiming("SetRemoteDescription OK -> CreateAnswer");
                     std::cout << "[PullSubscriber] SetRemoteDescription OK, CreateAnswer" << std::endl;
                     CreateAnswer();
                 }));
@@ -457,6 +523,7 @@ public:
                     if (!desc->ToString(&sdp)) {
                         return;
                     }
+                    TraceSigTiming("CreateAnswer success sdp_len=" + std::to_string(sdp.size()));
                     if (std::getenv("WEBRTC_DUMP_LOCAL_ANSWER")) {
                         std::cout << "\n--- Local answer SDP ---\n" << sdp << "\n--- End ---\n" << std::flush;
                     }
@@ -469,7 +536,9 @@ public:
                                     }
                                     return;
                                 }
+                                TraceSigTiming("SetLocalDescription OK (answer)");
                                 signaling_->SendAnswer(sdp);
+                                TraceSigTiming("SendAnswer invoked");
                                 std::cout << "[PullSubscriber] Answer sent" << std::endl;
                             }));
                     peer_connection_->SetLocalDescription(std::move(desc), set_local);
@@ -493,6 +562,7 @@ public:
             return;
         }
         auto work = [pc, mid, mline_index, candidate]() {
+            TraceSigTiming("AddRemoteIce begin mid=" + mid + " cand_len=" + std::to_string(candidate.size()));
             webrtc::SdpParseError err;
             webrtc::IceCandidateInterface* cand = webrtc::CreateIceCandidate(mid, mline_index, candidate, &err);
             if (!cand) {

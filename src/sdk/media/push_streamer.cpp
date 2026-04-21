@@ -47,6 +47,27 @@ namespace webrtc_demo {
 
 namespace {
 
+bool SignalingTimingTraceEnabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("WEBRTC_DEMO_SIGNALING_TIMING_TRACE");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+int64_t SignalingNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void TraceSigTiming(const std::string& msg) {
+    if (!SignalingTimingTraceEnabled()) {
+        return;
+    }
+    std::cout << "[SIG_TIMING][push] t_us=" << SignalingNowUs() << " " << msg << std::endl;
+}
+
 /// 部分平台在双 PC 回环下 PeerConnection::Close 可能长期阻塞；超时后放弃等待，由进程退出收尾。
 /// @return true 表示 Close 在线程内已返回；false 表示超时（可能仍有后台线程卡在 Close 内）。
 static bool ClosePeerConnectionWithDeadline(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc,
@@ -1062,6 +1083,7 @@ public:
         if (!WaitForCaptureGate(std::string("peer=") + peer_id)) {
             return;
         }
+        TraceSigTiming("CreateOfferForPeer gate_ok peer=" + peer_id);
         webrtc::Thread* sig = peer_connection_->signaling_thread();
         if (!sig) {
             std::cerr << "[PushStreamer] CreateOfferForPeer: no signaling thread" << std::endl;
@@ -1142,6 +1164,7 @@ public:
             return;
         }
         auto opts = MakeOfferOptions();
+        TraceSigTiming("CreateOfferOnConnection begin peer=" + (peer_id.empty() ? std::string("default") : peer_id));
         auto peer_id_ptr = std::make_shared<std::string>(peer_id);
 
         auto obs = webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver>(
@@ -1156,6 +1179,9 @@ public:
                         std::cerr << "[PushStreamer] SDP ToString failed" << std::endl;
                         return;
                     }
+                    TraceSigTiming("CreateOffer success peer=" +
+                                   (peer_id_ptr->empty() ? std::string("default") : *peer_id_ptr) +
+                                   " sdp_len=" + std::to_string(sdp.size()));
 
                     auto set_local = webrtc::scoped_refptr<webrtc::SetLocalDescriptionObserverInterface>(
                         new webrtc::RefCountedObject<SetLocalDescObserver>(
@@ -1165,6 +1191,8 @@ public:
                                               << std::endl;
                                     return;
                                 }
+                                TraceSigTiming("SetLocalDescription OK peer=" +
+                                               (peer_id_ptr->empty() ? std::string("default") : *peer_id_ptr));
                                 if (config_.common.test_encode_mode && peer_id_ptr->empty()) {
                                     if (std::getenv("WEBRTC_DUMP_OFFER")) {
                                         std::cout << "\n--- Local offer SDP ---\n" << sdp << "\n--- End ---\n" << std::flush;
@@ -1213,6 +1241,7 @@ public:
             return;
         }
         auto work = [pc, type, sdp]() {
+            TraceSigTiming("SetRemoteDescription begin type=" + type + " sdp_len=" + std::to_string(sdp.size()));
             auto opt_type = webrtc::SdpTypeFromString(type);
             if (!opt_type.has_value()) {
                 std::cerr << "[PushStreamer] Bad SDP type: " << type << std::endl;
@@ -1228,6 +1257,7 @@ public:
                     if (!err.ok()) {
                         std::cerr << "[PushStreamer] SetRemoteDescription failed: " << err.message() << std::endl;
                     } else {
+                        TraceSigTiming("SetRemoteDescription OK");
                         std::cout << "[PushStreamer] SetRemoteDescription OK" << std::endl;
                     }
                 }));
@@ -1262,6 +1292,7 @@ public:
             return;
         }
         auto work = [pc, mid, mline_index, candidate]() {
+            TraceSigTiming("AddRemoteIce begin mid=" + mid + " cand_len=" + std::to_string(candidate.size()));
             webrtc::SdpParseError err;
             webrtc::IceCandidateInterface* cand = webrtc::CreateIceCandidate(mid, mline_index, candidate, &err);
             if (!cand) {

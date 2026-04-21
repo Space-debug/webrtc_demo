@@ -72,6 +72,7 @@ private:
     std::unique_ptr<std::thread> reader_thread_;
     bool running_{false};
     mutable std::mutex peer_mutex_;
+    mutable std::mutex send_mutex_;
 };
 
 }  // namespace webrtc_demo

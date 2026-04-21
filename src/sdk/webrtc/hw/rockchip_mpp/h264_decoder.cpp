@@ -3,6 +3,8 @@
 #include "webrtc/hw/rockchip_mpp/h264_decoder.h"
 
 #include <cstring>
+#include <cstdlib>
+#include <atomic>
 #include <iostream>
 
 #include "api/video/i420_buffer.h"
@@ -41,6 +43,27 @@ int DecodePollTimeoutMs() {
         }
     }
     return def;
+}
+
+bool MediaTimingTraceEnabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("WEBRTC_DEMO_MEDIA_TIMING_TRACE");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+unsigned MediaTimingTraceEveryN() {
+    static const unsigned every_n = []() {
+        if (const char* v = std::getenv("WEBRTC_DEMO_MEDIA_TIMING_TRACE_EVERY_N")) {
+            const int n = std::atoi(v);
+            if (n >= 1 && n <= 600) {
+                return static_cast<unsigned>(n);
+            }
+        }
+        return 30u;
+    }();
+    return every_n;
 }
 
 }  // namespace
@@ -235,6 +258,19 @@ bool H264Decoder::TryDrainOneDecodedFrame(int64_t render_time_ms, const webrtc::
                 std::cout << "[RkMppH264Dec] Decoded first frame " << width << "x" << height << " fmt=" << fmt
                           << std::endl;
             }
+            if (MediaTimingTraceEnabled()) {
+                static std::atomic<unsigned> media_trace_n{0};
+                const unsigned n = ++media_trace_n;
+                if ((n % MediaTimingTraceEveryN()) == 0u) {
+                    const auto tid = ref_meta.VideoFrameTrackingId();
+                    std::cout << "[MEDIA_TIMING][dec] t_us=" << webrtc::TimeMicros()
+                              << " trace_id="
+                              << (tid.has_value() ? std::to_string(static_cast<unsigned>(*tid))
+                                                  : std::string("-"))
+                              << " rtp_ts=" << ref_meta.RtpTimestamp() << " width=" << width
+                              << " height=" << height << std::endl;
+                }
+            }
             callback_->Decoded(out);
         }
         return true;
@@ -282,6 +318,19 @@ int32_t H264Decoder::Decode(const webrtc::EncodedImage& input_image, bool /*miss
     if (pr != MPP_OK) {
         RTC_LOG(LS_WARNING) << "[RkMppH264Dec] decode_put_packet ret=" << pr;
         return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    if (MediaTimingTraceEnabled()) {
+        static std::atomic<unsigned> media_ingress_n{0};
+        const unsigned n = ++media_ingress_n;
+        if ((n % MediaTimingTraceEveryN()) == 0u) {
+            const auto tid = input_image.VideoFrameTrackingId();
+            std::cout << "[MEDIA_TIMING][rx] t_us=" << webrtc::TimeMicros()
+                      << " trace_id="
+                      << (tid.has_value() ? std::to_string(static_cast<unsigned>(*tid))
+                                          : std::string("-"))
+                      << " rtp_ts=" << input_image.RtpTimestamp()
+                      << " enc_bytes=" << input_image.size() << " event=decode_put_packet_ok" << std::endl;
+        }
     }
 
     while (TryDrainOneDecodedFrame(render_time_ms, input_image)) {

@@ -49,6 +49,27 @@ namespace webrtc_demo {
 
 namespace {
 
+bool MediaTimingTraceEnabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("WEBRTC_DEMO_MEDIA_TIMING_TRACE");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+unsigned MediaTimingTraceEveryN() {
+    static const unsigned every_n = []() {
+        if (const char* v = std::getenv("WEBRTC_DEMO_MEDIA_TIMING_TRACE_EVERY_N")) {
+            const int n = std::atoi(v);
+            if (n >= 1 && n <= 600) {
+                return static_cast<unsigned>(n);
+            }
+        }
+        return 30u;
+    }();
+    return every_n;
+}
+
 // 本地墙钟时间，毫秒精度，形如 2026-04-01 14:30:05.123
 std::string CurrentLocalDateTimeYmdHmsMs() {
     using std::chrono::duration_cast;
@@ -315,6 +336,7 @@ void RkMppH264Encoder::DestroyMpp() {
         mpi_ = nullptr;
     }
     annex_scratch_.clear();
+    split_assembly_buf_.clear();
 }
 
 bool RkMppH264Encoder::ApplyRcToCfg() {
@@ -397,7 +419,7 @@ int RkMppH264Encoder::InitEncode(const webrtc::VideoCodec* inst,
     const int fps_i = std::max(1, static_cast<int>(fps_));
     const int auto_refresh_arg = std::max(1, (mb_rows + fps_i - 1) / fps_i);
     intra_refresh_arg_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_INTRA_REFRESH_ARG", auto_refresh_arg, 1, 512);
-    // 默认按字节切片 + 低延迟输出，减轻关键帧 RTP/FU-A 突发；0 关闭切片。
+    // 默认关闭按字节分片；按需通过 WEBRTC_MPP_ENC_SPLIT_BYTES 打开实验。
     split_bytes_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_SPLIT_BYTES", 0, 0, 4096);
     split_by_byte_enabled_ = split_bytes_ > 0;
     // 关键帧请求风暴保护：限制连续 IDR 注入频率，但保留最长等待兜底，避免长期无法快速恢复。
@@ -680,6 +702,188 @@ webrtc::VideoEncoder::EncoderInfo RkMppH264Encoder::GetEncoderInfo() const {
     return info;
 }
 
+int32_t RkMppH264Encoder::EmitAssembledFrame(const webrtc::VideoFrame& frame,
+                                               const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& vfb,
+                                               int64_t encode_before_us,
+                                               int64_t on_frame_to_encode_enter_us,
+                                               bool mpp_reports_intra) {
+    if (split_assembly_buf_.empty()) {
+        return WEBRTC_VIDEO_CODEC_OK;
+    }
+    const uint8_t* raw = split_assembly_buf_.data();
+    const size_t len = split_assembly_buf_.size();
+    webrtc::scoped_refptr<webrtc::EncodedImageBuffer> buf;
+    if (!webrtc::H264::FindNaluIndices(webrtc::ArrayView<const uint8_t>(raw, len)).empty()) {
+        buf = webrtc::EncodedImageBuffer::Create(len);
+        memcpy(buf->data(), raw, len);
+    } else {
+        bool annex_ok = FillAvcLengthPrefixedToAnnexB(raw, len, &annex_scratch_);
+        if (!annex_ok) {
+            annex_ok = FillAvcLengthPrefixed16ToAnnexB(raw, len, &annex_scratch_);
+        }
+        if (!annex_ok) {
+            annex_ok = FillRawSingleNalToAnnexB(raw, len, &annex_scratch_);
+        }
+        if (!annex_ok) {
+            RTC_LOG(LS_WARNING) << "[RkMppH264] unparseable bitstream (assembled), request SW fallback; len=" << len;
+            std::cerr << "[RkMppH264Err] unparseable assembled bitstream len=" << len
+                      << ", request SW fallback" << std::endl;
+            return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+        }
+        buf = webrtc::EncodedImageBuffer::Create(annex_scratch_.size());
+        memcpy(buf->data(), annex_scratch_.data(), annex_scratch_.size());
+    }
+    webrtc::H264BitstreamParser qp_parser;
+    webrtc::EncodedImage encoded;
+    encoded.SetEncodedData(buf);
+    encoded._encodedWidth = width_;
+    encoded._encodedHeight = height_;
+    encoded.SetRtpTimestamp(frame.rtp_timestamp());
+    encoded.SetColorSpace(frame.color_space());
+    encoded.capture_time_ms_ = frame.render_time_ms();
+    const int64_t encode_finish_us = webrtc::TimeMicros();
+    encoded.SetEncodeTime(encode_before_us / webrtc::kNumMicrosecsPerMillisec,
+                          encode_finish_us / webrtc::kNumMicrosecsPerMillisec);
+    encoded.video_timing_mutable()->flags = webrtc::VideoSendTiming::kNotTriggered;
+
+    if (const char* lt = std::getenv("WEBRTC_LATENCY_TRACE"); lt && lt[0] == '1') {
+        static std::atomic<unsigned> enc_lat_n{0};
+        const unsigned n = ++enc_lat_n;
+        if ((n % 30u) == 0u) {
+            const double ms = static_cast<double>(encode_finish_us - encode_before_us) / 1000.0;
+            std::cout << "[Latency] MPP H264 encode put+get ms=" << ms << " sample#" << n << std::endl;
+        }
+    }
+
+    if (mpp_reports_intra) {
+        encoded._frameType = webrtc::VideoFrameType::kVideoFrameKey;
+    } else if (AnnexBHasIdrNalu(buf->data(), buf->size())) {
+        encoded._frameType = webrtc::VideoFrameType::kVideoFrameKey;
+    } else {
+        encoded._frameType = webrtc::VideoFrameType::kVideoFrameDelta;
+    }
+    if (encoded._frameType == webrtc::VideoFrameType::kVideoFrameKey) {
+        last_idr_emit_us_ = webrtc::TimeMicros();
+    }
+
+    qp_parser.ParseBitstream(encoded);
+    encoded.qp_ = qp_parser.GetLastSliceQp().value_or(-1);
+
+    const uint32_t trace_tid = next_video_frame_tracking_id_;
+    unsigned trace_every_n = 45u;
+    if (const char* ev = std::getenv("WEBRTC_MPP_ENC_TRACE_EVERY_N")) {
+        const int v = std::atoi(ev);
+        if (v >= 1 && v <= 600) {
+            trace_every_n = static_cast<unsigned>(v);
+        }
+    }
+    const bool trace_periodic_log = (trace_tid % trace_every_n == 0u);
+    encoded.SetVideoFrameTrackingId(trace_tid);
+    ++next_video_frame_tracking_id_;
+    webrtc::CodecSpecificInfo specifics{};
+    specifics.codecType = webrtc::kVideoCodecH264;
+    specifics.codecSpecific.H264.packetization_mode = h264_settings_.packetization_mode;
+    specifics.codecSpecific.H264.temporal_idx = webrtc::kNoTemporalIdx;
+    specifics.codecSpecific.H264.base_layer_sync = false;
+    specifics.codecSpecific.H264.idr_frame =
+        (encoded._frameType == webrtc::VideoFrameType::kVideoFrameKey);
+    const int64_t before_on_encoded_cb_us = webrtc::TimeMicros();
+    webrtc::EncodedImageCallback::Result res = callback_->OnEncodedImage(encoded, &specifics);
+    const int64_t after_on_encoded_cb_us = webrtc::TimeMicros();
+    const int64_t webrtc_onencodedimage_us = after_on_encoded_cb_us - before_on_encoded_cb_us;
+    if (MediaTimingTraceEnabled()) {
+        static std::atomic<unsigned> media_trace_n{0};
+        const unsigned n = ++media_trace_n;
+        if ((n % MediaTimingTraceEveryN()) == 0u) {
+            std::cout << "[MEDIA_TIMING][tx] t_us=" << after_on_encoded_cb_us << " trace_id="
+                      << static_cast<unsigned>(trace_tid) << " rtp_ts=" << encoded.RtpTimestamp()
+                      << " t_frame_ts_us=" << frame.timestamp_us() << " t_encode_done_us=" << encode_finish_us
+                      << " t_after_onencoded_us=" << after_on_encoded_cb_us
+                      << " onencoded_cb_cost_us=" << webrtc_onencodedimage_us << std::endl;
+        }
+    }
+    if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        static std::atomic<unsigned> enc_cb_n{0};
+        const unsigned n = ++enc_cb_n;
+        if ((n <= 5u) || ((n % 60u) == 0u)) {
+            std::cout << "[RkMppH264Dbg] OnEncodedImage #" << n << " size=" << encoded.size()
+                      << " type=" << (encoded._frameType == webrtc::VideoFrameType::kVideoFrameKey ? "key" : "delta")
+                      << " cb_error=" << static_cast<int>(res.error) << std::endl;
+        }
+    }
+    if (res.error != webrtc::EncodedImageCallback::Result::OK) {
+        std::cerr << "[RkMppH264Err] OnEncodedImage callback error=" << static_cast<int>(res.error) << std::endl;
+        return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    if (const char* e2e = std::getenv("WEBRTC_E2E_LATENCY_TRACE"); e2e && e2e[0] == '1') {
+        int64_t t_mjpeg_input_us = frame.timestamp_us();
+        int64_t t_v4l2_us = -1;
+        int64_t t_on_frame_us = -1;
+        int64_t wall_utc_ms = -1;
+        if (MppNativeDecFrameBuffer* e2e_native = MppNativeDecFrameBuffer::TryGet(vfb)) {
+            const int64_t mjpeg_us = e2e_native->mjpeg_input_timestamp_us();
+            if (mjpeg_us > 0) {
+                t_mjpeg_input_us = mjpeg_us;
+            }
+            t_v4l2_us = e2e_native->v4l2_timestamp_us();
+            t_on_frame_us = e2e_native->on_frame_enter_us();
+            wall_utc_ms = e2e_native->wall_capture_utc_ms();
+        }
+        std::cout << "[E2E_TX] rtp_ts=" << encoded.RtpTimestamp() << " trace_id=" << static_cast<unsigned>(trace_tid)
+                  << " t_mjpeg_input_us=" << t_mjpeg_input_us << " t_v4l2_us=" << t_v4l2_us
+                  << " t_on_frame_us=" << t_on_frame_us << " t_enc_done_us=" << encode_finish_us
+                  << " t_after_onencoded_us=" << after_on_encoded_cb_us << " wall_utc_ms=" << wall_utc_ms << std::endl;
+    }
+    if (trace_periodic_log) {
+        int64_t mjpeg_input_to_encode_done_us = encode_finish_us - frame.timestamp_us();
+        int64_t mjpeg_input_to_after_onencoded_us = after_on_encoded_cb_us - frame.timestamp_us();
+        int64_t usb_to_frame_timestamp_us = -1;
+        int64_t decode_queue_wait_us = -1;
+        if (MppNativeDecFrameBuffer* native_fb = MppNativeDecFrameBuffer::TryGet(vfb)) {
+            const int64_t mjpeg_input_us = native_fb->mjpeg_input_timestamp_us();
+            if (mjpeg_input_us > 0) {
+                mjpeg_input_to_encode_done_us = encode_finish_us - mjpeg_input_us;
+                mjpeg_input_to_after_onencoded_us = after_on_encoded_cb_us - mjpeg_input_us;
+            }
+            const int64_t v4l2_timestamp_us = native_fb->v4l2_timestamp_us();
+            if (v4l2_timestamp_us > 0) {
+                usb_to_frame_timestamp_us = frame.timestamp_us() - v4l2_timestamp_us;
+            }
+            decode_queue_wait_us = native_fb->decode_queue_wait_us();
+        }
+        std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: current_video_frame_tracking_id_=" << trace_tid
+                  << ", mjpeg_input_to_encode_done_us=" << mjpeg_input_to_encode_done_us << " ("
+                  << (static_cast<double>(mjpeg_input_to_encode_done_us) / 1000.0) << " ms)"
+                  << ", mjpeg_input_to_after_onencoded_us=" << mjpeg_input_to_after_onencoded_us << " ("
+                  << (static_cast<double>(mjpeg_input_to_after_onencoded_us) / 1000.0) << " ms)"
+                  << ", webrtc_onencodedimage_us=" << webrtc_onencodedimage_us << " ("
+                  << (static_cast<double>(webrtc_onencodedimage_us) / 1000.0) << " ms)"
+                  << ", usb_to_frame_timestamp_us=" << usb_to_frame_timestamp_us;
+        if (usb_to_frame_timestamp_us >= 0) {
+            std::cout << " (" << (static_cast<double>(usb_to_frame_timestamp_us) / 1000.0) << " ms)";
+        }
+        std::cout << ", decode_queue_wait_us=" << decode_queue_wait_us << " ("
+                  << (static_cast<double>(decode_queue_wait_us) / 1000.0) << " ms)"
+                  << ", on_frame_to_encode_enter_us=" << on_frame_to_encode_enter_us;
+        if (on_frame_to_encode_enter_us >= 0) {
+            std::cout << " (" << (static_cast<double>(on_frame_to_encode_enter_us) / 1000.0) << " ms)";
+        }
+        std::cout << std::endl;
+    }
+    if (const char* ev = std::getenv("WEBRTC_MJPEG_TO_H264_TRACE")) {
+        if (ev[0] != '0') {
+            static std::atomic<unsigned> g_pipe_n{0};
+            const unsigned pn = ++g_pipe_n;
+            if (pn % 30u == 0u) {
+                const int64_t delta_us = encode_finish_us - frame.timestamp_us();
+                std::cout << "[Pipe MJPEG→H264] frame#" << pn << " v4l2_mjpeg_process_start_to_h264_ready_us=" << delta_us
+                          << " (" << (static_cast<double>(delta_us) / 1000.0) << " ms)" << std::endl;
+            }
+        }
+    }
+    return WEBRTC_VIDEO_CODEC_OK;
+}
+
 int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                                  const std::vector<webrtc::VideoFrameType>* frame_types) {
     if (!initialized_ || !callback_ || !mpi_ || !mpp_ctx_) {
@@ -844,11 +1048,11 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     }
 
     const int64_t encode_before_us = webrtc::TimeMicros();
-    const bool use_sync_encode = []() {
+    bool use_sync_encode = []() {
         const char* e = std::getenv("WEBRTC_MPP_ENC_USE_SYNC");
         return e && e[0] == '1';
     }();
-    const bool use_task_encode = []() {
+    bool use_task_encode = []() {
         const char* e = std::getenv("WEBRTC_MPP_ENC_USE_TASK");
         return e && e[0] == '1';
     }();
@@ -866,7 +1070,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     MppTask output_task = nullptr;
     if (use_task_encode) {
         MppTask input_task = nullptr;
-        ret = mpi->poll(ctx, MPP_PORT_INPUT, 10);
+        ret = mpi->poll(ctx, MPP_PORT_INPUT, MPP_POLL_BLOCK);
         if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
             std::cout << "[RkMppH264Dbg] poll input ret=" << ret << std::endl;
         }
@@ -897,7 +1101,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             std::cerr << "[RkMppH264Err] enqueue input ret=" << ret << std::endl;
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
-        ret = mpi->poll(ctx, MPP_PORT_OUTPUT, 10);
+        ret = mpi->poll(ctx, MPP_PORT_OUTPUT, MPP_POLL_BLOCK);
         if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
             std::cout << "[RkMppH264Dbg] poll output(task) ret=" << ret << std::endl;
         }
@@ -980,9 +1184,11 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         }
     }
 
-    webrtc::H264BitstreamParser qp_parser;
-    // mpi_enc_test：非分片码流每帧通常一包，外层 eoi 初值为 1，仅分片模式用 mpp_packet_is_eoi 拼帧。
+    // mpi_enc_test：非分片时每帧通常一包（is_part==0 即 EOI）；分片模式下多包需拼满再 OnEncodedImage。
+    split_assembly_buf_.clear();
+    const int max_pkt_iterations = split_by_byte_enabled_ ? 2048 : 64;
     bool frame_output_done = false;
+    bool mpp_intra_hint = false;
     int safety = 0;
     do {
         if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
@@ -1025,190 +1231,44 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         }
         const RK_U32 is_part = mpp_packet_is_partition(out_pkt);
         const bool pkt_eoi = (is_part == 0) || (mpp_packet_is_eoi(out_pkt) != 0);
+        {
+            RK_S32 intra = 0;
+            if (mpp_packet_has_meta(out_pkt) &&
+                mpp_meta_get_s32(mpp_packet_get_meta(out_pkt), KEY_OUTPUT_INTRA, &intra) == MPP_OK && intra) {
+                mpp_intra_hint = true;
+            }
+        }
         const size_t len = mpp_packet_get_length(out_pkt);
         void* pos = mpp_packet_get_pos(out_pkt);
         if (len > 0 && pos) {
             const uint8_t* raw = static_cast<const uint8_t*>(pos);
-            webrtc::scoped_refptr<webrtc::EncodedImageBuffer> buf;
-            if (!webrtc::H264::FindNaluIndices(webrtc::ArrayView<const uint8_t>(raw, len)).empty()) {
-                buf = webrtc::EncodedImageBuffer::Create(len);
-                memcpy(buf->data(), raw, len);
-            } else {
-                bool annex_ok = FillAvcLengthPrefixedToAnnexB(raw, len, &annex_scratch_);
-                if (!annex_ok) {
-                    annex_ok = FillAvcLengthPrefixed16ToAnnexB(raw, len, &annex_scratch_);
-                }
-                if (!annex_ok) {
-                    annex_ok = FillRawSingleNalToAnnexB(raw, len, &annex_scratch_);
-                }
-                if (!annex_ok) {
-                    mpp_packet_deinit(&out_pkt);
-                    RTC_LOG(LS_WARNING) << "[RkMppH264] unparseable bitstream, request SW fallback; len="
-                                        << len;
-                    std::cerr << "[RkMppH264Err] unparseable bitstream len=" << len
-                              << ", request SW fallback" << std::endl;
-                    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
-                }
-                buf = webrtc::EncodedImageBuffer::Create(annex_scratch_.size());
-                memcpy(buf->data(), annex_scratch_.data(), annex_scratch_.size());
-            }
-            webrtc::EncodedImage encoded;
-            encoded.SetEncodedData(buf);
-            encoded._encodedWidth = width_;
-            encoded._encodedHeight = height_;
-            encoded.SetRtpTimestamp(frame.rtp_timestamp());
-            encoded.SetColorSpace(frame.color_space());
-            encoded.capture_time_ms_ = frame.render_time_ms();
-            // 与 VideoFrame::timestamp_us（同 webrtc::TimeMicros）对齐，供 video-timing 扩展算 delta。
-            const int64_t encode_finish_us = webrtc::TimeMicros();
-            encoded.SetEncodeTime(encode_before_us / webrtc::kNumMicrosecsPerMillisec,
-                                  encode_finish_us / webrtc::kNumMicrosecsPerMillisec);
-            encoded.video_timing_mutable()->flags = webrtc::VideoSendTiming::kNotTriggered;
-
-            if (const char* lt = std::getenv("WEBRTC_LATENCY_TRACE"); lt && lt[0] == '1') {
-                static std::atomic<unsigned> enc_lat_n{0};
-                const unsigned n = ++enc_lat_n;
-                if ((n % 30u) == 0u) {
-                    const double ms = static_cast<double>(encode_finish_us - encode_before_us) / 1000.0;
-                    std::cout << "[Latency] MPP H264 encode put+get ms=" << ms << " sample#" << n << std::endl;
-                }
-            }
-
-            RK_S32 intra = 0;
-            if (mpp_packet_has_meta(out_pkt) &&
-                mpp_meta_get_s32(mpp_packet_get_meta(out_pkt), KEY_OUTPUT_INTRA, &intra) == MPP_OK &&
-                intra) {
-                encoded._frameType = webrtc::VideoFrameType::kVideoFrameKey;
-            } else if (AnnexBHasIdrNalu(buf->data(), buf->size())) {
-                encoded._frameType = webrtc::VideoFrameType::kVideoFrameKey;
-            } else {
-                encoded._frameType = webrtc::VideoFrameType::kVideoFrameDelta;
-            }
-            if (encoded._frameType == webrtc::VideoFrameType::kVideoFrameKey) {
-                last_idr_emit_us_ = webrtc::TimeMicros();
-            }
-
-            qp_parser.ParseBitstream(encoded);
-            encoded.qp_ = qp_parser.GetLastSliceQp().value_or(-1);
-
-            const uint32_t trace_tid = next_video_frame_tracking_id_;
-            unsigned trace_every_n = 45u;
-            if (const char* ev = std::getenv("WEBRTC_MPP_ENC_TRACE_EVERY_N")) {
-                const int v = std::atoi(ev);
-                if (v >= 1 && v <= 600) {
-                    trace_every_n = static_cast<unsigned>(v);
-                }
-            }
-            const bool trace_periodic_log = (trace_tid % trace_every_n == 0u);
-            encoded.SetVideoFrameTrackingId(trace_tid);
-            ++next_video_frame_tracking_id_;
-            webrtc::CodecSpecificInfo specifics{};
-            specifics.codecType = webrtc::kVideoCodecH264;
-            specifics.codecSpecific.H264.packetization_mode = h264_settings_.packetization_mode;
-            specifics.codecSpecific.H264.temporal_idx = webrtc::kNoTemporalIdx;
-            specifics.codecSpecific.H264.base_layer_sync = false;
-            specifics.codecSpecific.H264.idr_frame =
-                (encoded._frameType == webrtc::VideoFrameType::kVideoFrameKey);
-            const int64_t before_on_encoded_cb_us = webrtc::TimeMicros();
-            webrtc::EncodedImageCallback::Result res =
-                callback_->OnEncodedImage(encoded, &specifics);
-            const int64_t after_on_encoded_cb_us = webrtc::TimeMicros();
-            const int64_t webrtc_onencodedimage_us = after_on_encoded_cb_us - before_on_encoded_cb_us;
-            if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
-                static std::atomic<unsigned> enc_cb_n{0};
-                const unsigned n = ++enc_cb_n;
-                if ((n <= 5u) || ((n % 60u) == 0u)) {
-                    std::cout << "[RkMppH264Dbg] OnEncodedImage #" << n << " size=" << encoded.size()
-                              << " type=" << (encoded._frameType == webrtc::VideoFrameType::kVideoFrameKey ? "key" : "delta")
-                              << " cb_error=" << static_cast<int>(res.error) << std::endl;
-                }
-            }
-            if (res.error != webrtc::EncodedImageCallback::Result::OK) {
-                mpp_packet_deinit(&out_pkt);
-                std::cerr << "[RkMppH264Err] OnEncodedImage callback error=" << static_cast<int>(res.error)
-                          << std::endl;
-                return WEBRTC_VIDEO_CODEC_ERROR;
-            }
-            if (const char* e2e = std::getenv("WEBRTC_E2E_LATENCY_TRACE"); e2e && e2e[0] == '1') {
-                int64_t t_mjpeg_input_us = frame.timestamp_us();
-                int64_t t_v4l2_us = -1;
-                int64_t t_on_frame_us = -1;
-                int64_t wall_utc_ms = -1;
-                if (MppNativeDecFrameBuffer* e2e_native = MppNativeDecFrameBuffer::TryGet(vfb)) {
-                    const int64_t mjpeg_us = e2e_native->mjpeg_input_timestamp_us();
-                    if (mjpeg_us > 0) {
-                        t_mjpeg_input_us = mjpeg_us;
-                    }
-                    t_v4l2_us = e2e_native->v4l2_timestamp_us();
-                    t_on_frame_us = e2e_native->on_frame_enter_us();
-                    wall_utc_ms = e2e_native->wall_capture_utc_ms();
-                }
-                std::cout << "[E2E_TX] rtp_ts=" << encoded.RtpTimestamp() << " trace_id="
-                          << static_cast<unsigned>(trace_tid) << " t_mjpeg_input_us=" << t_mjpeg_input_us
-                          << " t_v4l2_us=" << t_v4l2_us << " t_on_frame_us=" << t_on_frame_us
-                          << " t_enc_done_us=" << encode_finish_us
-                          << " t_after_onencoded_us=" << after_on_encoded_cb_us << " wall_utc_ms=" << wall_utc_ms
-                          << std::endl;
-            }
-            if (trace_periodic_log) {
-                int64_t mjpeg_input_to_encode_done_us = encode_finish_us - frame.timestamp_us();
-                int64_t mjpeg_input_to_after_onencoded_us = after_on_encoded_cb_us - frame.timestamp_us();
-                int64_t usb_to_frame_timestamp_us = -1;
-                int64_t decode_queue_wait_us = -1;
-                if (MppNativeDecFrameBuffer* native_fb = MppNativeDecFrameBuffer::TryGet(vfb)) {
-                    const int64_t mjpeg_input_us = native_fb->mjpeg_input_timestamp_us();
-                    if (mjpeg_input_us > 0) {
-                        mjpeg_input_to_encode_done_us = encode_finish_us - mjpeg_input_us;
-                        mjpeg_input_to_after_onencoded_us = after_on_encoded_cb_us - mjpeg_input_us;
-                    }
-                    const int64_t v4l2_timestamp_us = native_fb->v4l2_timestamp_us();
-                    if (v4l2_timestamp_us > 0) {
-                        usb_to_frame_timestamp_us = frame.timestamp_us() - v4l2_timestamp_us;
-                    }
-                    decode_queue_wait_us = native_fb->decode_queue_wait_us();
-                }
-                std::cout << "[" << CurrentLocalDateTimeYmdHmsMs() << "]: current_video_frame_tracking_id_="
-                          << trace_tid
-                          << ", mjpeg_input_to_encode_done_us=" << mjpeg_input_to_encode_done_us
-                          << " (" << (static_cast<double>(mjpeg_input_to_encode_done_us) / 1000.0) << " ms)"
-                          << ", mjpeg_input_to_after_onencoded_us=" << mjpeg_input_to_after_onencoded_us
-                          << " (" << (static_cast<double>(mjpeg_input_to_after_onencoded_us) / 1000.0) << " ms)"
-                          << ", webrtc_onencodedimage_us=" << webrtc_onencodedimage_us
-                          << " (" << (static_cast<double>(webrtc_onencodedimage_us) / 1000.0) << " ms)"
-                          << ", usb_to_frame_timestamp_us=" << usb_to_frame_timestamp_us;
-                if (usb_to_frame_timestamp_us >= 0) {
-                    std::cout << " (" << (static_cast<double>(usb_to_frame_timestamp_us) / 1000.0) << " ms)";
-                }
-                std::cout << ", decode_queue_wait_us=" << decode_queue_wait_us
-                          << " (" << (static_cast<double>(decode_queue_wait_us) / 1000.0) << " ms)"
-                          << ", on_frame_to_encode_enter_us=" << on_frame_to_encode_enter_us;
-                if (on_frame_to_encode_enter_us >= 0) {
-                    std::cout << " (" << (static_cast<double>(on_frame_to_encode_enter_us) / 1000.0) << " ms)";
-                }
-                std::cout << std::endl;
-            }
-            if (const char* ev = std::getenv("WEBRTC_MJPEG_TO_H264_TRACE")) {
-                if (ev[0] != '0') {
-                    static std::atomic<unsigned> g_pipe_n{0};
-                    const unsigned pn = ++g_pipe_n;
-                    if (pn % 30u == 0u) {
-                        const int64_t delta_us = encode_finish_us - frame.timestamp_us();
-                        std::cout << "[Pipe MJPEG→H264] frame#" << pn
-                                  << " v4l2_mjpeg_process_start_to_h264_ready_us=" << delta_us << " ("
-                                  << (static_cast<double>(delta_us) / 1000.0) << " ms)" << std::endl;
-                    }
-                }
-            }
+            split_assembly_buf_.insert(split_assembly_buf_.end(), raw, raw + len);
         }
         mpp_packet_deinit(&out_pkt);
         if (pkt_eoi) {
+            if (split_assembly_buf_.empty()) {
+                RTC_LOG(LS_ERROR) << "[RkMppH264] encoder EOI but assembly buffer empty";
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            const int32_t emit_ret =
+                EmitAssembledFrame(frame, vfb, encode_before_us, on_frame_to_encode_enter_us, mpp_intra_hint);
+            if (emit_ret != WEBRTC_VIDEO_CODEC_OK) {
+                return emit_ret;
+            }
+            split_assembly_buf_.clear();
+            mpp_intra_hint = false;
             frame_output_done = true;
         }
-        if (++safety > 64) {
+        if (++safety > max_pkt_iterations) {
             RTC_LOG(LS_ERROR) << "[RkMppH264] encode_get_packet exceeded safety iterations";
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
     } while (!frame_output_done);
+    if (!frame_output_done) {
+        split_assembly_buf_.clear();
+        RTC_LOG(LS_ERROR) << "[RkMppH264] encoder output finished without EOI (no complete frame)";
+        return WEBRTC_VIDEO_CODEC_ERROR;
+    }
     if (prebound_pkt) {
         mpp_packet_deinit(&prebound_pkt);
     }
