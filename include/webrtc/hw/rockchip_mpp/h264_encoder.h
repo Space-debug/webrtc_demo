@@ -84,6 +84,14 @@ class RkMppH264Encoder final : public webrtc::VideoEncoder {
   int recover_soft_fail_threshold_{6};
   int recover_hard_fail_threshold_{30};
   bool recover_disable_split_on_failure_{true};
+  bool debug_enabled_{false};
+  bool latency_trace_enabled_{false};
+  bool e2e_trace_enabled_{false};
+  bool mjpeg_to_h264_trace_enabled_{false};
+  bool use_sync_encode_{false};
+  bool use_task_encode_{false};
+  bool task_read_packet_{true};
+  unsigned trace_every_n_{45};
 
   bool initialized_{false};
   /// Annex-B 转换复用缓冲，避免每帧 std::vector 堆分配（容量随帧增长后保持稳定）。

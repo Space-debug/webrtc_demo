@@ -435,6 +435,15 @@ int RkMppH264Encoder::InitEncode(const webrtc::VideoCodec* inst,
     recover_soft_fail_threshold_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_RECOVER_SOFT_FAILS", 6, 1, 200);
     recover_hard_fail_threshold_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_RECOVER_HARD_FAILS", 30, 2, 500);
     recover_disable_split_on_failure_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_RECOVER_DISABLE_SPLIT", 1, 0, 1) == 1;
+    debug_enabled_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_DEBUG", 0, 0, 1) == 1;
+    latency_trace_enabled_ = ReadEnvIntInRange("WEBRTC_LATENCY_TRACE", 0, 0, 1) == 1;
+    e2e_trace_enabled_ = ReadEnvIntInRange("WEBRTC_E2E_LATENCY_TRACE", 0, 0, 1) == 1;
+    mjpeg_to_h264_trace_enabled_ = ReadEnvIntInRange("WEBRTC_MJPEG_TO_H264_TRACE", 0, 0, 1) == 1;
+    use_sync_encode_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_USE_SYNC", 0, 0, 1) == 1;
+    use_task_encode_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_USE_TASK", 0, 0, 1) == 1;
+    task_read_packet_ = ReadEnvIntInRange("WEBRTC_MPP_ENC_TASK_READ_PACKET", 1, 0, 1) == 1;
+    trace_every_n_ =
+        static_cast<unsigned>(ReadEnvIntInRange("WEBRTC_MPP_ENC_TRACE_EVERY_N", 45, 1, 600));
 
     MppCtx ctx = nullptr;
     MppApi* mpi = nullptr;
@@ -555,7 +564,7 @@ int RkMppH264Encoder::InitEncode(const webrtc::VideoCodec* inst,
     if (mpi->control(ctx, MPP_ENC_SET_HEADER_MODE, &header_mode) != MPP_OK) {
         RTC_LOG(LS_WARNING) << "[RkMppH264] MPP_ENC_SET_HEADER_MODE failed";
     }
-    if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+    if (debug_enabled_) {
         MppPacket extra = nullptr;
         if (mpi->control(ctx, MPP_ENC_GET_EXTRA_INFO, &extra) == MPP_OK && extra) {
             std::cout << "[RkMppH264Dbg] extra_info len=" << mpp_packet_get_length(extra) << std::endl;
@@ -630,7 +639,7 @@ int RkMppH264Encoder::InitEncode(const webrtc::VideoCodec* inst,
     buf_grp_ = grp;
     frm_buf_ = fb;
     pkt_buf_ = pb;
-    if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+    if (debug_enabled_) {
         std::cout << "[RkMppH264Dbg] buffer type=" << static_cast<int>(chosen_buf_type)
                   << " frm_fd=" << mpp_buffer_get_fd(reinterpret_cast<MppBuffer>(frm_buf_))
                   << " pkt_fd=" << mpp_buffer_get_fd(reinterpret_cast<MppBuffer>(pkt_buf_))
@@ -685,7 +694,7 @@ void RkMppH264Encoder::SetRates(const webrtc::VideoEncoder::RateControlParameter
     }
     min_bps_ = std::max(10'000, target_bps_ * 3 / 4);
     max_bps_ = std::max(target_bps_, min_bps_) * 4 / 3;
-    if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+    if (debug_enabled_) {
         std::cout << "[RkMppH264Dbg] SetRates sum_bps=" << sum << " target_bps=" << target_bps_
                   << " min_bps=" << min_bps_ << " max_bps=" << max_bps_
                   << " fps=" << parameters.framerate_fps << std::endl;
@@ -751,7 +760,7 @@ int32_t RkMppH264Encoder::EmitAssembledFrame(const webrtc::VideoFrame& frame,
                           encode_finish_us / webrtc::kNumMicrosecsPerMillisec);
     encoded.video_timing_mutable()->flags = webrtc::VideoSendTiming::kNotTriggered;
 
-    if (const char* lt = std::getenv("WEBRTC_LATENCY_TRACE"); lt && lt[0] == '1') {
+    if (latency_trace_enabled_) {
         static std::atomic<unsigned> enc_lat_n{0};
         const unsigned n = ++enc_lat_n;
         if ((n % 30u) == 0u) {
@@ -775,14 +784,7 @@ int32_t RkMppH264Encoder::EmitAssembledFrame(const webrtc::VideoFrame& frame,
     encoded.qp_ = qp_parser.GetLastSliceQp().value_or(-1);
 
     const uint32_t trace_tid = next_video_frame_tracking_id_;
-    unsigned trace_every_n = 45u;
-    if (const char* ev = std::getenv("WEBRTC_MPP_ENC_TRACE_EVERY_N")) {
-        const int v = std::atoi(ev);
-        if (v >= 1 && v <= 600) {
-            trace_every_n = static_cast<unsigned>(v);
-        }
-    }
-    const bool trace_periodic_log = (trace_tid % trace_every_n == 0u);
+    const bool trace_periodic_log = (trace_tid % trace_every_n_ == 0u);
     encoded.SetVideoFrameTrackingId(trace_tid);
     ++next_video_frame_tracking_id_;
     webrtc::CodecSpecificInfo specifics{};
@@ -807,7 +809,7 @@ int32_t RkMppH264Encoder::EmitAssembledFrame(const webrtc::VideoFrame& frame,
                       << " onencoded_cb_cost_us=" << webrtc_onencodedimage_us << std::endl;
         }
     }
-    if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+    if (debug_enabled_) {
         static std::atomic<unsigned> enc_cb_n{0};
         const unsigned n = ++enc_cb_n;
         if ((n <= 5u) || ((n % 60u) == 0u)) {
@@ -820,7 +822,7 @@ int32_t RkMppH264Encoder::EmitAssembledFrame(const webrtc::VideoFrame& frame,
         std::cerr << "[RkMppH264Err] OnEncodedImage callback error=" << static_cast<int>(res.error) << std::endl;
         return WEBRTC_VIDEO_CODEC_ERROR;
     }
-    if (const char* e2e = std::getenv("WEBRTC_E2E_LATENCY_TRACE"); e2e && e2e[0] == '1') {
+    if (e2e_trace_enabled_) {
         int64_t t_mjpeg_input_us = frame.timestamp_us();
         int64_t t_v4l2_us = -1;
         int64_t t_on_frame_us = -1;
@@ -875,15 +877,13 @@ int32_t RkMppH264Encoder::EmitAssembledFrame(const webrtc::VideoFrame& frame,
         }
         std::cout << std::endl;
     }
-    if (const char* ev = std::getenv("WEBRTC_MJPEG_TO_H264_TRACE")) {
-        if (ev[0] != '0') {
-            static std::atomic<unsigned> g_pipe_n{0};
-            const unsigned pn = ++g_pipe_n;
-            if (pn % 30u == 0u) {
-                const int64_t delta_us = encode_finish_us - frame.timestamp_us();
-                std::cout << "[Pipe MJPEG→H264] frame#" << pn << " v4l2_mjpeg_process_start_to_h264_ready_us=" << delta_us
-                          << " (" << (static_cast<double>(delta_us) / 1000.0) << " ms)" << std::endl;
-            }
+    if (mjpeg_to_h264_trace_enabled_) {
+        static std::atomic<unsigned> g_pipe_n{0};
+        const unsigned pn = ++g_pipe_n;
+        if (pn % 30u == 0u) {
+            const int64_t delta_us = encode_finish_us - frame.timestamp_us();
+            std::cout << "[Pipe MJPEG→H264] frame#" << pn << " v4l2_mjpeg_process_start_to_h264_ready_us=" << delta_us
+                      << " (" << (static_cast<double>(delta_us) / 1000.0) << " ms)" << std::endl;
         }
     }
     return WEBRTC_VIDEO_CODEC_OK;
@@ -913,7 +913,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     if (!initialized_ || !callback_ || !mpi_ || !mpp_ctx_) {
         return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
     }
-    if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+    if (debug_enabled_) {
         static std::atomic<unsigned> enc_call_n{0};
         const unsigned n = ++enc_call_n;
         if ((n <= 5u) || ((n % 60u) == 0u)) {
@@ -1072,15 +1072,9 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     }
 
     const int64_t encode_before_us = webrtc::TimeMicros();
-    bool use_sync_encode = []() {
-        const char* e = std::getenv("WEBRTC_MPP_ENC_USE_SYNC");
-        return e && e[0] == '1';
-    }();
-    bool use_task_encode = []() {
-        const char* e = std::getenv("WEBRTC_MPP_ENC_USE_TASK");
-        return e && e[0] == '1';
-    }();
-    if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+    const bool use_sync_encode = use_sync_encode_;
+    const bool use_task_encode = use_task_encode_;
+    if (debug_enabled_) {
         std::cout << "[RkMppH264Dbg] before "
                   << (use_task_encode ? "task_encode" : (use_sync_encode ? "encode" : "encode_put_frame"))
                   << " ts_us=" << frame.timestamp_us() << std::endl;
@@ -1107,7 +1101,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     if (use_task_encode) {
         MppTask input_task = nullptr;
         ret = mpi->poll(ctx, MPP_PORT_INPUT, MPP_POLL_BLOCK);
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] poll input ret=" << ret << std::endl;
         }
         if (ret != MPP_OK) {
@@ -1116,7 +1110,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
         ret = mpi->dequeue(ctx, MPP_PORT_INPUT, &input_task);
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] dequeue input ret=" << ret << " task=" << (input_task ? 1 : 0) << std::endl;
         }
         if (ret != MPP_OK || !input_task) {
@@ -1130,7 +1124,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         }
         ret = mpi->enqueue(ctx, MPP_PORT_INPUT, input_task);
         mpp_frame_deinit(&mframe);
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] enqueue input ret=" << ret << std::endl;
         }
         if (ret != MPP_OK) {
@@ -1138,7 +1132,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
         ret = mpi->poll(ctx, MPP_PORT_OUTPUT, MPP_POLL_BLOCK);
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] poll output(task) ret=" << ret << std::endl;
         }
         if (ret != MPP_OK) {
@@ -1146,7 +1140,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             return recover_or_error("task_poll_output", ret);
         }
         ret = mpi->dequeue(ctx, MPP_PORT_OUTPUT, &output_task);
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] dequeue output ret=" << ret << " task=" << (output_task ? 1 : 0)
                       << std::endl;
         }
@@ -1155,13 +1149,10 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             return recover_or_error("task_dequeue_output", ret);
         }
         // task 模式默认必须读取 KEY_OUTPUT_PACKET；关闭仅用于定位兼容性问题。
-        const bool task_read_packet = []() {
-            const char* e = std::getenv("WEBRTC_MPP_ENC_TASK_READ_PACKET");
-            return !e || e[0] != '0';
-        }();
+        const bool task_read_packet = task_read_packet_;
         if (task_read_packet) {
             ret = mpp_task_meta_get_packet(output_task, KEY_OUTPUT_PACKET, &first_out_pkt);
-            if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+            if (debug_enabled_) {
                 std::cout << "[RkMppH264Dbg] get output packet ret=" << ret
                           << " pkt=" << (first_out_pkt ? 1 : 0) << std::endl;
             }
@@ -1170,13 +1161,13 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
                           << " pkt=" << (first_out_pkt ? 1 : 0) << std::endl;
                 return recover_or_error("task_get_packet", ret);
             }
-        } else if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        } else if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] task output dequeued; packet read skipped by env" << std::endl;
         }
     } else if (use_sync_encode) {
         ret = mpi->encode(ctx, mframe, &first_out_pkt);
         mpp_frame_deinit(&mframe);
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] after encode ret=" << ret
                       << " first_pkt=" << (first_out_pkt ? 1 : 0) << std::endl;
         }
@@ -1220,7 +1211,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
             }
         }
         mpp_frame_deinit(&mframe);
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] after encode_put_frame ret=" << ret << std::endl;
         }
         if (ret != MPP_OK) {
@@ -1237,7 +1228,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
     bool mpp_intra_hint = false;
     int safety = 0;
     do {
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             static std::atomic<unsigned> get_pkt_n{0};
             const unsigned n = ++get_pkt_n;
             if ((n <= 5u) || ((n % 60u) == 0u)) {
@@ -1246,7 +1237,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         }
         if ((use_sync_encode || use_task_encode) && !first_out_pkt) {
             MPP_RET poll_ret = mpi->poll(ctx, MPP_PORT_OUTPUT, MPP_POLL_NON_BLOCK);
-            if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+            if (debug_enabled_) {
                 std::cout << "[RkMppH264Dbg] poll output ret=" << poll_ret << std::endl;
             }
         }
@@ -1319,7 +1310,7 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         mpp_packet_deinit(&prebound_pkt);
     }
     if (output_task) {
-        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+        if (debug_enabled_) {
             std::cout << "[RkMppH264Dbg] enqueue output task back" << std::endl;
         }
         mpi->enqueue(ctx, MPP_PORT_OUTPUT, output_task);
