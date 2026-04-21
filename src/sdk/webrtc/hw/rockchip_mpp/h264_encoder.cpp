@@ -1105,27 +1105,41 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
             std::cout << "[RkMppH264Dbg] poll output(task) ret=" << ret << std::endl;
         }
-        if (ret == MPP_OK) {
-            ret = mpi->dequeue(ctx, MPP_PORT_OUTPUT, &output_task);
+        if (ret != MPP_OK) {
+            std::cerr << "[RkMppH264Err] poll output(task) ret=" << ret << std::endl;
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
+        ret = mpi->dequeue(ctx, MPP_PORT_OUTPUT, &output_task);
+        if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+            std::cout << "[RkMppH264Dbg] dequeue output ret=" << ret << " task=" << (output_task ? 1 : 0)
+                      << std::endl;
+        }
+        if (ret != MPP_OK || !output_task) {
+            std::cerr << "[RkMppH264Err] dequeue output(task) ret=" << ret << std::endl;
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
+        // task 模式默认必须读取 KEY_OUTPUT_PACKET；关闭仅用于定位兼容性问题。
+        const bool task_read_packet = []() {
+            const char* e = std::getenv("WEBRTC_MPP_ENC_TASK_READ_PACKET");
+            return !e || e[0] != '0';
+        }();
+        if (task_read_packet) {
+            ret = mpp_task_meta_get_packet(output_task, KEY_OUTPUT_PACKET, &first_out_pkt);
             if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
-                std::cout << "[RkMppH264Dbg] dequeue output ret=" << ret << " task=" << (output_task ? 1 : 0)
-                          << std::endl;
+                std::cout << "[RkMppH264Dbg] get output packet ret=" << ret
+                          << " pkt=" << (first_out_pkt ? 1 : 0) << std::endl;
             }
-            if (ret == MPP_OK && output_task) {
-                const bool task_read_packet = []() {
-                    const char* e = std::getenv("WEBRTC_MPP_ENC_TASK_READ_PACKET");
-                    return e && e[0] == '1';
-                }();
-                if (task_read_packet) {
-                    ret = mpp_task_meta_get_packet(output_task, KEY_OUTPUT_PACKET, &first_out_pkt);
-                    if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
-                        std::cout << "[RkMppH264Dbg] get output packet ret=" << ret
-                                  << " pkt=" << (first_out_pkt ? 1 : 0) << std::endl;
-                    }
-                } else if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
-                    std::cout << "[RkMppH264Dbg] task output dequeued; packet read skipped" << std::endl;
+            if (ret != MPP_OK || !first_out_pkt) {
+                std::cerr << "[RkMppH264Err] task output has no packet ret=" << ret
+                          << " pkt=" << (first_out_pkt ? 1 : 0) << std::endl;
+                if (output_task) {
+                    mpi->enqueue(ctx, MPP_PORT_OUTPUT, output_task);
+                    output_task = nullptr;
                 }
+                return WEBRTC_VIDEO_CODEC_ERROR;
             }
+        } else if (const char* dbg = std::getenv("WEBRTC_MPP_ENC_DEBUG"); dbg && dbg[0] == '1') {
+            std::cout << "[RkMppH264Dbg] task output dequeued; packet read skipped by env" << std::endl;
         }
     } else if (use_sync_encode) {
         ret = mpi->encode(ctx, mframe, &first_out_pkt);
