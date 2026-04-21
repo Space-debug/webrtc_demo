@@ -686,13 +686,20 @@ private:
                 std::optional<double>(static_cast<double>(recv_config_.common.jitter_buffer_min_delay_ms) / 1000.0));
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        if (video_track_) {
+        const bool same_track = (video_track_.get() == vt);
+        const bool same_receiver = (video_rtp_receiver_.get() == r.get());
+        if (same_track && same_receiver) {
+            return;
+        }
+        if (video_track_ && !same_track) {
             video_track_->RemoveSink(video_sink_.get());
         }
         video_track_ = vt;
         video_rtp_receiver_ = std::move(r);
-        video_track_->AddOrUpdateSink(video_sink_.get(), webrtc::VideoSinkWants());
-        std::cout << "[PullSubscriber] Video track attached" << std::endl;
+        if (!same_track) {
+            video_track_->AddOrUpdateSink(video_sink_.get(), webrtc::VideoSinkWants());
+            std::cout << "[PullSubscriber] Video track attached" << std::endl;
+        }
     }
 };
 
