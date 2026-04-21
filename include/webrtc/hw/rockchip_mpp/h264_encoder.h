@@ -46,6 +46,8 @@ class RkMppH264Encoder final : public webrtc::VideoEncoder {
                              int64_t encode_before_us,
                              int64_t on_frame_to_encode_enter_us,
                              bool mpp_reports_intra);
+  /// 编码输出异常时执行软恢复（丢当前帧/必要时关闭分片），返回是否可继续会话。
+  bool HandleOutputFailureAndMaybeRecover(const char* stage, int err_code);
 
   const webrtc::Environment& env_;
   webrtc::H264EncoderSettings h264_settings_;
@@ -78,6 +80,10 @@ class RkMppH264Encoder final : public webrtc::VideoEncoder {
   int idr_force_max_wait_ms_{0};
   int64_t last_forced_idr_ctrl_us_{-1};
   int64_t last_idr_emit_us_{-1};
+  int consecutive_output_failures_{0};
+  int recover_soft_fail_threshold_{6};
+  int recover_hard_fail_threshold_{30};
+  bool recover_disable_split_on_failure_{true};
 
   bool initialized_{false};
   /// Annex-B 转换复用缓冲，避免每帧 std::vector 堆分配（容量随帧增长后保持稳定）。
