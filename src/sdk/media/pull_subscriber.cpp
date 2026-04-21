@@ -34,6 +34,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -302,8 +303,11 @@ public:
 class VideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
 public:
     using Callback = PullSubscriber::OnVideoFrameCallback;
-    explicit VideoSink(Callback cb, bool skip_argb_conversion)
-        : on_frame_(std::move(cb)), skip_argb_conversion_(skip_argb_conversion) {}
+    using StatsCallback = std::function<void(uint16_t trace_id, int64_t t_callback_done_us)>;
+    explicit VideoSink(Callback cb, bool skip_argb_conversion, StatsCallback stats_cb = nullptr)
+        : on_frame_(std::move(cb)),
+          skip_argb_conversion_(skip_argb_conversion),
+          on_frame_stats_(std::move(stats_cb)) {}
 
     void OnFrame(const webrtc::VideoFrame& frame) override {
         const bool e2e_trace = (std::getenv("WEBRTC_E2E_LATENCY_TRACE") != nullptr &&
@@ -332,6 +336,9 @@ public:
             }
             const int64_t t_callback_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
             on_frame_(nullptr, w, h, 0, frame.id(), t_callback_done_us);
+            if (on_frame_stats_) {
+                on_frame_stats_(frame.id(), t_callback_done_us);
+            }
             if (MediaTimingTraceEnabled()) {
                 static std::atomic<unsigned> media_sink_n{0};
                 const unsigned n_trace = ++media_sink_n;
@@ -367,6 +374,9 @@ public:
         }
         const int64_t t_callback_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
         on_frame_(argb_.data(), w, h, stride, frame.id(), t_callback_done_us);
+        if (on_frame_stats_) {
+            on_frame_stats_(frame.id(), t_callback_done_us);
+        }
         if (MediaTimingTraceEnabled()) {
             static std::atomic<unsigned> media_sink_n{0};
             const unsigned n_trace = ++media_sink_n;
@@ -389,6 +399,7 @@ public:
 private:
     Callback on_frame_;
     bool skip_argb_conversion_{false};
+    StatsCallback on_frame_stats_;
     std::vector<uint8_t> argb_;
 };
 
@@ -396,10 +407,35 @@ class PullSubscriber::Impl : public webrtc::PeerConnectionObserver {
 public:
     Impl(const std::string& url, const std::string& stream_id, const PullSubscriberConfig& recv)
         : signaling_(std::make_unique<webrtc_demo::SignalingClient>(url, "subscriber", stream_id)),
-          recv_config_(recv) {}
+          recv_config_(recv) {
+        stats_.t_construct_us = SignalingNowUs();
+    }
+
+    void OnSinkFrame(uint16_t trace_id, int64_t t_callback_done_us) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const int64_t now_us = t_callback_done_us > 0 ? t_callback_done_us : SignalingNowUs();
+        ++stats_.frames_sink_total;
+        stats_.last_frame_us = now_us;
+        stats_.last_trace_id = trace_id;
+        if (stats_.first_frame_us <= 0) {
+            stats_.first_frame_us = now_us;
+            std::ostringstream oss;
+            oss << "frames=" << stats_.frames_sink_total << " trace_id=" << static_cast<unsigned>(trace_id);
+            if (stats_.t_connected_us > 0 && stats_.first_frame_us >= stats_.t_connected_us) {
+                oss << " connected_to_first_frame_ms="
+                    << (stats_.first_frame_us - stats_.t_connected_us) / 1000.0;
+            }
+            TracePathStat("RX_FIRST_FRAME", oss.str());
+        } else if (stats_.frames_sink_total % 120 == 0) {
+            std::ostringstream oss;
+            oss << "frames=" << stats_.frames_sink_total << " trace_id=" << static_cast<unsigned>(trace_id);
+            TracePathStat("RX_FRAME_PROGRESS", oss.str());
+        }
+    }
 
     bool Initialize() {
         std::cout << "[PullSubscriber] Initializing WebRTC (native API)..." << std::endl;
+        stats_.t_initialize_begin_us = SignalingNowUs();
         webrtc_demo::EnsureWebrtcFieldTrialsInitialized(); 
         if (!webrtc::InitializeSSL()) {
             return false;
@@ -416,6 +452,7 @@ public:
             webrtc::CleanupSSL();
             return false;
         }
+        stats_.t_initialize_done_us = SignalingNowUs();
         return CreatePeerConnection();
     }
 
@@ -435,6 +472,7 @@ public:
             owned_signaling_thread_->Stop();
             owned_signaling_thread_.reset();
         }
+        TracePathSummary("shutdown");
         webrtc::CleanupSSL();
     }
 
@@ -466,34 +504,34 @@ public:
         }
         webrtc::Thread* sig = pc->signaling_thread();
         if (!sig) {
-            if (on_error_) {
-                on_error_("SetRemoteDescription: no signaling thread");
-            }
+            ReportPathError("RX_ERR_NO_SIGNALING_THREAD", "SetRemoteDescription: no signaling thread");
             return;
         }
         auto work = [this, pc, type, sdp]() {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stats_.t_set_remote_begin_us = SignalingNowUs();
+            }
             TraceSigTiming("SetRemoteDescription begin type=" + type + " sdp_len=" + std::to_string(sdp.size()));
             auto opt_t = webrtc::SdpTypeFromString(type);
             if (!opt_t.has_value()) {
-                if (on_error_) {
-                    on_error_("bad SDP type");
-                }
+                ReportPathError("RX_ERR_BAD_SDP_TYPE", "bad SDP type");
                 return;
             }
             auto desc = webrtc::CreateSessionDescription(*opt_t, sdp);
             if (!desc) {
-                if (on_error_) {
-                    on_error_("parse remote SDP failed");
-                }
+                ReportPathError("RX_ERR_PARSE_REMOTE_SDP", "parse remote SDP failed");
                 return;
             }
             auto obs = webrtc::scoped_refptr<webrtc::SetRemoteDescriptionObserverInterface>(
                 new webrtc::RefCountedObject<SetRemoteDescObserver>([this](webrtc::RTCError err) {
                     if (!err.ok()) {
-                        if (on_error_) {
-                            on_error_(std::string("SetRemoteDescription: ") + err.message());
-                        }
+                        ReportPathError("RX_ERR_SET_REMOTE_SDP", std::string("SetRemoteDescription: ") + err.message());
                         return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        stats_.t_set_remote_ok_us = SignalingNowUs();
                     }
                     TraceSigTiming("SetRemoteDescription OK -> CreateAnswer");
                     std::cout << "[PullSubscriber] SetRemoteDescription OK, CreateAnswer" << std::endl;
@@ -531,22 +569,23 @@ public:
                         new webrtc::RefCountedObject<SetLocalDescObserver>(
                             [this, sdp](webrtc::RTCError err) {
                                 if (!err.ok()) {
-                                    if (on_error_) {
-                                        on_error_(std::string("SetLocalDescription: ") + err.message());
-                                    }
+                                    ReportPathError("RX_ERR_SET_LOCAL_SDP",
+                                                    std::string("SetLocalDescription: ") + err.message());
                                     return;
                                 }
                                 TraceSigTiming("SetLocalDescription OK (answer)");
                                 signaling_->SendAnswer(sdp);
+                                {
+                                    std::lock_guard<std::mutex> lock(mutex_);
+                                    stats_.t_answer_sent_us = SignalingNowUs();
+                                }
                                 TraceSigTiming("SendAnswer invoked");
                                 std::cout << "[PullSubscriber] Answer sent" << std::endl;
                             }));
                     peer_connection_->SetLocalDescription(std::move(desc), set_local);
                 },
                 [this](webrtc::RTCError err) {
-                    if (on_error_) {
-                        on_error_(std::string("CreateAnswer: ") + err.message());
-                    }
+                    ReportPathError("RX_ERR_CREATE_ANSWER", std::string("CreateAnswer: ") + err.message());
                 }));
 
         peer_connection_->CreateAnswer(obs.get(), opts);
@@ -561,16 +600,29 @@ public:
         if (!sig) {
             return;
         }
-        auto work = [pc, mid, mline_index, candidate]() {
+        auto work = [this, pc, mid, mline_index, candidate]() {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++stats_.remote_ice_calls;
+            }
             TraceSigTiming("AddRemoteIce begin mid=" + mid + " cand_len=" + std::to_string(candidate.size()));
             webrtc::SdpParseError err;
             webrtc::IceCandidateInterface* cand = webrtc::CreateIceCandidate(mid, mline_index, candidate, &err);
             if (!cand) {
                 std::cerr << "[PullSubscriber] CreateIceCandidate: " << err.description << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    ++stats_.remote_ice_parse_fail;
+                }
+                TracePathStat("RX_ERR_REMOTE_ICE_PARSE", "mid=" + mid + " idx=" + std::to_string(mline_index));
                 return;
             }
             std::unique_ptr<webrtc::IceCandidateInterface> owned(cand);
             pc->AddIceCandidate(owned.get());
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++stats_.remote_ice_added;
+            }
         };
         if (sig->IsCurrent()) {
             work();
@@ -608,6 +660,7 @@ public:
         if (!on_connection_state_) {
             return;
         }
+        const int64_t now_us = SignalingNowUs();
         PullConnectionState cs = PullConnectionState::New;
         switch (state) {
             case webrtc::PeerConnectionInterface::PeerConnectionState::kConnecting:
@@ -627,6 +680,29 @@ public:
                 break;
             default:
                 break;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++stats_.pc_state_changes;
+            if (cs == PullConnectionState::Connected && stats_.t_connected_us <= 0) {
+                stats_.t_connected_us = now_us;
+                TracePathStat("RX_CONN_CONNECTED", "state=connected");
+            }
+            if ((cs == PullConnectionState::Disconnected || cs == PullConnectionState::Failed) &&
+                stats_.t_connected_us > 0 && stats_.frames_sink_total == 0) {
+                std::ostringstream oss;
+                oss << "state=" << (cs == PullConnectionState::Failed ? "failed" : "disconnected")
+                    << " connected_without_frame_ms=" << (now_us - stats_.t_connected_us) / 1000.0;
+                TracePathStat("RX_ERR_NO_FRAME_WHILE_CONNECTED", oss.str());
+            }
+            if ((cs == PullConnectionState::Disconnected || cs == PullConnectionState::Failed) &&
+                stats_.last_frame_us > 0) {
+                std::ostringstream oss;
+                oss << "state=" << (cs == PullConnectionState::Failed ? "failed" : "disconnected")
+                    << " since_last_frame_ms=" << (now_us - stats_.last_frame_us) / 1000.0
+                    << " frames=" << stats_.frames_sink_total;
+                TracePathStat("RX_CONN_FRAME_GAP", oss.str());
+            }
         }
         on_connection_state_(cs);
     }
@@ -669,6 +745,73 @@ public:
     OnErrorCallback on_error_;
 
 private:
+    struct RxPathStats {
+        int64_t t_construct_us{0};
+        int64_t t_initialize_begin_us{0};
+        int64_t t_initialize_done_us{0};
+        int64_t t_set_remote_begin_us{0};
+        int64_t t_set_remote_ok_us{0};
+        int64_t t_answer_sent_us{0};
+        int64_t t_connected_us{0};
+        int64_t t_first_frame_us{0};
+        int64_t last_frame_us{0};
+        uint16_t last_trace_id{0};
+        uint64_t attach_calls{0};
+        uint64_t attach_dedup{0};
+        uint64_t attach_effective{0};
+        uint64_t remote_ice_calls{0};
+        uint64_t remote_ice_parse_fail{0};
+        uint64_t remote_ice_added{0};
+        uint64_t pc_state_changes{0};
+        uint64_t frames_sink_total{0};
+        uint64_t error_reports{0};
+    };
+    RxPathStats stats_{};
+
+    void TracePathStat(const char* code, const std::string& details) const {
+        std::cout << "[PATH_STAT][rx] t_us=" << SignalingNowUs() << " code=" << code;
+        if (!details.empty()) {
+            std::cout << " " << details;
+        }
+        std::cout << std::endl;
+    }
+
+    void ReportPathError(const char* code, const std::string& msg) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++stats_.error_reports;
+        }
+        TracePathStat(code, "msg=\"" + msg + "\"");
+        if (on_error_) {
+            on_error_(msg);
+        }
+    }
+
+    void TracePathSummary(const char* reason) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ostringstream oss;
+        oss << "reason=" << reason << " frames=" << stats_.frames_sink_total << " attach_calls=" << stats_.attach_calls
+            << " attach_dedup=" << stats_.attach_dedup << " attach_effective=" << stats_.attach_effective
+            << " remote_ice_calls=" << stats_.remote_ice_calls
+            << " remote_ice_parse_fail=" << stats_.remote_ice_parse_fail
+            << " remote_ice_added=" << stats_.remote_ice_added << " state_changes=" << stats_.pc_state_changes
+            << " errors=" << stats_.error_reports;
+        if (stats_.t_connected_us > 0) {
+            oss << " connected_at_us=" << stats_.t_connected_us;
+        }
+        if (stats_.t_first_frame_us > 0) {
+            oss << " first_frame_at_us=" << stats_.t_first_frame_us;
+        }
+        if (stats_.t_connected_us > 0 && stats_.t_first_frame_us > 0 &&
+            stats_.t_first_frame_us >= stats_.t_connected_us) {
+            oss << " connected_to_first_frame_ms=" << (stats_.t_first_frame_us - stats_.t_connected_us) / 1000.0;
+        }
+        if (stats_.last_frame_us > 0) {
+            oss << " last_frame_us=" << stats_.last_frame_us << " last_trace_id=" << stats_.last_trace_id;
+        }
+        TracePathStat("RX_PATH_SUMMARY", oss.str());
+    }
+
     void AttachVideo(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> r) {
         if (!r || !video_sink_) {
             return;
@@ -686,9 +829,11 @@ private:
                 std::optional<double>(static_cast<double>(recv_config_.common.jitter_buffer_min_delay_ms) / 1000.0));
         }
         std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.attach_calls;
         const bool same_track = (video_track_.get() == vt);
         const bool same_receiver = (video_rtp_receiver_.get() == r.get());
         if (same_track && same_receiver) {
+            ++stats_.attach_dedup;
             return;
         }
         if (video_track_ && !same_track) {
@@ -697,8 +842,10 @@ private:
         video_track_ = vt;
         video_rtp_receiver_ = std::move(r);
         if (!same_track) {
+            ++stats_.attach_effective;
             video_track_->AddOrUpdateSink(video_sink_.get(), webrtc::VideoSinkWants());
             std::cout << "[PullSubscriber] Video track attached" << std::endl;
+            TracePathStat("RX_ATTACH_VIDEO", "attach_effective=" + std::to_string(stats_.attach_effective));
         }
     }
 };
@@ -719,8 +866,13 @@ void PullSubscriber::Play() {
 
     impl_->on_connection_state_ = on_connection_state_;
     impl_->on_error_ = on_error_;
-    impl_->video_sink_ =
-        std::make_shared<VideoSink>(on_video_frame_, impl_->recv_config_.common.skip_sink_argb_conversion);
+    impl_->video_sink_ = std::make_shared<VideoSink>(
+        on_video_frame_, impl_->recv_config_.common.skip_sink_argb_conversion,
+        [impl = impl_.get()](uint16_t trace_id, int64_t t_callback_done_us) {
+            if (impl) {
+                impl->OnSinkFrame(trace_id, t_callback_done_us);
+            }
+        });
     if (impl_->recv_config_.common.skip_sink_argb_conversion) {
         std::cout << "[PullSubscriber] VideoSink: skip I420→ARGB (client low-latency path)" << std::endl;
     }
