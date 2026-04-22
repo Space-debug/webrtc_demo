@@ -66,6 +66,23 @@ unsigned MediaTimingTraceEveryN() {
     return every_n;
 }
 
+void MaybeShrinkBitstreamCopy(std::vector<uint8_t>* buf, size_t current_bytes, unsigned tick) {
+    if (!buf) {
+        return;
+    }
+    if ((tick % 240u) != 0u) {
+        return;
+    }
+    if (buf->capacity() <= (2 * 1024 * 1024) || current_bytes > (256 * 1024)) {
+        return;
+    }
+    std::vector<uint8_t> compact(current_bytes);
+    if (current_bytes > 0) {
+        std::memcpy(compact.data(), buf->data(), current_bytes);
+    }
+    buf->swap(compact);
+}
+
 }  // namespace
 
 H264Decoder::H264Decoder(const webrtc::Environment& env) : env_(env) {
@@ -136,6 +153,7 @@ int32_t H264Decoder::Release() {
     callback_ = nullptr;
     DestroyMpp();
     bitstream_copy_.clear();
+    std::vector<uint8_t>().swap(bitstream_copy_);
     return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -298,6 +316,8 @@ int32_t H264Decoder::Decode(const webrtc::EncodedImage& input_image, bool /*miss
     bitstream_copy_.resize(len + 64);
     memcpy(bitstream_copy_.data(), src, len);
     memset(bitstream_copy_.data() + len, 0, 64);
+    static thread_local unsigned decode_calls = 0;
+    ++decode_calls;
 
     MppCtx ctx = reinterpret_cast<MppCtx>(mpp_ctx_);
     MppApi* mpi = reinterpret_cast<MppApi*>(mpi_);
@@ -335,6 +355,7 @@ int32_t H264Decoder::Decode(const webrtc::EncodedImage& input_image, bool /*miss
 
     while (TryDrainOneDecodedFrame(render_time_ms, input_image)) {
     }
+    MaybeShrinkBitstreamCopy(&bitstream_copy_, len + 64, decode_calls);
     return WEBRTC_VIDEO_CODEC_OK;
 }
 

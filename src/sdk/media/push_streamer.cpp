@@ -68,43 +68,37 @@ void TraceSigTiming(const std::string& msg) {
     std::cout << "[SIG_TIMING][push] t_us=" << SignalingNowUs() << " " << msg << std::endl;
 }
 
-/// 部分平台在双 PC 回环下 PeerConnection::Close 可能长期阻塞；超时后放弃等待，由进程退出收尾。
-/// @return true 表示 Close 在线程内已返回；false 表示超时（可能仍有后台线程卡在 Close 内）。
-static bool ClosePeerConnectionWithDeadline(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc,
-                                            const char* log_tag,
-                                            int timeout_sec) {
+/// 避免 detached 关闭线程造成生命周期失控：改为同步关闭，仅在完成后输出耗时告警。
+static void ClosePeerConnectionWithTiming(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc,
+                                          const char* log_tag,
+                                          int warn_sec) {
     if (!pc) {
-        return true;
+        return;
     }
-    std::packaged_task<void()> task([pc]() { pc->Close(); });
-    std::future<void> done = task.get_future();
-    std::thread worker(std::move(task));
-    if (done.wait_for(std::chrono::seconds(timeout_sec)) != std::future_status::ready) {
-        std::cerr << "[PushStreamer] " << log_tag << " PeerConnection::Close exceeded " << timeout_sec
-                  << "s; continuing shutdown\n"
+    const auto t0 = std::chrono::steady_clock::now();
+    pc->Close();
+    const double elapsed_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (elapsed_s > static_cast<double>(warn_sec)) {
+        std::cerr << "[PushStreamer] " << log_tag << " PeerConnection::Close took " << elapsed_s
+                  << "s (warn threshold=" << warn_sec << "s)\n"
                   << std::flush;
-        worker.detach();
-        return false;
     }
-    worker.join();
-    return true;
 }
 
-static void StopWebrtcThreadWithDeadline(webrtc::Thread* thread, int timeout_sec) {
+static void StopWebrtcThreadWithTiming(webrtc::Thread* thread, int warn_sec) {
     if (!thread) {
         return;
     }
-    std::packaged_task<void()> task([thread]() { thread->Stop(); });
-    std::future<void> done = task.get_future();
-    std::thread worker(std::move(task));
-    if (done.wait_for(std::chrono::seconds(timeout_sec)) != std::future_status::ready) {
-        std::cerr << "[PushStreamer] webrtc signaling Thread::Stop exceeded " << timeout_sec
-                  << "s; continuing shutdown\n"
+    const auto t0 = std::chrono::steady_clock::now();
+    thread->Stop();
+    const double elapsed_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (elapsed_s > static_cast<double>(warn_sec)) {
+        std::cerr << "[PushStreamer] webrtc signaling Thread::Stop took " << elapsed_s
+                  << "s (warn threshold=" << warn_sec << "s)\n"
                   << std::flush;
-        worker.detach();
-        return;
     }
-    worker.join();
 }
 
 static webrtc::Priority ParseVideoNetworkPriority(const std::string& s) {
@@ -521,18 +515,18 @@ public:
         if (receiver_) {
             webrtc::scoped_refptr<webrtc::PeerConnectionInterface> recv = receiver_;
             receiver_ = nullptr;
-            ClosePeerConnectionWithDeadline(recv, "loopback receiver", 8);
+            ClosePeerConnectionWithTiming(recv, "loopback receiver", 8);
         }
         loopback_observer_.reset();
 
         if (peer_connection_) {
             webrtc::scoped_refptr<webrtc::PeerConnectionInterface> sender = peer_connection_;
             peer_connection_ = nullptr;
-            ClosePeerConnectionWithDeadline(sender, "publisher", 8);
+            ClosePeerConnectionWithTiming(sender, "publisher", 8);
         }
         for (auto& kv : peer_connections_) {
             if (kv.second) {
-                ClosePeerConnectionWithDeadline(kv.second, "subscriber", 8);
+                ClosePeerConnectionWithTiming(kv.second, "subscriber", 8);
             }
         }
         peer_connections_.clear();
@@ -546,7 +540,7 @@ public:
 
         if (owned_signaling_thread_) {
             if (!owned_signaling_thread_->IsCurrent()) {
-                StopWebrtcThreadWithDeadline(owned_signaling_thread_.get(), 6);
+                StopWebrtcThreadWithTiming(owned_signaling_thread_.get(), 6);
             }
             owned_signaling_thread_.reset();
         }
@@ -1584,6 +1578,7 @@ bool PushStreamer::Start() {
         return true;
     }
     if (!impl_->Initialize()) {
+        impl_->Shutdown();
         return false;
     }
     if (!impl_->TestCaptureOnly() && !impl_->SignalingSubscriberOfferOnly()) {

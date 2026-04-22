@@ -267,6 +267,26 @@ static int ReadEnvIntInRange(const char* name, int fallback, int min_v, int max_
     return static_cast<int>(v);
 }
 
+void MaybeShrinkScratchBuffer(std::vector<uint8_t>* buf,
+                              size_t max_capacity,
+                              size_t max_live_size,
+                              uint16_t periodic_tick) {
+    if (!buf || buf->capacity() <= max_capacity) {
+        return;
+    }
+    if ((periodic_tick % 300u) != 0u) {
+        return;
+    }
+    if (buf->size() > max_live_size) {
+        return;
+    }
+    std::vector<uint8_t> compact;
+    if (!buf->empty()) {
+        compact.assign(buf->begin(), buf->end());
+    }
+    buf->swap(compact);
+}
+
 /// MPP JPEG 解码 NV12 输出常见按 64 水平对齐；编码器 prep 仅 16 对齐时易与解码 stride 不一致，
 /// kNative 直通会退化为每帧 CopySemiPlanarToMppBuffer。默认 64；异常 BSP 可设 WEBRTC_MPP_ENC_HOR_STRIDE_ALIGN=16。
 static int MppEncHorStrideAlignPixels() {
@@ -337,7 +357,9 @@ void RkMppH264Encoder::DestroyMpp() {
         mpi_ = nullptr;
     }
     annex_scratch_.clear();
+    std::vector<uint8_t>().swap(annex_scratch_);
     split_assembly_buf_.clear();
+    std::vector<uint8_t>().swap(split_assembly_buf_);
 }
 
 bool RkMppH264Encoder::ApplyRcToCfg() {
@@ -1315,6 +1337,8 @@ int32_t RkMppH264Encoder::Encode(const webrtc::VideoFrame& frame,
         }
         mpi->enqueue(ctx, MPP_PORT_OUTPUT, output_task);
     }
+    MaybeShrinkScratchBuffer(&split_assembly_buf_, 1024 * 1024, 0, next_video_frame_tracking_id_);
+    MaybeShrinkScratchBuffer(&annex_scratch_, 1024 * 1024, 64 * 1024, next_video_frame_tracking_id_);
     consecutive_output_failures_ = 0;
     return WEBRTC_VIDEO_CODEC_OK;
 }

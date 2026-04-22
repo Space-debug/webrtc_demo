@@ -15,6 +15,8 @@
 
 namespace webrtc_demo {
 namespace {
+constexpr size_t kSignalingReadChunkBytes = 64 * 1024;
+constexpr size_t kSignalingMaxBufferedBytes = 4 * 1024 * 1024;
 
 bool SignalingTimingTraceEnabled() {
     static const bool enabled = []() {
@@ -193,18 +195,29 @@ void SignalingClient::SendIceCandidate(const std::string& mid, int mline_index,
 
 void SignalingClient::ReaderLoop() {
     std::string buf;
-    char tmp[65536];
+    char tmp[kSignalingReadChunkBytes];
+    size_t parse_off = 0;
     while (running_ && sock_fd_ >= 0) {
-        ssize_t n = recv(sock_fd_, tmp, sizeof(tmp) - 1, 0);
+        ssize_t n = recv(sock_fd_, tmp, sizeof(tmp), 0);
         if (n > 0) {
-            tmp[n] = '\0';
-            buf += tmp;
-            size_t pos;
-            while ((pos = buf.find('\n')) != std::string::npos) {
-                std::string line = buf.substr(0, pos);
-                buf.erase(0, pos + 1);
+            buf.append(tmp, static_cast<size_t>(n));
+            if (buf.size() > kSignalingMaxBufferedBytes) {
+                if (on_error_) {
+                    on_error_("signaling receive buffer overflow (missing newline)");
+                }
+                break;
+            }
+            size_t pos = 0;
+            while ((pos = buf.find('\n', parse_off)) != std::string::npos) {
+                std::string line = buf.substr(parse_off, pos - parse_off);
+                parse_off = pos + 1;
                 TraceSig("recv line bytes=" + std::to_string(line.size()));
                 ParseAndDispatch(line);
+            }
+            // 避免对大字符串频繁头删；仅在消费过半或全部消费时做一次压缩。
+            if (parse_off > 0 && (parse_off == buf.size() || parse_off >= (buf.size() / 2))) {
+                buf.erase(0, parse_off);
+                parse_off = 0;
             }
         } else if (n == 0) {
             break;

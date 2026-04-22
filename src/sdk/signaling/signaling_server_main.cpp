@@ -46,6 +46,43 @@ std::unordered_map<int, std::tuple<std::string, std::string, std::string>> g_fd_
 
 std::atomic<unsigned long> g_peer_seq{1};
 
+size_t ReadEnvSizeInRange(const char* name, size_t fallback, size_t min_v, size_t max_v) {
+    const char* e = std::getenv(name);
+    if (!e || !e[0]) {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(e, &end, 10);
+    if (end == e || (end && *end != '\0')) {
+        return fallback;
+    }
+    if (v < min_v || v > max_v) {
+        return fallback;
+    }
+    return static_cast<size_t>(v);
+}
+
+size_t MaxClientReadBufBytes() {
+    static const size_t v = ReadEnvSizeInRange("SIGNALING_MAX_CLIENT_READ_BUF_BYTES",
+                                               1024 * 1024,
+                                               64 * 1024,
+                                               16 * 1024 * 1024);
+    return v;
+}
+
+size_t MaxShardQueueLines() {
+    static const size_t v = ReadEnvSizeInRange("SIGNALING_MAX_QUEUE_LINES", 4096, 256, 200000);
+    return v;
+}
+
+size_t MaxShardQueueBytes() {
+    static const size_t v = ReadEnvSizeInRange("SIGNALING_MAX_QUEUE_BYTES",
+                                               8 * 1024 * 1024,
+                                               256 * 1024,
+                                               64 * 1024 * 1024);
+    return v;
+}
+
 void LogVerbose(const std::string& msg) {
     if (g_verbose.load(std::memory_order_relaxed)) {
         std::cout << msg << std::endl;
@@ -96,6 +133,7 @@ static void ForwardLineWithFrom(int target_fd, const std::string& line, const st
 struct Client : std::enable_shared_from_this<Client> {
     int fd{-1};
     std::string read_buf;
+    size_t parse_off{0};
     bool registered{false};
     std::string stream_id{"livestream"};
     std::string peer_id;
@@ -189,8 +227,12 @@ struct LineTask {
 
 class ShardedLineWorkers {
 public:
-    explicit ShardedLineWorkers(size_t num_threads) : n_(num_threads > 0 ? num_threads : 1) {
+    explicit ShardedLineWorkers(size_t num_threads)
+        : n_(num_threads > 0 ? num_threads : 1),
+          max_queue_lines_(MaxShardQueueLines()),
+          max_queue_bytes_(MaxShardQueueBytes()) {
         queues_.resize(n_);
+        queue_bytes_.assign(n_, 0);
         mutexes_.reserve(n_);
         cvs_.reserve(n_);
         for (size_t i = 0; i < n_; ++i) {
@@ -223,13 +265,19 @@ public:
         }
     }
 
-    void Enqueue(int source_fd, LineTask task) {
+    bool Enqueue(int source_fd, LineTask task) {
         const size_t shard = static_cast<size_t>(source_fd >= 0 ? source_fd : 0) % n_;
+        const size_t task_bytes = task.line.size();
         {
             std::lock_guard<std::mutex> lock(*mutexes_[shard]);
+            if (queues_[shard].size() >= max_queue_lines_ || queue_bytes_[shard] + task_bytes > max_queue_bytes_) {
+                return false;
+            }
             queues_[shard].push_back(std::move(task));
+            queue_bytes_[shard] += task_bytes;
         }
         cvs_[shard]->notify_one();
+        return true;
     }
 
     ShardedLineWorkers(const ShardedLineWorkers&) = delete;
@@ -245,8 +293,14 @@ private:
                 if (stop_ && queues_[shard].empty()) {
                     return;
                 }
+                const size_t task_bytes = queues_[shard].front().line.size();
                 task = std::move(queues_[shard].front());
                 queues_[shard].pop_front();
+                if (queue_bytes_[shard] >= task_bytes) {
+                    queue_bytes_[shard] -= task_bytes;
+                } else {
+                    queue_bytes_[shard] = 0;
+                }
             }
             auto c = task.client.lock();
             if (!c || c->dead.load(std::memory_order_acquire)) {
@@ -262,13 +316,34 @@ private:
 
     size_t n_;
     std::vector<std::deque<LineTask>> queues_;
+    std::vector<size_t> queue_bytes_;
     std::vector<std::unique_ptr<std::mutex>> mutexes_;
     std::vector<std::unique_ptr<std::condition_variable>> cvs_;
     std::vector<std::thread> threads_;
+    size_t max_queue_lines_;
+    size_t max_queue_bytes_;
     bool stop_{false};
 };
 
 std::unique_ptr<ShardedLineWorkers> g_workers;
+void RemoveClientResources(int fd, const std::shared_ptr<Client>& client);
+
+void DisconnectClient(int fd, const std::shared_ptr<Client>& client, const char* reason) {
+    if (client) {
+        client->dead.store(true, std::memory_order_release);
+    }
+    if (reason && *reason) {
+        LogVerbose(std::string("[Signaling] disconnect fd=") + std::to_string(fd) + " reason=" + reason);
+    }
+    CloseClientFd(fd);
+    {
+        std::lock_guard<std::mutex> lock(g_clients_mutex);
+        g_clients.erase(fd);
+    }
+    if (client) {
+        RemoveClientResources(fd, client);
+    }
+}
 
 void RemoveClientResources(int fd, const std::shared_ptr<Client>&) {
     std::string removed_stream_id;
@@ -307,13 +382,14 @@ void RemoveClientResources(int fd, const std::shared_ptr<Client>&) {
 }
 
 static void DrainCompleteLines(const std::shared_ptr<Client>& client, int fd) {
+    bool queue_overflow = false;
     while (true) {
-        const size_t pos = client->read_buf.find('\n');
+        const size_t pos = client->read_buf.find('\n', client->parse_off);
         if (pos == std::string::npos) {
             break;
         }
-        std::string line = client->read_buf.substr(0, pos);
-        client->read_buf.erase(0, pos + 1);
+        std::string line = client->read_buf.substr(client->parse_off, pos - client->parse_off);
+        client->parse_off = pos + 1;
         if (line.empty()) {
             continue;
         }
@@ -326,7 +402,18 @@ static void DrainCompleteLines(const std::shared_ptr<Client>& client, int fd) {
         LineTask task;
         task.client = client->weak_from_this();
         task.line = std::move(line);
-        g_workers->Enqueue(fd, std::move(task));
+        if (!g_workers->Enqueue(fd, std::move(task))) {
+            queue_overflow = true;
+            break;
+        }
+    }
+    if (client->parse_off > 0 &&
+        (client->parse_off == client->read_buf.size() || client->parse_off >= (client->read_buf.size() / 2))) {
+        client->read_buf.erase(0, client->parse_off);
+        client->parse_off = 0;
+    }
+    if (queue_overflow) {
+        DisconnectClient(fd, client, "queue_overflow");
     }
 }
 
@@ -348,27 +435,22 @@ void ProcessClientRead(int fd) {
         const ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n > 0) {
             client->read_buf.append(tmp, static_cast<size_t>(n));
-            DrainCompleteLines(client, fd);
-        } else if (n == 0) {
-            client->dead.store(true, std::memory_order_release);
-            CloseClientFd(fd);
-            {
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                g_clients.erase(fd);
+            if (client->read_buf.size() > MaxClientReadBufBytes()) {
+                DisconnectClient(fd, client, "read_buf_overflow");
+                return;
             }
-            RemoveClientResources(fd, client);
+            DrainCompleteLines(client, fd);
+            if (client->dead.load(std::memory_order_acquire)) {
+                return;
+            }
+        } else if (n == 0) {
+            DisconnectClient(fd, client, "peer_closed");
             return;
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             }
-            client->dead.store(true, std::memory_order_release);
-            CloseClientFd(fd);
-            {
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                g_clients.erase(fd);
-            }
-            RemoveClientResources(fd, client);
+            DisconnectClient(fd, client, "recv_error");
             return;
         }
     }
@@ -598,6 +680,15 @@ int webrtc_demo::RunSignalingServerMain(int argc, char* argv[]) {
                         auto it = g_clients.find(cfd);
                         if (it != g_clients.end()) {
                             it->second->read_buf = std::move(leftover);
+                            it->second->parse_off = 0;
+                            if (it->second->read_buf.size() > MaxClientReadBufBytes()) {
+                                auto too_big = it->second;
+                                too_big->dead.store(true, std::memory_order_release);
+                                g_clients.erase(it);
+                                CloseClientFd(cfd);
+                                RemoveClientResources(cfd, too_big);
+                                continue;
+                            }
                         }
                     }
 

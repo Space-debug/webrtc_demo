@@ -374,6 +374,7 @@ public:
         }
         const int64_t t_callback_done_us = e2e_trace ? webrtc::TimeMicros() : 0;
         on_frame_(argb_.data(), w, h, stride, frame.id(), t_callback_done_us);
+        MaybeShrinkArgbBuffer(w, h, n);
         if (on_frame_stats_) {
             on_frame_stats_(frame.id(), t_callback_done_us);
         }
@@ -397,6 +398,19 @@ public:
     }
 
 private:
+    void MaybeShrinkArgbBuffer(int w, int h, unsigned frame_index) {
+        if (frame_index == 0 || (frame_index % 300u) != 0u || w <= 0 || h <= 0) {
+            return;
+        }
+        const size_t expected = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+        if (expected == 0 || argb_.capacity() <= expected * 4u || argb_.size() != expected) {
+            return;
+        }
+        std::vector<uint8_t> compact;
+        compact.assign(argb_.begin(), argb_.end());
+        argb_.swap(compact);
+    }
+
     Callback on_frame_;
     bool skip_argb_conversion_{false};
     StatsCallback on_frame_stats_;
@@ -417,13 +431,13 @@ public:
         ++stats_.frames_sink_total;
         stats_.last_frame_us = now_us;
         stats_.last_trace_id = trace_id;
-        if (stats_.first_frame_us <= 0) {
-            stats_.first_frame_us = now_us;
+        if (stats_.t_first_frame_us <= 0) {
+            stats_.t_first_frame_us = now_us;
             std::ostringstream oss;
             oss << "frames=" << stats_.frames_sink_total << " trace_id=" << static_cast<unsigned>(trace_id);
-            if (stats_.t_connected_us > 0 && stats_.first_frame_us >= stats_.t_connected_us) {
+            if (stats_.t_connected_us > 0 && stats_.t_first_frame_us >= stats_.t_connected_us) {
                 oss << " connected_to_first_frame_ms="
-                    << (stats_.first_frame_us - stats_.t_connected_us) / 1000.0;
+                    << (stats_.t_first_frame_us - stats_.t_connected_us) / 1000.0;
             }
             TracePathStat("RX_FIRST_FRAME", oss.str());
         } else if (stats_.frames_sink_total % 120 == 0) {
@@ -898,12 +912,16 @@ void PullSubscriber::Play() {
     });
 
     if (!impl_->Initialize()) {
+        impl_->signaling_->Stop();
+        impl_->Shutdown();
         if (on_error_) {
             on_error_("WebRTC init failed");
         }
         return;
     }
     if (!impl_->signaling_->Start()) {
+        impl_->signaling_->Stop();
+        impl_->Shutdown();
         if (on_error_) {
             on_error_("Signaling failed. Run: ./build/bin/signaling_server");
         }

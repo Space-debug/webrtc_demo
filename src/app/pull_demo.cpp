@@ -78,6 +78,7 @@ public:
                      int64_t t_sink_callback_done_us) {
         if (!argb || width <= 0 || height <= 0) return;
         std::lock_guard<std::mutex> lock(mutex_);
+        ++frame_updates_;
         size_t size = static_cast<size_t>(stride) * height;
         if (frame_buffer_.size() != size || frame_width_ != width || frame_height_ != height) {
             frame_buffer_.resize(size);
@@ -85,6 +86,7 @@ public:
             frame_height_ = height;
         }
         std::memcpy(frame_buffer_.data(), argb, size);
+        MaybeShrinkFrameBuffer(size);
         frame_trace_id_ = trace_id;
         frame_sink_callback_done_us_ = t_sink_callback_done_us;
         frame_dirty_ = true;
@@ -152,6 +154,18 @@ public:
     bool IsOpen() const { return window_ != nullptr; }
 
 private:
+    void MaybeShrinkFrameBuffer(size_t expected_size) {
+        if (frame_updates_ == 0 || (frame_updates_ % 300u) != 0u || expected_size == 0) {
+            return;
+        }
+        if (frame_buffer_.capacity() <= expected_size * 4u || frame_buffer_.size() != expected_size) {
+            return;
+        }
+        std::vector<uint8_t> compact;
+        compact.assign(frame_buffer_.begin(), frame_buffer_.end());
+        frame_buffer_.swap(compact);
+    }
+
     SDL_Window* window_{nullptr};
     SDL_Renderer* renderer_{nullptr};
     SDL_Texture* texture_{nullptr};
@@ -161,6 +175,7 @@ private:
     int frame_width_{0};
     int frame_height_{0};
     bool frame_dirty_{false};
+    uint64_t frame_updates_{0};
     uint16_t frame_trace_id_{0};
     int64_t frame_sink_callback_done_us_{0};
 };
