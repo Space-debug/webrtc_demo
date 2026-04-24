@@ -22,8 +22,10 @@
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -46,6 +48,68 @@ bool LatencyTraceEnabled() {
     const char* e = std::getenv("WEBRTC_LATENCY_TRACE");
     cached = (e && e[0] == '1') ? 1 : 0;
     return cached != 0;
+}
+
+int ReadEnvIntInRange(const char* name, int def, int lo, int hi) {
+    const char* v = std::getenv(name);
+    if (!v || !v[0]) {
+        return def;
+    }
+    const int n = std::atoi(v);
+    if (n < lo || n > hi) {
+        return def;
+    }
+    return n;
+}
+
+void ApplyThreadTuneIfRequested(const char* role, const char* cpu_env_name) {
+    const char* mode = std::getenv("WEBRTC_DEMO_MEDIA_THREAD_SCHED");
+    const bool mode_off = mode && (mode[0] == '0' || mode[0] == 'n' || mode[0] == 'N' || mode[0] == 'f' || mode[0] == 'F');
+    const bool mode_set = mode && mode[0];
+
+    if (cpu_env_name) {
+        const int cpu = ReadEnvIntInRange(cpu_env_name, -1, -1, 4096);
+        if (cpu >= 0) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(cpu, &cpuset);
+            const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+            if (rc != 0) {
+                std::cerr << "[ThreadTune] " << role << " setaffinity cpu=" << cpu << " failed rc=" << rc << std::endl;
+            }
+        }
+    }
+    if (mode_off) {
+        return;
+    }
+    if (!mode_set) {
+        return;
+    }
+
+    const bool use_rr = mode && (mode[0] == 'r' || mode[0] == 'R');
+    if (use_rr) {
+        const int rr_prio = ReadEnvIntInRange("WEBRTC_DEMO_MEDIA_THREAD_RR_PRIO", 20, 1, 90);
+        sched_param sp{};
+        sp.sched_priority = rr_prio;
+        const int rc = pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+        if (rc != 0) {
+            std::cerr << "[ThreadTune] " << role << " setschedparam rr prio=" << rr_prio << " failed rc=" << rc
+                      << std::endl;
+        }
+        return;
+    }
+
+    const int nice_val = ReadEnvIntInRange("WEBRTC_DEMO_MEDIA_THREAD_NICE", -8, -20, 19);
+    if (setpriority(PRIO_PROCESS, 0, nice_val) != 0) {
+        std::cerr << "[ThreadTune] " << role << " setpriority nice=" << nice_val << " failed errno=" << errno
+                  << std::endl;
+    }
+}
+
+int64_t DecodeQueueStaleDropBudgetUs() {
+    static const int64_t budget_us =
+        static_cast<int64_t>(ReadEnvIntInRange("WEBRTC_MJPEG_DECODE_QUEUE_MAX_WAIT_MS", 25, 0, 5000)) * 1000;
+    return budget_us;
 }
 
 void LogMjpegDecodeTiming(const char* tag, int64_t before_us, int64_t after_us) {
@@ -614,6 +678,7 @@ bool CameraVideoTrackSource::StartDirectV4l2(const char* device_path, int width,
 void CameraVideoTrackSource::DecodeWorkerThreadMain() {
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "wrtc_mjpg_dec");
+    ApplyThreadTuneIfRequested("mjpeg_decode", "WEBRTC_DEMO_MJPEG_DECODE_CPU");
 #endif
     while (true) {
         MjpegPendingBuf job{};
@@ -776,6 +841,7 @@ void CameraVideoTrackSource::ProcessV4l2CapturedFrame(unsigned int buf_index,
 void CameraVideoTrackSource::DirectCaptureThreadMain() {
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "wrtc_v4l2_cap");
+    ApplyThreadTuneIfRequested("v4l2_capture", "WEBRTC_DEMO_V4L2_CAPTURE_CPU");
 #endif
     std::atomic<unsigned> poll_log_counter{0};
     while (direct_run_.load(std::memory_order_relaxed)) {
@@ -838,6 +904,18 @@ void CameraVideoTrackSource::DirectCaptureThreadMain() {
                 std::deque<MjpegPendingBuf> dropped;
                 {
                     std::unique_lock<std::mutex> lk(jpeg_queue_mu_);
+                    const int64_t stale_budget_us = DecodeQueueStaleDropBudgetUs();
+                    if (stale_budget_us > 0) {
+                        const int64_t now_us = webrtc::TimeMicros();
+                        while (!jpeg_queue_.empty()) {
+                            const int64_t age_us = now_us - jpeg_queue_.front().enqueue_time_us;
+                            if (age_us <= stale_budget_us) {
+                                break;
+                            }
+                            dropped.push_back(jpeg_queue_.front());
+                            jpeg_queue_.pop_front();
+                        }
+                    }
                     if (mjpeg_queue_latest_only_) {
                         dropped.swap(jpeg_queue_);
                     } else {

@@ -346,7 +346,7 @@ public:
                     std::cout << "[MEDIA_TIMING][sink] t_us=" << t_now_us << " trace_id="
                               << static_cast<unsigned>(frame.id()) << " rtp_ts=" << frame.rtp_timestamp()
                               << " event=onframe_skip_argb t_callback_done_us=" << t_callback_done_us
-                              << std::endl;
+                              << '\n';
                 }
             }
             if (e2e_trace) {
@@ -354,7 +354,7 @@ public:
                           << static_cast<unsigned>(frame.id()) << " frame_id="
                           << static_cast<unsigned>(frame.id()) << " t_sink_us=" << t_sink_enter_us
                           << " wall_utc_ms=" << wall_sink_utc_ms << " t_argb_done_us=" << t_fast_done_us
-                          << " t_callback_done_us=" << t_callback_done_us << std::endl;
+                          << " t_callback_done_us=" << t_callback_done_us << '\n';
             }
             return;
         }
@@ -385,7 +385,7 @@ public:
                 std::cout << "[MEDIA_TIMING][sink] t_us=" << t_now_us << " trace_id="
                           << static_cast<unsigned>(frame.id()) << " rtp_ts=" << frame.rtp_timestamp()
                           << " event=onframe_argb_done t_argb_done_us=" << t_argb_done_us
-                          << " t_callback_done_us=" << t_callback_done_us << std::endl;
+                          << " t_callback_done_us=" << t_callback_done_us << '\n';
             }
         }
         if (e2e_trace) {
@@ -393,7 +393,7 @@ public:
                       << static_cast<unsigned>(frame.id()) << " frame_id="
                       << static_cast<unsigned>(frame.id()) << " t_sink_us=" << t_sink_enter_us
                       << " wall_utc_ms=" << wall_sink_utc_ms << " t_argb_done_us=" << t_argb_done_us
-                      << " t_callback_done_us=" << t_callback_done_us << std::endl;
+                      << " t_callback_done_us=" << t_callback_done_us << '\n';
         }
     }
 

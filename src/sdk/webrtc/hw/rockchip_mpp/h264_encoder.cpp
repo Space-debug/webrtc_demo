@@ -828,7 +828,7 @@ int32_t RkMppH264Encoder::EmitAssembledFrame(const webrtc::VideoFrame& frame,
                       << static_cast<unsigned>(trace_tid) << " rtp_ts=" << encoded.RtpTimestamp()
                       << " t_frame_ts_us=" << frame.timestamp_us() << " t_encode_done_us=" << encode_finish_us
                       << " t_after_onencoded_us=" << after_on_encoded_cb_us
-                      << " onencoded_cb_cost_us=" << webrtc_onencodedimage_us << std::endl;
+                      << " onencoded_cb_cost_us=" << webrtc_onencodedimage_us << '\n';
         }
     }
     if (debug_enabled_) {
@@ -861,7 +861,7 @@ int32_t RkMppH264Encoder::EmitAssembledFrame(const webrtc::VideoFrame& frame,
         std::cout << "[E2E_TX] rtp_ts=" << encoded.RtpTimestamp() << " trace_id=" << static_cast<unsigned>(trace_tid)
                   << " t_mjpeg_input_us=" << t_mjpeg_input_us << " t_v4l2_us=" << t_v4l2_us
                   << " t_on_frame_us=" << t_on_frame_us << " t_enc_done_us=" << encode_finish_us
-                  << " t_after_onencoded_us=" << after_on_encoded_cb_us << " wall_utc_ms=" << wall_utc_ms << std::endl;
+                  << " t_after_onencoded_us=" << after_on_encoded_cb_us << " wall_utc_ms=" << wall_utc_ms << '\n';
     }
     if (trace_periodic_log) {
         int64_t mjpeg_input_to_encode_done_us = encode_finish_us - frame.timestamp_us();

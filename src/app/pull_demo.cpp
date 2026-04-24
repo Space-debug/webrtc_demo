@@ -140,7 +140,7 @@ public:
             const int64_t t_present_submit_us = webrtc::TimeMicros();
             std::cout << "[E2E_UI] trace_id=" << static_cast<unsigned>(trace_id)
                       << " t_sink_callback_done_us=" << sink_done_us
-                      << " t_present_submit_us=" << t_present_submit_us << std::endl;
+                      << " t_present_submit_us=" << t_present_submit_us << '\n';
         }
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         SDL_RenderClear(renderer_);

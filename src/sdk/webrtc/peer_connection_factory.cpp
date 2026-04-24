@@ -31,21 +31,29 @@ namespace {
     return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
   }
 
+int ReadEnvIntInRange(const char* name, int def, int lo, int hi) {
+  const char* v = std::getenv(name);
+  if (!v || !v[0]) {
+    return def;
+  }
+  int n = std::atoi(v);
+  if (n < lo || n > hi) {
+    return def;
+  }
+  return n;
+}
+
   /// 客户端低延迟：FieldTrial WebRTC-ZeroPlayoutDelay（pacing + max_decode_queue_size）。
   /// 脚本 steady profile：2ms pacing + 队列 8；仍可用 WEBRTC_DEMO_* 覆盖（4..16）。
   std::string ZeroPlayoutDelayTrialString() {
-    int pacing_ms = 1;
-    if (const char* p = std::getenv("WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS")) {
-      int v = std::atoi(p);
-      if (v >= 0 && v <= 20) {
-        pacing_ms = v;
-      }
-    }
-    int q = 6;
-    if (const char* p = std::getenv("WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE")) {
-      int v = std::atoi(p);
-      if (v >= 4 && v <= 16) {
-        q = v;
+    int pacing_ms = ReadEnvIntInRange("WEBRTC_DEMO_ZERO_PLAYOUT_MIN_PACING_MS", 1, 0, 20);
+    int q = ReadEnvIntInRange("WEBRTC_DEMO_MAX_DECODE_QUEUE_SIZE", 6, 4, 16);
+    // 可选保护：为 max_decode_queue_size 增加上限，避免偶发抖动后在解码前排队持续堆积。
+    // 默认关闭，需显式 export WEBRTC_DEMO_ENABLE_DECODE_QUEUE_GUARD=1 开启。
+    if (EnvTruthy("WEBRTC_DEMO_ENABLE_DECODE_QUEUE_GUARD")) {
+      const int guard_cap = ReadEnvIntInRange("WEBRTC_DEMO_DECODE_QUEUE_GUARD_CAP", 6, 4, 12);
+      if (pacing_ms <= 2 && q > guard_cap) {
+        q = guard_cap;
       }
     }
     return "WebRTC-ZeroPlayoutDelay/min_pacing:" + std::to_string(pacing_ms) +

@@ -79,12 +79,6 @@ run_same_board_e2e() {
         echo "E2E push overrides: WIDTH=${E2E_WIDTH:-} HEIGHT=${E2E_HEIGHT:-} FPS=${E2E_FPS:-}"
     fi
 
-    pkill -f "signaling_server" 2>/dev/null || true
-    sleep 1
-    "$SIG" "$PORT" &
-    SIG_PID=$!
-    sleep 1
-
     local H="${SIG_ADDR%%:*}"
     if [ "$H" = "127.0.0.1" ] || [ "$H" = "localhost" ]; then
         local LIP
@@ -217,11 +211,37 @@ run_same_board_e2e() {
     fi
     EXP_SIG+=" sched_mode=${E2E_SCHED_MODE} sched_prio=${E2E_SCHED_PRIO} use_chrt=${USE_CHRT}"
     EXP_SIG+=" use_nice=${USE_NICE}"
+    local SIG_CORE="${E2E_SIGNALING_CORE:-}"
+    if [ -z "$SIG_CORE" ] && [ "$USE_TASKSET" = "1" ]; then
+        if [ -n "${PUSH_CORE:-}" ] && [ "$PUSH_CORE" -ge 1 ] 2>/dev/null; then
+            SIG_CORE="$((PUSH_CORE - 1))"
+        else
+            SIG_CORE="0"
+        fi
+        if [ -n "${PULL_CORE:-}" ] && [ "$SIG_CORE" = "$PULL_CORE" ]; then
+            if [ "$SIG_CORE" -ge 1 ] 2>/dev/null; then
+                SIG_CORE="$((SIG_CORE - 1))"
+            else
+                SIG_CORE="1"
+            fi
+        fi
+    fi
+    EXP_SIG+=" signaling_core=${SIG_CORE:-na}"
+    pkill -f "signaling_server" 2>/dev/null || true
+    sleep 1
+    if [ "$USE_TASKSET" = "1" ] && [ -n "$SIG_CORE" ]; then
+        taskset -c "$SIG_CORE" "$SIG" "$PORT" &
+    else
+        "$SIG" "$PORT" &
+    fi
+    SIG_PID=$!
+    sleep 1
     # E2E 默认沿用推流脚本同款 MPP H.264 策略；均可被外部环境覆盖。
     export WEBRTC_MPP_ENC_INTRA_REFRESH_MODE="${WEBRTC_MPP_ENC_INTRA_REFRESH_MODE:-1}"
     export WEBRTC_MPP_ENC_INTRA_REFRESH_ARG="${WEBRTC_MPP_ENC_INTRA_REFRESH_ARG:-1}"
     export WEBRTC_MPP_ENC_SPLIT_BYTES="${WEBRTC_MPP_ENC_SPLIT_BYTES:-0}"
-    export WEBRTC_MPP_ENC_IDR_MIN_INTERVAL_MS="${WEBRTC_MPP_ENC_IDR_MIN_INTERVAL_MS:-250}"
+    # 同机低尾延迟默认：限制额外强制 IDR 频率，配合 GOP=120 可降低关键帧扰动尾巴。
+    export WEBRTC_MPP_ENC_IDR_MIN_INTERVAL_MS="${WEBRTC_MPP_ENC_IDR_MIN_INTERVAL_MS:-600}"
     export WEBRTC_MPP_ENC_IDR_LOSS_QUICK_MS="${WEBRTC_MPP_ENC_IDR_LOSS_QUICK_MS:-180}"
     export WEBRTC_MPP_ENC_IDR_FORCE_MAX_WAIT_MS="${WEBRTC_MPP_ENC_IDR_FORCE_MAX_WAIT_MS:-1200}"
     local PUSH_EXTRA_ARGS=()
